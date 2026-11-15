@@ -40,6 +40,20 @@ python src/munich_radar.py drafts 123456 # Bewerbungstext zu einer Anzeige anzei
 python src/munich_radar.py done 123456   # nach dem Abschicken oder Verwerfen ausblenden
 ```
 
+### Dashboard öffnen
+
+Das Streamlit-Dashboard zeigt neue passende Angebote, Bewerbungsentwürfe, offene Adressprüfungen, Antwortentwürfe und den Verlauf. Du kannst den Text ansehen und kopieren. Das Dashboard liest die SQLite-Datenbank des Workers.
+
+Lokal: Installiere die Abhängigkeiten mit `pip install -r requirements-dashboard.txt` und hinterlege ein eigenes langes Passwort als `MUNICH_DASHBOARD_PASSWORD` in deiner privaten `config/.env`. Starte den Worker und öffne das Dashboard in einem zweiten Terminal:
+
+```bash
+python -m streamlit run src/dashboard.py --server.address 127.0.0.1 --browser.gatherUsageStats false
+```
+
+Öffne `http://127.0.0.1:8501` und melde dich mit dem Passwort an. Ein neuer Browser-Tab braucht eine eigene Anmeldung.
+
+Auf Railway: Setze `MUNICH_DASHBOARD_ENABLED=true` und `MUNICH_DASHBOARD_PASSWORD` in **Variables**. Der Docker-Startbefehl startet den Worker und das Dashboard gemeinsam, damit beide dasselbe `/data`-Volume nutzen. Erstelle danach unter **Settings → Networking** eine HTTPS-Domain für diesen Dienst. Mit einer eigenen Domain kannst du ihren Hostnamen ohne `https://` unter `MUNICH_DASHBOARD_HOST` setzen. Die Anmeldung schützt die Entwürfe und Antworten hinter dieser URL. [Railway-Netzwerk einrichten](https://docs.railway.com/networking/public-networking)
+
 ### Kleinanzeigen ergänzen
 
 Speichere auf Kleinanzeigen eine Suche für Münchner Mietwohnungen oder Auf Zeit & WG mit der Angebotsart **Angebote** und aktiviere die [E-Mail-Suchbenachrichtigung](https://hilfe.kleinanzeigen.de/hc/de/articles/17102975598492-Ich-m%C3%B6chte-automatisch-neue-Suchergebnisse-zu-meiner-Suche-erhalten-Wie-richte-ich-das-ein). Sortiere diese Mails per Postfachregel in einen separaten IMAP-Ordner. Setze `KLEINANZEIGEN_IMAP_FOLDER` und `KLEINANZEIGEN_ALERT_SENDER` auf diesen Ordner und die genaue Absenderadresse. Die Zugangsdaten kommen aus `MUNICH_IMAP_HOST`, `MUNICH_IMAP_USER` und `MUNICH_IMAP_PASSWORD`. Die gleichen Variablen gelten auf Railway.
@@ -90,7 +104,7 @@ Mit `python src/munich_radar.py klein-activity` siehst du Treffer, Ortsprüfunge
 
 ### Auf Railway betreiben
 
-Verbinde das Repo als [Dockerfile-Service](https://docs.railway.com/builds/dockerfiles) mit Railway. Wähle für den Dienst die [Region EU West (Amsterdam)](https://docs.railway.com/deployments/regions). Das Image startet `watch` und enthält Chromium und den zugehörigen Treiber. Betreibe eine Instanz und hänge ein privates [Volume](https://docs.railway.com/volumes) unter `/data` an. Dort bleiben Entwürfe, Versandstatus und Browserprofil erhalten. Der Dienst braucht keine öffentliche Domain und keinen HTTP-Healthcheck.
+Verbinde das Repo als [Dockerfile-Service](https://docs.railway.com/builds/dockerfiles) mit Railway. Wähle für den Dienst die [Region EU West (Amsterdam)](https://docs.railway.com/deployments/regions). Das Image startet den Worker und enthält Chromium und den zugehörigen Treiber. Betreibe eine Instanz und hänge ein privates [Volume](https://docs.railway.com/volumes) unter `/data` an. Dort bleiben Entwürfe, Versandstatus und Browserprofil erhalten. Eine öffentliche Domain brauchst du nur für das Webdashboard.
 
 Trage die Variablen aus der lokalen Anleitung in Railway ein, inklusive `MUNICH_MESSAGE_TEMPLATE` als mehrzeilige Variable. Lass den Dienst zuerst im Entwurfsmodus laufen. Der Versand braucht einen erfolgreichen Browserstart mit aktiver Chromium-Sandbox und eine reguläre Anmeldung. Für Kleinanzeigen muss das Browserprofil auf dem Host bereits angemeldet sein. Ohne interaktive Anmeldung auf dem Host kannst du den Kleinanzeigen-Versand lokal betreiben.
 
