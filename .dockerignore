@@ -1,0 +1,11 @@
+**
+!requirements-radar.txt
+!src/
+!src/munich_radar.py
+!src/munich_transit.py
+!src/wg_source.py
+!src/wg_alerts.py
+!src/wg_preferences.py
+!src/llm_personalizer.py
+!config/
+!config/llm_persona.txt

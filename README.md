@@ -1,7 +1,7 @@
 # MietRadar 📡
 ### Automated Apartment & WG Application Bot for Germany — WG-Gesucht + ImmobilienScout24
 
-> **Scan. Apply. Move in.** — An AI-powered Python bot that monitors [WG-Gesucht](https://www.wg-gesucht.de) and [ImmobilienScout24](https://www.immobilienscout24.de), automatically applies to new rental listings, and personalises each application using an LLM — either fully local, or via a hosted API (Google Gemini, OpenAI).
+> MietRadar monitors [WG-Gesucht](https://www.wg-gesucht.de) and [ImmobilienScout24](https://www.immobilienscout24.de). The Munich radar picks out fresh WG-Gesucht listings and prepares application drafts for review. The original two bots are documented below.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL](https://img.shields.io/badge/license-GPL-green.svg)](LICENSE)
@@ -9,9 +9,54 @@
 
 ---
 
+## München-Radar
+
+Der Radar sucht WG-Zimmer, Einzimmerwohnungen und Wohnungen in München. Er prüft zuerst, ob das Inserat frisch ist, und sortiert passende Entwürfe nach Datum. Standardmäßig gilt ein Zeitfenster von 24 Stunden. Eine hochgeschobene Anzeige allein gilt nicht als neu.
+
+- **Lage:** Zum Hauptbahnhof **oder** zum Ostbahnhof dauert es mit dem ÖPNV inklusive Fußwegen höchstens 30 Minuten. Als Vergleich dient die Abfahrt am nächsten Werktag (Mo–Fr) um 08:00 Uhr Münchner Zeit. Anzeigen ohne aussagekräftige öffentliche Adresse oder prüfbare Route landen nicht in der Entwurfsliste.
+- **WG:** Klar formulierte Gesuche nur für Studierende oder nur für Frauen werden aussortiert. Liegt ein genanntes Alter der Mitbewohnenden außerhalb von **21 bis 35 einschließlich**, wird die Anzeige übersprungen. Fehlende Altersangaben werden akzeptiert. Der Textfilter erfasst gängige Formulierungen; prüf die Anzeige vor dem Abschicken noch einmal.
+- **Bewerbung:** Die Entwürfe bleiben auf deinem Rechner oder Railway-Volume. Der Radar verschickt keine Nachrichten. Öffne das Inserat und schick den Entwurf selbst ab. Für personalisierte Absätze kannst du Mistral Studio hinzufügen: Das ist die API von Mistral, die unabhängig vom Vibe-Chatkonto eingerichtet wird. Dein persönlicher Bewerbungstext bleibt in deiner Vorlage.
+
+### Lokal starten
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-radar.txt
+cp config/.env.example config/.env
+cp config/message.txt.example config/message.txt
+```
+
+1. Ersetze den Beispieltext in `config/message.txt` durch deine eigenen Angaben. Mit `{LLM_TEXT}` legst du fest, wo ein kurzer persönlicher Absatz stehen soll.
+2. Aktiviere die [Google Routes API](https://developers.google.com/maps/documentation/routes/transit-route) in einem Google-Cloud-Projekt mit Abrechnung und setze `GOOGLE_MAPS_API_KEY`. Nur die für die Routenprüfung nötige Adresse geht an Google.
+3. Wähle in `config/.env` eine Quelle. **`MUNICH_SOURCE=alerts`** empfiehlt sich im Alltag: Richte auf WG-Gesucht einen [Suchauftrag mit E-Mail-Benachrichtigung](https://www.wg-gesucht.de/hilfebereich.html) ein und leite die passenden Suchalarm-Mails per Postfachregel in einen eigenen Ordner. Setze `MUNICH_IMAP_HOST`, `MUNICH_IMAP_USER`, `MUNICH_IMAP_PASSWORD`, `MUNICH_IMAP_FOLDER` und `MUNICH_ALERT_SENDER` (die genaue Absenderadresse deiner Suchalarm-Mails). Der Radar liest den Ordner per IMAP über TLS und folgt direkten WG-Gesucht-Inseratslinks. Wenn das ursprüngliche Datum öffentlich ist, gilt dieses; sonst zählt der Eingang des Suchalarms. Das wird im Entwurf gekennzeichnet. **`MUNICH_SOURCE=public`** liest die öffentlichen Suchseiten und verlangt einen expliziten Veröffentlichungszeitpunkt. WG-Gesucht blendet ihn oft aus; dann kann dieser Modus keine Entwürfe für diese Anzeigen erstellen. Mit `MUNICH_SEARCH_URLS` kannst du im öffentlichen Modus deine eigenen WG-Gesucht-Suchergebnislinks hinterlegen.
+4. Optional: Setze `MUNICH_LLM_PROVIDER=mistral` und `MISTRAL_API_KEY` aus [Mistral Studio](https://docs.mistral.ai/api/endpoint/chat). `MISTRAL_MODEL` ist optional (`mistral-small-latest`). Sonst nutzt der Radar die Vorlage direkt.
+
+```bash
+python src/munich_radar.py scan          # einmal suchen
+python src/munich_radar.py watch         # regelmäßig suchen, standardmäßig alle 5 Minuten
+python src/munich_radar.py drafts        # aktuelle Treffer, neueste zuerst
+python src/munich_radar.py drafts 123456 # Bewerbungstext zu einer Anzeige anzeigen
+python src/munich_radar.py done 123456   # nach dem Abschicken oder Verwerfen ausblenden
+```
+
+### Auf Railway betreiben
+
+Verbinde dieses Repo als [Dockerfile-Service](https://docs.railway.com/builds/dockerfiles) mit Railway. Der Dockerfile startet `watch` automatisch. Betreibe eine Instanz ohne öffentliches Web oder HTTP-Healthcheck und hänge ein [Volume](https://docs.railway.com/volumes) unter `/data` an. Der Radar verwendet `RAILWAY_VOLUME_MOUNT_PATH` automatisch für seine SQLite-Datenbank. Trage die Variablen aus der lokalen Anleitung in Railway ein, inklusive `MUNICH_MESSAGE_TEMPLATE` als mehrzeilige Variable für deinen Text. Website-Sperren und Fehler führen zu längeren Pollpausen.
+
+Melde dich über [Railway SSH](https://docs.railway.com/cli/ssh) an, um die private Warteschlange zu lesen:
+
+```bash
+railway ssh -- python /app/src/munich_radar.py drafts
+railway ssh -- python /app/src/munich_radar.py drafts 123456
+railway ssh -- python /app/src/munich_radar.py done 123456
+```
+
+Die Idee, neue Inserate für eine persönliche Nachricht zu priorisieren, kommt von [jonasdieker/wg-gesucht-bot](https://github.com/jonasdieker/wg-gesucht-bot). Der München-Radar setzt diesen Ablauf eigenständig um.
+
 ## What is MietRadar?
 
-Finding an apartment in Germany — especially in cities like Munich, Berlin, or Hamburg — is brutally competitive. Listings disappear within minutes. **MietRadar** monitors WG-Gesucht and ImmobilienScout24 around the clock, instantly applies to new listings matching your search filters, and optionally uses an LLM to write a personalised paragraph for each application. Choose the backend that fits you: a **local Gemma 3 4B-IT** model (no API costs, runs on your machine), or a hosted API — **Google Gemini** (Developer API key or Vertex AI) or **OpenAI** (e.g. GPT-5 nano).
+The original MietRadar bots monitor WG-Gesucht and ImmobilienScout24 and automatically apply to listings matching their search filters. They use the same application generator as the Munich radar and support local Gemma, Google Gemini, OpenAI, and Mistral Studio.
 
 **Keywords**: Wohnung Bot, WG Bot, apartment bot Germany, Wohnungssuche automatisieren, WG-Gesucht Bot, ImmobilienScout24 Bot, rental application automation, Mietwohnung Bot, automated apartment search Germany, Bewerbung automatisch senden
 
@@ -114,6 +159,7 @@ cp config/message.txt.example config/message.txt
    | `gemma_local` *(default)* | Local Gemma 3 4B-IT (HuggingFace + PyTorch, runs on your machine) | `HF_TOKEN` |
    | `gemini` | Google Gemini API — Developer API key **or** Vertex AI | `GEMINI_MODEL` + either `GEMINI_API_KEY` **or** (`GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and `gcloud auth application-default login`) |
    | `openai` | OpenAI API (e.g. GPT-5 nano) | `OPENAI_MODEL`, `OPENAI_API_KEY` |
+   | `mistral` | Mistral Studio Chat Completions | `MISTRAL_API_KEY`, optional `MISTRAL_MODEL` |
 
    Install the extra SDKs only for the backend(s) you use: `pip install google-genai` (Gemini) and/or `pip install openai` (OpenAI).
 
