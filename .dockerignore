@@ -1,0 +1,16 @@
+**
+!requirements-radar.txt
+!requirements-send.txt
+!src/
+!src/munich_radar.py
+!src/munich_transit.py
+!src/munich_delivery.py
+!src/wg_source.py
+!src/wg_alerts.py
+!src/wg_preferences.py
+!src/wg_delivery.py
+!src/llm_personalizer.py
+!config/
+!config/llm_persona.txt
+!scripts/
+!scripts/start-mietradar.sh

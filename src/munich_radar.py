@@ -210,7 +210,7 @@ def main() -> int:
         parser.error("done braucht eine ID; watch und scan nehmen keine ID an")
     try:
         max_age = timedelta(hours=_number("MUNICH_MAX_AGE_HOURS", 24, 1, 72))
-        data_dir = Path(os.getenv("MUNICH_DATA_DIR") or ROOT / "data")
+        data_dir = Path(os.getenv("MUNICH_DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ROOT / "data")
         with closing(_database(data_dir / "munich_radar.sqlite3")) as db:
             if args.command == "done":
                 with db:
