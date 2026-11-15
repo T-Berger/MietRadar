@@ -4,8 +4,9 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from dashboard_data import load_dashboard
 from kleinanzeigen_radar import KleinanzeigenRadar
 from munich_radar import Scanner, _database
 from test_munich_radar import NOW, offer, ref
@@ -19,6 +20,26 @@ def klein_offer(number, **changes):
 
 
 class KleinanzeigenRadarTest(unittest.TestCase):
+    def test_draft_mode_reviews_applications_from_both_sources(self):
+        wg, klein = offer(1, 1), klein_offer(1)
+        source, router, inbox = Mock(inventory_scope="munich"), Mock(), Mock()
+        source.candidates.return_value = [ref(wg)]
+        source.details.return_value = wg
+        router.qualifies.return_value = True
+        inbox.recent_items.return_value = [(klein, NOW - timedelta(minutes=20))]
+        scanner = Scanner(source, router, "Hallo, ich würde mir das Zimmer gerne ansehen!", "none",
+                          timedelta(days=1), 10, klein_alerts=inbox, outgoing_provider="mistral")
+        verdicts = ['{"approved": true, "reason": "ok"}', '{"approved": false, "reason": "bezug"}']
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "radar.sqlite3"
+            with closing(_database(path)) as db, patch("outgoing_judge._generate_via_mistral", side_effect=verdicts) as judge:
+                scanner.scan(db, NOW, {})
+                self.assertEqual(judge.call_count, 2)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery").fetchone(), (0,))
+            snapshot = load_dashboard(path, now=NOW)
+            self.assertEqual([(match.id, match.state) for match in snapshot.matches],
+                             [(klein.id, "draft"), (wg.id, "held")])
+
     def test_combined_scan_keeps_ids_separate_and_sends_only_wg_gesucht(self):
         wg = offer(1, 1)
         klein = klein_offer(1)

@@ -80,7 +80,7 @@ Bei Kleinanzeigen kann der Radar Entwürfe bereithalten oder sie automatisch üb
 
 Der Versand verarbeitet die neuesten Treffer zuerst. Direkt vor dem Klick gilt eine feste Obergrenze von **24 Stunden**. Eine kürzere Einstellung aus `MUNICH_MAX_AGE_HOURS` gilt weiterhin. Bei Suchalarmen kann der Maileingang als Aktualitätssignal dienen, wenn das Veröffentlichungsdatum fehlt. Standardmäßig sind insgesamt höchstens drei Versandversuche je 24 Stunden erlaubt (`MUNICH_DAILY_SEND_LIMIT`, 1–5).
 
-Der München-Radar prüft jede automatische Bewerbung und Antwort vor dem Versand. Standardmäßig prüft er lokal auf offene Platzhalter, vertrauliche Angaben und riskante Zusagen. Mit `MUNICH_OUTGOING_JUDGE_PROVIDER=mistral` kommt eine Mistral-Prüfung hinzu. Nur eine ausdrückliche Freigabe erlaubt den Versand. Bei einem API-Fehler bleibt die Nachricht liegen. Die Gründe stehen unter `python src/munich_radar.py outgoing-checks`.
+Der München-Radar prüft Bewerbungsentwürfe beim Speichern sowie jede automatische Bewerbung und Antwort vor dem Versand. Standardmäßig prüft er lokal auf offene Platzhalter, vertrauliche Angaben und riskante Zusagen. Mit `MUNICH_OUTGOING_JUDGE_PROVIDER=mistral` kommt eine Mistral-Prüfung hinzu. Nur eine ausdrückliche Freigabe erlaubt den Versand. Bei einem API-Fehler bleibt die Nachricht liegen. Die Gründe stehen im Dashboard und unter `python src/munich_radar.py outgoing-checks`.
 
 Wenn WG-Gesucht eine zusätzliche Prüfung anzeigt, pausiert der Versand. Entwürfe werden weiter erstellt. Bei einem unklaren Ergebnis wird dieselbe Anzeige nicht erneut automatisch angeschrieben; prüf zuerst das WG-Gesucht-Postfach. Starte den Worker neu, sobald das Login oder die Prüfung geklärt ist. Verwende für den München-Radar und den alten WG-Gesucht-Bot keinen gleichzeitigen Versand auf demselben Konto.
 
@@ -120,6 +120,14 @@ railway ssh -- start-mietradar python /app/src/munich_radar.py delivery
 railway ssh -- start-mietradar python /app/src/munich_radar.py klein-review
 railway ssh -- start-mietradar python /app/src/munich_radar.py klein-activity
 railway ssh -- start-mietradar python /app/src/munich_radar.py klein-reply-drafts
+```
+
+Die folgenden Checks verwenden die bereits hinterlegten Railway-Variablen. Der Mistral-Check prüft zwei fiktive Nachrichten, die nie verschickt werden. Der E-Mail-Check sendet ausdrücklich eine einzelne Testmail an die konfigurierte Empfängeradresse.
+
+```bash
+railway ssh -- python /app/src/judge_smoke.py
+railway ssh -- python /app/src/integration_smoke.py kleinanzeigen
+railway ssh -- python /app/src/integration_smoke.py email
 ```
 
 Die Idee, neue Inserate für eine persönliche Nachricht zu priorisieren, kommt von [jonasdieker/wg-gesucht-bot](https://github.com/jonasdieker/wg-gesucht-bot). Der München-Radar setzt diesen Ablauf eigenständig um.

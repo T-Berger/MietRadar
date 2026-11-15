@@ -87,8 +87,8 @@ def _matches(rows, hours: int, wg_scan: tuple[float, int] | None) -> None:
             st.caption(f"{row.basis.capitalize()}: {_date(row.fresh_at)}")
             if row.basis == "zuerst gesehen":
                 st.caption("Veröffentlichungsdatum unbekannt · nur als Entwurf")
-            if row.review_reason and row.state == "held":
-                st.text(row.review_reason)
+            if row.review_reason:
+                st.caption(row.review_reason)
             _location_link(row.url)
             if row.message:
                 with st.expander("Bewerbung anzeigen"):
