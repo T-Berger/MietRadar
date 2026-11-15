@@ -139,6 +139,7 @@ class EmailNotifier:
                    "text": f"{summary}\n\n{url}".strip()}
         request = Request("https://api.resend.com/emails", method="POST", data=json.dumps(payload).encode("utf-8"),
                           headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json",
+                                   "User-Agent": "MietRadar/1.0",
                                    "Idempotency-Key": "mietradar/" + hashlib.sha256(event_id.encode()).hexdigest()})
         try:
             with urlopen(request, timeout=10) as response:

@@ -49,6 +49,7 @@ class KleinanzeigenActivityTest(unittest.TestCase):
                 self.assertEqual(notifier.flush(db, NOW), (0, True))
             requests = [item.args[0] for item in fetch.call_args_list]
             self.assertEqual(requests[0].get_header("Idempotency-key"), requests[1].get_header("Idempotency-key"))
+            self.assertEqual(requests[1].get_header("User-agent"), "MietRadar/1.0")
             self.assertEqual(json.loads(requests[1].data)["to"], ["me@example.com"])
 
 
