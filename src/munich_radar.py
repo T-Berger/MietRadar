@@ -8,7 +8,7 @@ import os
 import sqlite3
 import time
 from collections import Counter
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -80,6 +80,7 @@ class Scanner:
     age_gap: int = 7
     delivery: DeliveryQueue | None = None
     klein_alerts: AlertsInbox | None = None
+    klein_delivery: DeliveryQueue | None = None
 
     def scan(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         cutoff = now - self.max_age
@@ -93,7 +94,7 @@ class Scanner:
 
         counts: Counter = Counter()
         if self.klein_alerts:
-            klein = KleinanzeigenRadar(self.router, self.template, self.provider, self.age, self.age_gap)
+            klein = KleinanzeigenRadar(self.router, self.template, self.provider, self.age, self.age_gap, self.klein_delivery)
             try:
                 counts.update(klein.scan(db, self.klein_alerts, now, cutoff, self.limit, retry_after))
             except AlertsError as exc:
@@ -285,7 +286,7 @@ def main() -> int:
                 return 0
             if args.command == "delivery":
                 query = """SELECT s.id, s.state, s.recorded_at, d.url FROM delivery s JOIN drafts d ON d.id = s.id"""
-                labels = {"unconfirmed": "Unklar – bitte im WG-Gesucht-Postfach prüfen", "sent": "Gesendet",
+                labels = {"unconfirmed": "Unklar – bitte im Postfach der Plattform prüfen", "sent": "Gesendet",
                           "already_contacted": "Bereits kontaktiert", "unavailable": "Kontakt nicht verfügbar"}
                 if args.id:
                     rows = db.execute(query + " WHERE s.id = ?", (args.id,)).fetchall()
@@ -299,8 +300,7 @@ def main() -> int:
                 return 0
 
             scanner = _scanner(max_age)
-            sender = None
-            try:
+            with ExitStack() as sessions:
                 if _switch("MUNICH_AUTOSEND", False):
                     try:
                         from wg_delivery import BrowserSender
@@ -312,12 +312,22 @@ def main() -> int:
                         headless=_switch("MUNICH_BROWSER_HEADLESS", True),
                         email=os.getenv("WG_EMAIL", "").strip(), password=os.getenv("WG_PASSWORD", ""),
                     )
+                    sessions.callback(sender.close)
                     scanner.delivery = DeliveryQueue(sender, limit)
+                if _switch("KLEINANZEIGEN_AUTOSEND", False):
+                    if scanner.klein_alerts is None:
+                        raise ValueError("Für Kleinanzeigen-Versand zuerst Kleinanzeigen-Suchalarme einrichten")
+                    try:
+                        from kleinanzeigen_delivery import KleinanzeigenBrowserSender
+                    except ModuleNotFoundError as exc:
+                        raise ValueError("Für den Versand: pip install -r requirements-send.txt") from exc
+                    klein_sender = KleinanzeigenBrowserSender(
+                        data_dir / "kleinanzeigen_browser", headless=_switch("KLEINANZEIGEN_BROWSER_HEADLESS", True),
+                    )
+                    sessions.callback(klein_sender.close)
+                    scanner.klein_delivery = DeliveryQueue(klein_sender, _number("MUNICH_DAILY_SEND_LIMIT", 3, 1, 5))
                 interval = _number("MUNICH_POLL_SECONDS", 300, 60, 3600)
                 return _poll(scanner, db, interval, once=args.command == "scan")
-            finally:
-                if sender is not None:
-                    sender.close()
     except (OSError, sqlite3.Error, ValueError) as exc:
         LOG.error("Start fehlgeschlagen: %s", exc)
         return 1
@@ -341,7 +351,7 @@ def _poll(scanner: Scanner, db: sqlite3.Connection, interval: int, *, once: bool
             LOG.info("Scan fertig: %s", ", ".join(f"{n} {key}" for key, n in counts.items()) or "nichts Neues")
             delay = interval
             if once:
-                return int(scanner.delivery is not None and scanner.delivery.paused)
+                return int(any(queue is not None and queue.paused for queue in (scanner.delivery, scanner.klein_delivery)))
         except (WGSourceError, AlertsError) as exc:
             LOG.warning("Scan pausiert: %s", exc)
             if once:
