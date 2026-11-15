@@ -1,19 +1,24 @@
-"""Read recent WG-Gesucht saved-search alerts from a dedicated IMAP folder."""
+"""Read recent saved-search alerts from a dedicated IMAP folder."""
 
 from __future__ import annotations
 
 import imaplib
 import re
 import ssl
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr, parsedate_to_datetime
+from typing import TypeVar
 
 from bs4 import BeautifulSoup
 
-from wg_source import ListingRef
+from wg_source import Listing, ListingRef
+
+
+_Item = TypeVar("_Item", ListingRef, Listing)
 
 
 class AlertsError(RuntimeError):
@@ -71,6 +76,11 @@ class AlertsInbox:
     sender: str
 
     def recent(self, cutoff: datetime, limit: int) -> list[ListingAlert]:
+        return [ListingAlert(ref, received_at) for ref, received_at in self.recent_items(cutoff, limit, extract_refs)]
+
+    def recent_items(
+        self, cutoff: datetime, limit: int, extract: Callable[[bytes, str], list[_Item]],
+    ) -> list[tuple[_Item, datetime]]:
         # IMAP SINCE is day-based and ignores time zones. Filter INTERNALDATE
         # precisely below; include the previous day to handle offset boundaries.
         try:
@@ -85,7 +95,7 @@ class AlertsInbox:
                 if status != "OK":
                     raise AlertsError("Cannot search the saved-search folder")
                 ids = sorted((data[0] or b"").split(), key=int, reverse=True)
-                result: dict[str, ListingAlert] = {}
+                result: dict[str, tuple[_Item, datetime]] = {}
                 for uid in ids[:max(20, limit * 2)]:
                     status, rows = conn.uid("FETCH", uid, "(INTERNALDATE BODY.PEEK[]<0.262144>)")
                     if status != "OK":
@@ -103,11 +113,11 @@ class AlertsInbox:
                     for row in rows:
                         if not isinstance(row, tuple):
                             continue
-                        for ref in extract_refs(row[1], self.sender):
-                            prior = result.get(ref.id)
+                        for item in extract(row[1], self.sender):
+                            prior = result.get(item.id)
                             # Use the first alert in the scan window for repeated listings.
-                            if prior is None or received < prior.received_at:
-                                result[ref.id] = ListingAlert(ref, received.astimezone(timezone.utc))
-                return sorted(result.values(), key=lambda item: item.received_at, reverse=True)[:limit]
+                            if prior is None or received < prior[1]:
+                                result[item.id] = (item, received.astimezone(timezone.utc))
+                return sorted(result.values(), key=lambda item: item[1], reverse=True)[:limit]
         except (OSError, imaplib.IMAP4.error) as exc:
             raise AlertsError(f"IMAP: {type(exc).__name__}; check server, folder and credentials") from exc

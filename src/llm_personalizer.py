@@ -499,6 +499,7 @@ def personalise_message(
     listing_url: str = "",
     *,
     provider: str | None = None,
+    listing_type: str | None = None,
 ) -> str:
     """
     Build a personalised application message.
@@ -519,6 +520,8 @@ def personalise_message(
         URL of the listing (used for type detection).
     provider : str | None
         Use this backend instead of LLM_PROVIDER. "none" uses the plain template.
+    listing_type : str | None
+        Use a known offer type ("wg", "zimmer", or "wohnung") instead of inferring it from the URL.
 
     Returns
     -------
@@ -537,7 +540,7 @@ def personalise_message(
             paragraph = _generate_personalisation_para(
                 listing_description,
                 provider=provider,
-                listing_type=_detect_listing_type(listing_url, listing_description),
+                listing_type=listing_type or _detect_listing_type(listing_url, listing_description),
             )
         filled_template = filled_template.replace("{LLM_TEXT}", paragraph or "")
         if not paragraph:

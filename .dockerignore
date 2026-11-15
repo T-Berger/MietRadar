@@ -10,6 +10,8 @@
 !src/wg_preferences.py
 !src/wg_delivery.py
 !src/llm_personalizer.py
+!src/kleinanzeigen_source.py
+!src/kleinanzeigen_radar.py
 !config/
 !config/llm_persona.txt
 !scripts/

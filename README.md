@@ -11,7 +11,7 @@
 
 ## München-Radar
 
-Der Radar sucht WG-Zimmer, Einzimmerwohnungen und Wohnungen in München. Er prüft zuerst, ob das Inserat frisch ist, und sortiert passende Entwürfe nach Datum. Standardmäßig gilt ein Zeitfenster von 24 Stunden. Eine hochgeschobene Anzeige allein gilt nicht als neu.
+Der Radar sucht WG-Zimmer, Einzimmerwohnungen und Wohnungen in München auf WG-Gesucht und optional über Suchalarme von Kleinanzeigen. Er sortiert passende Entwürfe nach Datum. Standardmäßig gilt ein Zeitfenster von 24 Stunden. Bei Kleinanzeigen zählt der Eingang des Suchalarms im Postfach.
 
 - **Lage:** Zum Hauptbahnhof **oder** zum Ostbahnhof dauert es mit dem ÖPNV inklusive Fußwegen höchstens 30 Minuten. Als Vergleich dient die Abfahrt am nächsten Werktag (Mo–Fr) um 08:00 Uhr Münchner Zeit. Anzeigen ohne aussagekräftige öffentliche Adresse oder prüfbare Route landen nicht in der Entwurfsliste.
 - **WG:** Klar formulierte Gesuche nur für Studierende oder nur für Frauen werden aussortiert. Liegt ein genanntes Alter der Mitbewohnenden außerhalb von **21 bis 35 einschließlich**, wird die Anzeige übersprungen. Fehlende Altersangaben werden akzeptiert. Der Textfilter erfasst gängige Formulierungen; prüf die Anzeige vor dem Abschicken noch einmal.
@@ -40,13 +40,27 @@ python src/munich_radar.py drafts 123456 # Bewerbungstext zu einer Anzeige anzei
 python src/munich_radar.py done 123456   # nach dem Abschicken oder Verwerfen ausblenden
 ```
 
+### Kleinanzeigen ergänzen
+
+Speichere auf Kleinanzeigen eine Suche für Münchner Mietwohnungen oder Auf Zeit & WG und aktiviere die [E-Mail-Suchbenachrichtigung](https://hilfe.kleinanzeigen.de/hc/de/articles/17102975598492-Ich-m%C3%B6chte-automatisch-neue-Suchergebnisse-zu-meiner-Suche-erhalten-Wie-richte-ich-das-ein). Sortiere diese Mails per Postfachregel in einen separaten IMAP-Ordner. Setze `KLEINANZEIGEN_IMAP_FOLDER` und `KLEINANZEIGEN_ALERT_SENDER` auf diesen Ordner und die genaue Absenderadresse. Die Zugangsdaten kommen aus `MUNICH_IMAP_HOST`, `MUNICH_IMAP_USER` und `MUNICH_IMAP_PASSWORD`. Die gleichen Variablen gelten auf Railway.
+
+Der Radar verarbeitet direkte Inseratslinks aus den Suchalarm-Mails. Enthält der Alarm eine vollständige Münchner Adresse, prüft er dieselbe ÖPNV-Verbindung wie bei WG-Gesucht. Mit einer PLZ, einem Viertel oder einem [ungefähren Kartenpunkt](https://hilfe.kleinanzeigen.de/hc/de/articles/29128094755100-Neu-Immobilien-auf-der-Karte-ansehen) bleibt der Treffer zur Ortsprüfung offen. Wenn du im Inserat eine genaue Adresse findest, kannst du sie selbst prüfen lassen. Ein Entwurf entsteht erst, wenn die Route bestätigt ist.
+
+```bash
+python src/munich_radar.py klein-review
+python src/munich_radar.py klein-address ka-1234567890 --address 'Musterstraße 12, 81667 München'
+python src/munich_radar.py drafts ka-1234567890
+```
+
+Kleinanzeigen-Nachrichten verschickst du aus dem verlinkten Inserat. Angaben zum WG-Profil, die in der Alarm-Mail fehlen, kannst du dort vor dem Abschicken prüfen.
+
 ### Automatisch bewerben
 
 1. Installiere die Browser-Abhängigkeiten (`pip install -r requirements-send.txt`) und Chrome oder Chromium. Füll zuerst deine eigene deutsche Bewerbungsvorlage aus.
 2. Setze `WG_EMAIL`, `WG_PASSWORD` und `MUNICH_AUTOSEND=true` in `config/.env`. Starte `python src/munich_radar.py watch`. Auch `scan` verschickt Bewerbungen, wenn die Option gesetzt ist.
 3. Mit `python src/munich_radar.py delivery` siehst du den Versandstatus. `MUNICH_AUTOSEND=false` schaltet wieder auf Entwürfe um.
 
-Der Versand prüft die München-Filter auch bei vorhandenen Entwürfen erneut und verarbeitet die neuesten Treffer zuerst. Direkt vor dem Klick gilt eine feste Obergrenze von **24 Stunden**; eine kürzere Einstellung aus `MUNICH_MAX_AGE_HOURS` gilt weiterhin. Bei Suchalarmen kann der Maileingang als Aktualitätssignal dienen, wenn WG-Gesucht das Veröffentlichungsdatum ausblendet. Standardmäßig sind höchstens drei Versandversuche je 24 Stunden erlaubt (`MUNICH_DAILY_SEND_LIMIT`, 1–5).
+Der Versand gilt für WG-Gesucht. Er prüft die München-Filter auch bei vorhandenen Entwürfen erneut und verarbeitet die neuesten Treffer zuerst. Direkt vor dem Klick gilt eine feste Obergrenze von **24 Stunden**. Eine kürzere Einstellung aus `MUNICH_MAX_AGE_HOURS` gilt weiterhin. Bei Suchalarmen kann der Maileingang als Aktualitätssignal dienen, wenn WG-Gesucht das Veröffentlichungsdatum ausblendet. Standardmäßig sind höchstens drei Versandversuche je 24 Stunden erlaubt (`MUNICH_DAILY_SEND_LIMIT`, 1–5).
 
 Wenn WG-Gesucht eine zusätzliche Prüfung anzeigt, pausiert der Versand. Entwürfe werden weiter erstellt. Bei einem unklaren Ergebnis wird dieselbe Anzeige nicht erneut automatisch angeschrieben; prüf zuerst das WG-Gesucht-Postfach. Starte den Worker neu, sobald das Login oder die Prüfung geklärt ist. Verwende für den München-Radar und den alten WG-Gesucht-Bot keinen gleichzeitigen Versand auf demselben Konto.
 
@@ -61,6 +75,7 @@ Mit [Railway SSH](https://docs.railway.com/cli/ssh) kannst du Entwürfe und Vers
 ```bash
 railway ssh -- start-mietradar python /app/src/munich_radar.py drafts
 railway ssh -- start-mietradar python /app/src/munich_radar.py delivery
+railway ssh -- start-mietradar python /app/src/munich_radar.py klein-review
 ```
 
 Die Idee, neue Inserate für eine persönliche Nachricht zu priorisieren, kommt von [jonasdieker/wg-gesucht-bot](https://github.com/jonasdieker/wg-gesucht-bot). Der München-Radar setzt diesen Ablauf eigenständig um.
