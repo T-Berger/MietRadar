@@ -50,6 +50,19 @@ Der Versand prüft die München-Filter auch bei vorhandenen Entwürfen erneut un
 
 Wenn WG-Gesucht eine zusätzliche Prüfung anzeigt, pausiert der Versand. Entwürfe werden weiter erstellt. Bei einem unklaren Ergebnis wird dieselbe Anzeige nicht erneut automatisch angeschrieben; prüf zuerst das WG-Gesucht-Postfach. Starte den Worker neu, sobald das Login oder die Prüfung geklärt ist. Verwende für den München-Radar und den alten WG-Gesucht-Bot keinen gleichzeitigen Versand auf demselben Konto.
 
+### Auf Railway betreiben
+
+Verbinde das Repo als [Dockerfile-Service](https://docs.railway.com/builds/dockerfiles) mit Railway. Das Image startet `watch` und enthält Chromium und den zugehörigen Treiber. Betreibe eine Instanz und hänge ein privates [Volume](https://docs.railway.com/volumes) unter `/data` an. Dort bleiben Entwürfe, Versandstatus und Browserprofil erhalten. Der Dienst braucht keine öffentliche Domain und keinen HTTP-Healthcheck.
+
+Trage die Variablen aus der lokalen Anleitung in Railway ein, inklusive `MUNICH_MESSAGE_TEMPLATE` als mehrzeilige Variable. Lass den Dienst zuerst im Entwurfsmodus laufen. Zum automatischen Versand setze `MUNICH_AUTOSEND=true` und die WG-Gesucht-Zugangsdaten. Der Versand braucht einen erfolgreichen Browserstart mit aktiver Chromium-Sandbox und eine reguläre Anmeldung. Wenn Railway den Browser nicht starten kann oder WG-Gesucht eine zusätzliche Verifikation verlangt, pausiert der Versand; in diesem Fall kannst du den Versand lokal betreiben.
+
+Mit [Railway SSH](https://docs.railway.com/cli/ssh) kannst du Entwürfe und Versandstatus lesen:
+
+```bash
+railway ssh -- start-mietradar python /app/src/munich_radar.py drafts
+railway ssh -- start-mietradar python /app/src/munich_radar.py delivery
+```
+
 Die Idee, neue Inserate für eine persönliche Nachricht zu priorisieren, kommt von [jonasdieker/wg-gesucht-bot](https://github.com/jonasdieker/wg-gesucht-bot). Der München-Radar setzt diesen Ablauf eigenständig um.
 
 ## What is MietRadar?
