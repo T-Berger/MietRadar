@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from typing import Protocol
 
+from munich_tiers import install_secondary_offers
 from outgoing_judge import OutgoingJudgment, judge_outgoing
 
 
@@ -26,6 +27,7 @@ class Sender(Protocol):
 
 
 def install_schema(db: sqlite3.Connection) -> None:
+    install_secondary_offers(db)
     db.execute("""
         CREATE TABLE IF NOT EXISTS delivery (
             id TEXT PRIMARY KEY REFERENCES drafts(id),
@@ -95,7 +97,8 @@ class DeliveryQueue:
         info = db.execute(
             """SELECT d.fresh_at FROM drafts d LEFT JOIN delivery s ON s.id = d.id
                WHERE d.id = ? AND d.done = 0 AND d.message IS NOT NULL AND s.id IS NULL
-                 AND d.basis != 'zuerst gesehen'""",
+                 AND d.basis != 'zuerst gesehen'
+                 AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = d.id)""",
             (listing_id,),
         ).fetchone()
         if info is None or not cutoff.timestamp() <= info[0] <= now.timestamp():

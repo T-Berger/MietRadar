@@ -12,7 +12,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from dashboard_auth import logout_button, require_authentication
-from dashboard_data import BERLIN, RESULT_LIMIT, DateBasis, load_dashboard, weekend_dates
+from dashboard_data import BERLIN, RESULT_LIMIT, DateBasis, SecondaryListing, load_dashboard, weekend_dates
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -162,6 +162,25 @@ def _addresses(rows) -> None:
             _location_link(row.url)
 
 
+def _secondary_offers(rows: tuple[SecondaryListing, ...], hours: int) -> None:
+    st.caption("Bis zu 45 Min. mit dem ÖPNV ab Ostbahnhof für B oder ab Hauptbahnhof für C. Passt beides, gilt B.")
+    if not rows:
+        st.info(f"Keine Angebote der Kategorie B oder C in den letzten {hours} Stunden.")
+        return
+    for tier in ("b", "c"):
+        offers = [row for row in rows if row.tier == tier]
+        if not offers:
+            continue
+        st.subheader(f"Kategorie {tier.upper()}", anchor=False)
+        for row in offers:
+            station = "Hauptbahnhof" if row.station == "Hbf" else row.station
+            with st.container(border=True):
+                st.text(row.title or _headline(row.url))
+                st.caption(f"{row.platform} · {row.minutes} Min. mit dem ÖPNV ab {station}")
+                st.caption(f"{row.basis.capitalize()}: {_date(row.fresh_at)}")
+                _location_link(row.url)
+
+
 def _replies(rows) -> None:
     st.subheader("Antwortentwürfe", anchor=False)
     if not rows:
@@ -231,12 +250,16 @@ def main() -> None:
         matches.metric("Neue Angebote", len(data.matches), border=True)
     drafts.metric("Bewerbungsentwürfe", sum(bool(row.message) for row in data.matches), border=True)
     pending.metric("Adressen zur Prüfung", len(data.address_checks), border=True)
-    offers, address, replies, activity = st.tabs(["Angebote", "Adresse prüfen", "Antwortentwürfe", "Verlauf"])
+    offers, secondary, address, replies, activity = st.tabs(
+        ["Angebote", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf"]
+    )
     with offers:
         if date_basis:
             _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan)
         else:
             _matches(data.matches, hours, data.wg_scan)
+    with secondary:
+        _secondary_offers(data.secondary_offers, hours)
     with address:
         _addresses(data.address_checks)
     with replies:

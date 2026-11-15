@@ -73,6 +73,7 @@ def record_activity(db: sqlite3.Connection, now: datetime, sending_paused: bool 
             FROM drafts d LEFT JOIN delivery s ON s.id = d.id
             WHERE d.id GLOB 'ka-*' AND d.fresh_at BETWEEN ? AND ?
               AND d.done = 0 AND d.message IS NOT NULL AND s.id IS NULL
+              AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = d.id)
         """, (cutoff, now.timestamp()))
         db.execute("""INSERT OR IGNORE INTO klein_activity (id, kind, listing_id, url, subject, summary, occurred_at)
             SELECT 'delivery:' || s.state || ':' || s.id, 'delivery', s.id, d.url,

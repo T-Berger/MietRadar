@@ -64,14 +64,14 @@ class ScannerTest(unittest.TestCase):
         source.candidates.return_value = [ref(item) for item in listing_by_id.values()]
         source.details.side_effect = lambda candidate: listing_by_id[candidate.id]
         router = Mock()
-        router.qualifies.side_effect = lambda address, now: None if address == no_route.address else True
+        router.classify.side_effect = lambda address, now: (None, None) if address == no_route.address else ("a", None)
         scanner = Scanner(source, router, "Hi {name},\n\nich bin 28.\n\n{LLM_TEXT}\n\nViele Grüße", "none", timedelta(days=1), 12)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "radar.sqlite3"
             with closing(_database(path)) as db:
                 counts = scanner.scan(db, NOW, {})
                 self.assertEqual(counts["neue Entwürfe"], 2)
-                self.assertEqual([call.args[0] for call in router.qualifies.call_args_list],
+                self.assertEqual([call.args[0] for call in router.classify.call_args_list],
                                  [fresh.address, no_route.address, older.address])
                 queued = db.execute("SELECT id, message FROM drafts ORDER BY fresh_at DESC").fetchall()
                 self.assertEqual([row[0] for row in queued], [fresh.id, older.id])
@@ -86,13 +86,13 @@ class ScannerTest(unittest.TestCase):
         alerts, source, router = Mock(), Mock(), Mock()
         alerts.recent.return_value = [ListingAlert(ref(item), NOW - timedelta(minutes=10)) for item in (unknown, stale)]
         source.details.side_effect = [unknown, stale]
-        router.qualifies.return_value = True
+        router.classify.return_value = ("a", None)
         scanner = Scanner(source, router, "Hi!", "none", timedelta(days=1), 12, alerts)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             scanner.scan(db, NOW, {})
             self.assertEqual(db.execute("SELECT id, basis FROM drafts").fetchall(), [(unknown.id, "Suchalarm erhalten")])
         source.candidates.assert_not_called()
-        router.qualifies.assert_called_once()
+        router.classify.assert_called_once()
 
     def test_snapshots_cover_all_ids_and_first_observed_matches_remain_manual(self):
         baseline, beyond_budget, new, stale = offer(1, None), offer(2, None), offer(3, None), offer(4, 36)
@@ -104,7 +104,7 @@ class ScannerTest(unittest.TestCase):
             [ref(beyond_budget), ref(stale)],
         ]
         source.details.side_effect = [baseline, new, stale]
-        router.qualifies.return_value = True
+        router.classify.return_value = ("a", None)
         scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 1, delivery=delivery)
         later = NOW + timedelta(hours=1)
         with tempfile.TemporaryDirectory() as directory:
@@ -135,7 +135,7 @@ class ScannerTest(unittest.TestCase):
         source.inventory_scope = "munich"
         source.candidates.side_effect = [[ref(baseline)], WGSourceError("unavailable"), [ref(during_gap)], [ref(new)]]
         source.details.side_effect = [baseline, during_gap, new]
-        router.qualifies.return_value = True
+        router.classify.return_value = ("a", None)
         scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 12)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             scanner.scan(db, NOW, {})
@@ -160,14 +160,14 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT published_at, published_day FROM wg_observations").fetchone(),
                              (None, "2026-11-12"))
             self.assertEqual(db.execute("SELECT count(*) FROM drafts").fetchone(), (0,))
-        router.qualifies.assert_not_called()
+        router.classify.assert_not_called()
 
     def test_calendar_day_from_an_alert_never_qualifies_for_automatic_delivery(self):
         known_day = replace(offer(1, None), published_day=date(2026, 11, 14))
         alerts, source, router, delivery = Mock(), Mock(), Mock(), Mock()
         alerts.recent.return_value = [ListingAlert(ref(known_day), NOW - timedelta(minutes=5))]
         source.details.side_effect = [known_day, replace(known_day, published_day=None)]
-        router.qualifies.return_value = True
+        router.classify.return_value = ("a", None)
         delivery.paused = False
         scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=72), 12, alerts, delivery=delivery)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
@@ -176,6 +176,21 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM drafts").fetchone(), (1,))
             self.assertEqual(db.execute("SELECT published_at, published_day FROM wg_observations").fetchone(),
                              (None, "2026-11-14"))
+        delivery.deliver.assert_not_called()
+
+    def test_secondary_travel_matches_are_saved_without_applications(self):
+        east, central = offer(1, 1), offer(2, 2)
+        source, router, delivery = Mock(), Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.return_value = [ref(east), ref(central)]
+        source.details.side_effect = [east, central]
+        router.classify.side_effect = [("b", 38), ("c", 45)]
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 12, delivery=delivery)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            scanner.scan(db, NOW, {})
+            self.assertEqual(db.execute("SELECT tier, station, minutes FROM munich_secondary_offers ORDER BY id").fetchall(),
+                             [("b", "Ostbahnhof", 38), ("c", "Hbf", 45)])
+            self.assertEqual(db.execute("SELECT count(*) FROM drafts").fetchone(), (0,))
         delivery.deliver.assert_not_called()
 
 

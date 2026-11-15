@@ -74,7 +74,44 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.matches[0].state, "draft")
         self.assertEqual(data.matches[0].url, "https://www.wg-gesucht.de/12.html")
         self.assertEqual(data.address_checks, ())
+        self.assertEqual(data.secondary_offers, ())
         self.assertIsNone(data.wg_scan)
+
+    def test_current_secondary_offers_are_separate_from_primary_matches(self):
+        recent = (NOW - timedelta(hours=1)).timestamp()
+        older = (NOW - timedelta(hours=23)).timestamp()
+        expired = (NOW - timedelta(hours=25)).timestamp()
+        future = (NOW + timedelta(hours=1)).timestamp()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TABLE drafts (id TEXT, url TEXT, fresh_at REAL, basis TEXT, message TEXT, done INTEGER)")
+            db.executemany("INSERT INTO drafts VALUES (?, ?, ?, ?, ?, ?)", [
+                ("12", "https://www.wg-gesucht.de/12.html", recent, "veröffentlicht", "Older primary draft", 0),
+                ("13", "https://www.wg-gesucht.de/13.html", recent, "veröffentlicht", "Current primary draft", 0),
+            ])
+            db.execute("""CREATE TABLE munich_secondary_offers (
+                id TEXT PRIMARY KEY, url TEXT, title TEXT, fresh_at REAL, basis TEXT,
+                tier TEXT, station TEXT, minutes INTEGER
+            )""")
+            db.executemany("INSERT INTO munich_secondary_offers VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+                ("12", "https://www.wg-gesucht.de/12.html?tracking=1", "WG-Zimmer", recent,
+                 "zuerst gesehen", "b", "Ostbahnhof", 45),
+                ("ka-77", "https://www.kleinanzeigen.de/s-anzeige/wohnung/77-203-650", "Wohnung", older,
+                 "veröffentlicht", "c", "Hbf", 28),
+                ("13", "https://www.wg-gesucht.de/13.html", "WG-Zimmer", expired,
+                 "veröffentlicht", "b", "Ostbahnhof", 36),
+                ("14", "https://www.wg-gesucht.de/14.html", "WG-Zimmer", future,
+                 "veröffentlicht", "b", "Ostbahnhof", 36),
+                ("15", "https://www.wg-gesucht.de/15.html", "WG-Zimmer", recent,
+                 "veröffentlicht", "b", "Ostbahnhof", 46),
+            ])
+
+        data = load_dashboard(self.path, now=NOW)
+        self.assertEqual(data.status, "ready")
+        self.assertEqual([row.id for row in data.matches], ["13"])
+        offers = [(row.id, row.platform, row.tier, row.station, row.minutes) for row in data.secondary_offers]
+        self.assertEqual(offers, [("12", "WG-Gesucht", "b", "Ostbahnhof", 45),
+                                  ("ka-77", "Kleinanzeigen", "c", "Hbf", 28)])
+        self.assertEqual(data.secondary_offers[0].url, "https://www.wg-gesucht.de/12.html")
 
     def test_shows_latest_public_inventory_count_even_without_matches(self):
         current = NOW.timestamp()

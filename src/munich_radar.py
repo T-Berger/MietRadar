@@ -21,6 +21,7 @@ from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
 from llm_personalizer import personalise_message
 from munich_delivery import DeliveryQueue, install_schema, save_application_draft
+from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import TransitRouter
 from wg_alerts import AlertsError, AlertsInbox
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
@@ -145,6 +146,8 @@ class Scanner:
             try:
                 listing = self.source.details(ref)
             except WGListingGone:
+                with db:
+                    remove_secondary_offer(db, ref.id)
                 counts["nicht mehr verfügbar"] += 1
                 retry_after[ref.id] = now + self.max_age
                 continue
@@ -157,6 +160,8 @@ class Scanner:
             if published_at is None and published_day is not None:
                 counts["Veröffentlichungsdaten ohne Uhrzeit"] += 1
                 if not first_eligible_day <= published_day <= current_day:
+                    with db:
+                        remove_secondary_offer(db, ref.id)
                     counts["außerhalb des Zeitfensters"] += 1
                     continue
             if published_at is not None:
@@ -170,6 +175,15 @@ class Scanner:
                 counts["kein Veröffentlichungsdatum"] += 1
                 retry_after[ref.id] = now + timedelta(minutes=15)
                 continue
+            previous_secondary = secondary_freshness(db, ref.id)
+            if previous_secondary is not None:
+                if previous_secondary[0] < fresh_at.timestamp():
+                    stamp, basis = previous_secondary
+                    fresh_at = datetime.fromtimestamp(stamp, timezone.utc)
+                elif fresh_at < cutoff:
+                    with db:
+                        db.execute("UPDATE munich_secondary_offers SET fresh_at = ?, basis = ? WHERE id = ?",
+                                   (fresh_at.timestamp(), basis, ref.id))
             if not cutoff <= fresh_at <= now:
                 counts["außerhalb des Zeitfensters"] += 1
                 retry_after[ref.id] = now + self.max_age
@@ -180,6 +194,8 @@ class Scanner:
                 resident_ages=listing.resident_ages or "", age=self.age, age_gap=self.age_gap,
             )
             if reason:
+                with db:
+                    remove_secondary_offer(db, ref.id)
                 counts[reason] += 1
                 retry_after[ref.id] = now + self.max_age
                 continue
@@ -191,15 +207,28 @@ class Scanner:
 
         for fresh_at, listing, basis, draft, may_deliver in sorted(eligible, key=lambda item: item[0], reverse=True):
             if not listing.address:
+                with db:
+                    remove_secondary_offer(db, listing.id)
                 counts["keine prüfbare Adresse"] += 1
                 retry_after[listing.id] = now + timedelta(minutes=30)
                 continue
-            match = self.router.qualifies(listing.address, now)
-            if match is not True:
-                counts["ÖPNV über 30 Minuten" if match is False else "ÖPNV nicht prüfbar"] += 1
-                retry_after[listing.id] = now + (self.max_age if match is False else timedelta(minutes=10))
+            tier, minutes = self.router.classify(listing.address, now)
+            if tier in {"b", "c"} and minutes is not None:
+                with db:
+                    save_secondary_offer(db, listing.id, listing.url, listing.title, fresh_at, basis,
+                                         tier, "Ostbahnhof" if tier == "b" else "Hbf", minutes)
+                counts[f"{tier.upper()}-Tier-Treffer"] += 1
+                continue
+            if tier != "a":
+                if tier == "outside":
+                    with db:
+                        remove_secondary_offer(db, listing.id)
+                counts["ÖPNV über 45 Minuten" if tier == "outside" else "ÖPNV nicht prüfbar"] += 1
+                retry_after[listing.id] = now + (self.max_age if tier == "outside" else timedelta(minutes=10))
                 continue
             if draft:
+                with db:
+                    remove_secondary_offer(db, listing.id)
                 message = draft[1]
             else:
                 message = personalise_message(
@@ -210,6 +239,7 @@ class Scanner:
                         db, listing.id, listing.url, fresh_at.timestamp(), basis, message,
                         context=listing.description, provider=self.outgoing_provider, now=now,
                     )
+                    remove_secondary_offer(db, listing.id)
                 if not saved:
                     continue
                 counts["neue Entwürfe"] += 1
@@ -385,6 +415,7 @@ def main() -> int:
                 cutoff = datetime.now(timezone.utc) - max_age
                 query = """SELECT id, url, fresh_at, basis, message FROM drafts
                            WHERE done = 0 AND message IS NOT NULL AND fresh_at >= ?
+                           AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = drafts.id)
                            AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.id = drafts.id AND state = 'unconfirmed')"""
                 params: tuple = (cutoff.timestamp(),)
                 if args.id:

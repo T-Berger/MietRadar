@@ -25,7 +25,7 @@ class KleinanzeigenRadarTest(unittest.TestCase):
         source, router, inbox = Mock(inventory_scope="munich"), Mock(), Mock()
         source.candidates.return_value = [ref(wg)]
         source.details.return_value = wg
-        router.qualifies.return_value = True
+        router.classify.return_value = ("a", None)
         inbox.recent_items.return_value = [(klein, NOW - timedelta(minutes=20))]
         scanner = Scanner(source, router, "Hallo, ich würde mir das Zimmer gerne ansehen!", "none",
                           timedelta(days=1), 10, klein_alerts=inbox, outgoing_provider="mistral")
@@ -46,7 +46,7 @@ class KleinanzeigenRadarTest(unittest.TestCase):
         source, router, inbox, delivery = Mock(inventory_scope="munich"), Mock(), Mock(), Mock()
         source.candidates.return_value = [ref(wg)]
         source.details.return_value = wg
-        router.qualifies.return_value = True
+        router.classify.return_value = ("a", None)
         inbox.recent_items.return_value = [(klein, NOW - timedelta(minutes=20))]
         scanner = Scanner(source, router, "Hallo!", "none", timedelta(days=1), 10,
                           delivery=delivery, klein_alerts=inbox)
@@ -70,13 +70,53 @@ class KleinanzeigenRadarTest(unittest.TestCase):
         cutoff = NOW - timedelta(days=1)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             radar.scan(db, inbox, NOW, cutoff, 10, {})
-            router.qualifies.assert_not_called()
+            router.classify.assert_not_called()
             self.assertEqual(db.execute("SELECT id FROM klein_review").fetchall(), [(pending.id,)])
             self.assertFalse(radar.check_address(db, pending.id, "81667 München", NOW, cutoff)[0])
-            router.qualifies.return_value = True
+            router.classify.return_value = ("a", None)
             self.assertTrue(radar.check_address(db, pending.id, "Musterstraße 12, 81667 München", NOW, cutoff)[0])
             self.assertEqual(db.execute("SELECT id, basis FROM drafts").fetchall(), [(pending.id, "Suchalarm erhalten")])
             self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_review").fetchone()[0], 0)
+
+    def test_secondary_offers_keep_original_freshness_without_a_draft_or_delivery(self):
+        east, central = klein_offer(1), klein_offer(2)
+        initial = NOW - timedelta(hours=2)
+        recent = NOW - timedelta(minutes=30)
+        router, inbox, delivery = Mock(), Mock(), Mock(paused=False)
+        router.classify.side_effect = lambda address, _: ("b", 38) if address == east.address else ("c", 45)
+        inbox.recent_items.side_effect = [[(east, initial), (central, recent)], [(east, recent)]]
+        radar = KleinanzeigenRadar(router, "Hallo!", "none", delivery=delivery)
+        cutoff = NOW - timedelta(days=1)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with patch("kleinanzeigen_radar.personalise_message") as personalise:
+                radar.scan(db, inbox, NOW, cutoff, 10, {})
+                radar.scan(db, inbox, NOW, cutoff, 10, {})
+                personalise.assert_not_called()
+            rows = db.execute("""SELECT id, tier, station, minutes, fresh_at FROM munich_secondary_offers
+                                 ORDER BY id""").fetchall()
+            self.assertEqual(rows, [
+                (east.id, "b", "Ostbahnhof", 38, initial.timestamp()), (central.id, "c", "Hbf", 45, recent.timestamp()),
+            ])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM drafts").fetchone(), (0,))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_origins").fetchone(), (0,))
+        delivery.deliver.assert_not_called()
+
+    def test_manual_secondary_offer_does_not_reopen_address_review_on_alert_replay(self):
+        listing = klein_offer(1, address=None)
+        router, inbox = Mock(), Mock()
+        router.classify.return_value = ("b", 43)
+        inbox.recent_items.return_value = [(listing, NOW - timedelta(minutes=30))]
+        radar = KleinanzeigenRadar(router, "Hallo!", "none")
+        cutoff = NOW - timedelta(days=1)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            saved, _ = radar.check_address(db, listing.id, "Musterstraße 12, 81667 München", NOW, cutoff)
+            self.assertTrue(saved)
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            self.assertEqual(db.execute("SELECT id, tier, minutes FROM munich_secondary_offers").fetchall(),
+                             [(listing.id, "b", 43)])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_review").fetchone(), (0,))
+        router.classify.assert_called_once()
 
 
 if __name__ == "__main__":

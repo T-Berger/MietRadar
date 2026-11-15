@@ -21,6 +21,7 @@ _TABLE_COLUMNS = {
     "klein_activity": {"kind", "listing_id", "url", "subject", "summary", "occurred_at"},
     "wg_inventory_scan": {"id", "scanned_at"},
     "wg_observations": {"last_seen_at"},
+    "munich_secondary_offers": {"id", "url", "title", "fresh_at", "basis", "tier", "station", "minutes"},
 }
 _PLATFORM_HOSTS = {"www.wg-gesucht.de", "wg-gesucht.de", "www.kleinanzeigen.de", "kleinanzeigen.de"}
 RESULT_LIMIT = 100
@@ -48,6 +49,19 @@ class DatedListing:
     url: str | None
     day: date
     matched: bool
+
+
+@dataclass(frozen=True)
+class SecondaryListing:
+    id: str
+    platform: str
+    url: str | None
+    title: str
+    fresh_at: float
+    basis: str
+    tier: str
+    station: str
+    minutes: int
 
 
 @dataclass(frozen=True)
@@ -90,6 +104,7 @@ class DashboardData:
     activity: tuple[Activity, ...] = ()
     wg_scan: tuple[float, int] | None = None
     dated_listings: tuple[DatedListing, ...] = ()
+    secondary_offers: tuple[SecondaryListing, ...] = ()
 
 
 def _platform_url(url: str) -> str | None:
@@ -139,13 +154,23 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     observations = _columns(db, "wg_observations") if "wg_observations" in tables else set()
     observation_join = "LEFT JOIN wg_observations o ON o.id = d.id" if {"id", "published_day"} <= observations else ""
     day = "o.published_day" if observation_join else "NULL"
+    secondary_filter = ""
+    parameters = [cutoff, until]
+    if "munich_secondary_offers" in tables:
+        secondary_filter = """AND NOT EXISTS (
+            SELECT 1 FROM munich_secondary_offers m
+            WHERE m.id = d.id AND m.fresh_at BETWEEN ? AND ? AND m.minutes BETWEEN 1 AND 45
+        )"""
+        parameters.extend((cutoff, until))
+    parameters.append(RESULT_LIMIT)
     rows = db.execute(f"""
         SELECT d.id, d.url, d.fresh_at, d.basis, d.message, {state}, {reason}, {approved}, {day}
         FROM drafts d {delivery_join} {check_join} {observation_join}
         WHERE d.fresh_at BETWEEN ? AND ?
           AND ((d.done = 0 AND d.message IS NOT NULL) OR {state} IS NOT NULL)
+          {secondary_filter}
         ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
-    """, (cutoff, until, RESULT_LIMIT))
+    """, parameters)
     return tuple(
         Match(listing_id, "Kleinanzeigen" if listing_id.startswith("ka-") else "WG-Gesucht",
               _platform_url(url), stamp, basis, message if state is None else None,
@@ -161,6 +186,19 @@ def _address_checks(db: sqlite3.Connection, cutoff: float, until: float) -> tupl
     """, (cutoff, until, RESULT_LIMIT))
     return tuple(AddressCheck(item, _platform_url(url), title, stamp, basis, reason)
                  for item, url, title, stamp, basis, reason in rows)
+
+
+def _secondary_offers(db: sqlite3.Connection, cutoff: float, until: float) -> tuple[SecondaryListing, ...]:
+    rows = db.execute("""
+        SELECT id, url, title, fresh_at, basis, tier, station, minutes FROM munich_secondary_offers
+        WHERE fresh_at BETWEEN ? AND ? AND minutes BETWEEN 1 AND 45
+        ORDER BY fresh_at DESC, id DESC LIMIT ?
+    """, (cutoff, until, RESULT_LIMIT))
+    return tuple(
+        SecondaryListing(item, "Kleinanzeigen" if item.startswith("ka-") else "WG-Gesucht",
+                         _platform_url(url), title, stamp, basis, tier, station, minutes)
+        for item, url, title, stamp, basis, tier, station, minutes in rows
+    )
 
 
 def _replies(db: sqlite3.Connection, tables: set[str], cutoff: float, until: float) -> tuple[Reply, ...]:
@@ -294,6 +332,7 @@ def load_dashboard(
                 activity=_activity(db, history_cutoff, until) if "klein_activity" in tables else (),
                 wg_scan=_wg_scan(db, tables),
                 dated_listings=_dated_listings(db, tables, posting_window, now, date_basis) if posting_window else (),
+                secondary_offers=_secondary_offers(db, cutoff, until) if "munich_secondary_offers" in tables else (),
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")
