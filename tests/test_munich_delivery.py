@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 from munich_delivery import DeliveryOutcome, DeliveryQueue
 from munich_radar import Scanner, _database
+from munich_tiers import save_secondary_offer
 from test_munich_radar import NOW, offer, ref
 
 
@@ -57,6 +58,22 @@ class DeliveryTest(unittest.TestCase):
         self.assertFalse(sender.attempts)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM delivery").fetchone(), (0,))
 
+    def test_demotion_to_secondary_before_click_prevents_delivery(self):
+        listing = offer(1, 1)
+        self.draft(listing)
+        sender = Mock()
+
+        def send(url, message, before_submit):
+            with self.db:
+                save_secondary_offer(self.db, listing.id, url, listing.title, listing.published_at,
+                                     "veröffentlicht", "c", "Hbf", 45)
+            self.assertFalse(before_submit())
+            return DeliveryOutcome.SKIPPED
+
+        sender.send.side_effect = send
+        self.assertIsNone(self.run_delivery(DeliveryQueue(sender, clock=lambda: NOW), listing))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM delivery").fetchone(), (0,))
+
     def test_unknown_result_is_not_retried_even_after_restart(self):
         listing = offer(1, 1)
         self.draft(listing)
@@ -88,7 +105,7 @@ class DeliveryTest(unittest.TestCase):
         source.inventory_scope = "munich"
         source.candidates.return_value = [ref(item) for item in by_id.values()]
         source.details.side_effect = lambda candidate: by_id[candidate.id]
-        router.qualifies.side_effect = lambda address, now: address != nonmatch.address
+        router.classify.side_effect = lambda address, now: ("outside", None) if address == nonmatch.address else ("a", None)
         sender = RecordingSender()
         queue = DeliveryQueue(sender, limit=1, clock=lambda: NOW)
         scanner = Scanner(source, router, "Hi, ich bin 28.", "none", timedelta(hours=24), 12, delivery=queue)

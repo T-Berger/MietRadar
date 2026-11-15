@@ -5,8 +5,10 @@ import math
 import re
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPException
+from typing import Literal
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -15,10 +17,13 @@ from zoneinfo import ZoneInfo
 
 DEFAULT_TRANSIT_API_URL = "https://api.transitous.org/api"
 # Station entrances as coordinates keep them independent of feed-specific stop IDs.
-STATIONS = ("48.14021,11.55853", "48.12806,11.60365")
+HAUPTBAHNHOF = "48.14021,11.55853"
+OSTBAHNHOF = "48.12806,11.60365"
+STATIONS = (HAUPTBAHNHOF, OSTBAHNHOF)
 USER_AGENT = "MietRadar/1.0 (+https://github.com/T-Berger/MietRadar)"
 MUNICH_TIME = ZoneInfo("Europe/Berlin")
 MAX_DURATION_SECONDS = 30 * 60
+SECONDARY_DURATION_SECONDS = 45 * 60
 MAX_REQUESTS_PER_DAY = 300
 _DAY = 24 * 60 * 60
 _CITY_NAMES = {"münchen", "muenchen", "munich"}
@@ -90,7 +95,7 @@ def _exact_coordinates(matches, address: re.Match) -> str | None:
     return f"{lat:.7f},{lon:.7f}"
 
 
-def _route_within_limit(itinerary, departure: datetime) -> bool | None:
+def _route_seconds(itinerary, departure: datetime) -> float | None:
     if not isinstance(itinerary, dict):
         return None
     legs = itinerary.get("legs")
@@ -102,9 +107,9 @@ def _route_within_limit(itinerary, departure: datetime) -> bool | None:
     if any(mode != "WALK" and mode not in _TRANSIT_MODES for mode in modes) or not any(
         mode in _TRANSIT_MODES for mode in modes
     ):
-        return False
+        return math.inf
     if any(leg.get("cancelled") for leg in legs):
-        return False
+        return math.inf
     try:
         start = datetime.fromisoformat(itinerary["startTime"].replace("Z", "+00:00"))
         end = datetime.fromisoformat(itinerary["endTime"].replace("Z", "+00:00"))
@@ -112,7 +117,18 @@ def _route_within_limit(itinerary, departure: datetime) -> bool | None:
         return None
     if start.tzinfo is None or end.tzinfo is None or end <= start:
         return None
-    return start >= departure and (end - departure).total_seconds() <= MAX_DURATION_SECONDS
+    return (end - departure).total_seconds() if start >= departure else math.inf
+
+
+@dataclass(frozen=True)
+class _StationRoutes:
+    fastest_seconds: float = math.inf
+    incomplete: bool = False
+
+    def within(self, limit: int) -> bool | None:
+        if self.fastest_seconds <= limit:
+            return True
+        return None if self.incomplete else False
 
 
 class TransitRouter:
@@ -130,42 +146,59 @@ class TransitRouter:
         self._requests: deque[float] = deque()
         self._retry_after = 0.0
         self._geocodes: dict[str, tuple[float, str | None]] = {}
-        self._routes: dict[tuple[str, datetime], tuple[float, bool]] = {}
+        self._routes: dict[tuple[str, str, datetime, int], tuple[float, _StationRoutes]] = {}
 
     def qualifies(self, origin: str, now: datetime) -> bool | None:
         """Return whether either station is within 30 minutes, or None if unknown."""
+        coordinates = self._coordinates(origin)
+        if not coordinates:
+            return None
+        return self._qualifies(coordinates, _next_weekday_departure(now))
+
+    def _qualifies(self, coordinates: str, departure: datetime) -> bool | None:
+        incomplete = False
+        for station in STATIONS:
+            routes = self._routes_between(coordinates, station, departure, MAX_DURATION_SECONDS)
+            result = routes.within(MAX_DURATION_SECONDS)
+            if result is True:
+                return True
+            incomplete |= result is None
+        return None if incomplete else False
+
+    def classify(self, origin: str, now: datetime) -> tuple[Literal["a", "b", "c", "outside"] | None, int | None]:
+        """Classify the commute. B and C measure from the station to the listing."""
+        coordinates = self._coordinates(origin)
+        if not coordinates:
+            return None, None
+        departure = _next_weekday_departure(now)
+        primary = self._qualifies(coordinates, departure)
+        if primary is True:
+            return "a", None
+        if primary is None:
+            return None, None
+        for station, tier in ((OSTBAHNHOF, "b"), (HAUPTBAHNHOF, "c")):
+            routes = self._routes_between(station, coordinates, departure, SECONDARY_DURATION_SECONDS)
+            result = routes.within(SECONDARY_DURATION_SECONDS)
+            if result is None:
+                return None, None
+            if result:
+                return tier, math.ceil(routes.fastest_seconds / 60)
+        return "outside", None
+
+    def _coordinates(self, origin: str) -> str | None:
         address = _ADDRESS.fullmatch(" ".join((origin or "").split()))
         if not address or address["city"].casefold() not in _CITY_NAMES:
             return None
 
         canonical = f"{address['street']} {address['number'].strip()}, {address['postcode']} München"
-        departure = _next_weekday_departure(now)
         clock = time.monotonic()
-        key = (canonical, departure)
-        if (cached_route := self._routes.get(key)) is not None and cached_route[0] > clock:
-            return cached_route[1]
-
         if (cached_point := self._geocodes.get(canonical)) is not None and cached_point[0] > clock:
-            coordinates = cached_point[1]
-        else:
-            matches = self._get_json("v1/geocode", {"text": canonical, "type": "ADDRESS", "language": "de"})
-            coordinates = _exact_coordinates(matches, address)
-            if isinstance(matches, list):
-                self._cache(self._geocodes, canonical, clock + _DAY, coordinates)
-        if not coordinates:
-            return None
-
-        outcomes = []
-        for station in STATIONS:
-            outcome = self._station_qualifies(coordinates, station, departure)
-            if outcome is True:
-                self._cache(self._routes, key, clock + 600, True)
-                return True
-            outcomes.append(outcome)
-        if None in outcomes:
-            return None
-        self._cache(self._routes, key, clock + 600, False)
-        return False
+            return cached_point[1]
+        matches = self._get_json("v1/geocode", {"text": canonical, "type": "ADDRESS", "language": "de"})
+        coordinates = _exact_coordinates(matches, address)
+        if isinstance(matches, list):
+            self._cache(self._geocodes, canonical, clock + _DAY, coordinates)
+        return coordinates
 
     @staticmethod
     def _cache(cache, key, expires_at, value) -> None:
@@ -197,23 +230,33 @@ class TransitRouter:
         except (OSError, ValueError, HTTPException):
             return None
 
-    def _station_qualifies(self, origin: str, station: str, departure: datetime) -> bool | None:
+    def _routes_between(self, origin: str, destination: str, departure: datetime, limit: int) -> _StationRoutes:
+        clock = time.monotonic()
+        key = (origin, destination, departure, limit)
+        if (cached := self._routes.get(key)) is not None and cached[0] > clock:
+            return cached[1]
+
         payload = self._get_json("v6/plan", {
             "fromPlace": origin,
-            "toPlace": station,
+            "toPlace": destination,
             "time": departure.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "transitModes": ",".join(_TRANSIT_MODES),
             "directModes": "",
-            "maxTravelTime": "30",
-            "searchWindow": str(MAX_DURATION_SECONDS),
+            "maxTravelTime": str(limit // 60),
+            "searchWindow": str(limit),
             "useRoutedTransfers": "true",
         })
         if not isinstance(payload, dict) or not isinstance(payload.get("itineraries"), list):
-            return None
-        unknown = False
+            return _StationRoutes(incomplete=True)
+        fastest = math.inf
+        incomplete = False
         for itinerary in payload["itineraries"]:
-            outcome = _route_within_limit(itinerary, departure)
-            if outcome is True:
-                return True
-            unknown = unknown or outcome is None
-        return None if unknown else False
+            seconds = _route_seconds(itinerary, departure)
+            if seconds is None:
+                incomplete = True
+            else:
+                fastest = min(fastest, seconds)
+        result = _StationRoutes(fastest, incomplete)
+        if not incomplete or fastest <= limit:
+            self._cache(self._routes, key, clock + 600, result)
+        return result

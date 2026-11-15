@@ -13,7 +13,7 @@
 
 Der Radar sucht WG-Zimmer, Einzimmerwohnungen und Wohnungen in München auf WG-Gesucht und optional über Suchalarme von Kleinanzeigen. Er sortiert passende Entwürfe nach Datum. Standardmäßig gilt ein Zeitfenster von 24 Stunden. Bei Kleinanzeigen zählt der Eingang des Suchalarms im Postfach.
 
-- **Lage:** Zum Hauptbahnhof **oder** zum Ostbahnhof dauert es mit dem ÖPNV inklusive Fußwegen höchstens 30 Minuten. Als Vergleich dient die Abfahrt am nächsten Werktag (Mo–Fr) um 08:00 Uhr Münchner Zeit. Anzeigen ohne aussagekräftige öffentliche Adresse oder prüfbare Route landen nicht in der Entwurfsliste.
+- **Lage:** Für Liste A dauert die Fahrt von der Adresse zum Hauptbahnhof **oder** zum Ostbahnhof höchstens 30 Minuten. Für weitere Angebote prüft der Radar die Gegenrichtung: B bis 45 Minuten **ab Ostbahnhof**, C bis 45 Minuten **ab Hauptbahnhof**. B hat Vorrang, wenn beide Verbindungen passen. Die Fahrzeit enthält Fußwege und Wartezeit ab 08:00 Uhr am nächsten Werktag (Mo–Fr) Münchner Zeit. Die Listen B und C stehen im Dashboard zur Durchsicht.
 - **WG:** Klar formulierte Gesuche nur für Studierende oder nur für Frauen werden aussortiert. Liegt ein genanntes Alter der Mitbewohnenden außerhalb von **21 bis 35 einschließlich**, wird die Anzeige übersprungen. Fehlende Altersangaben werden akzeptiert. Der Textfilter erfasst gängige Formulierungen; prüf die Anzeige vor dem Abschicken noch einmal.
 - **Bewerbung:** Standardmäßig speichert der Radar Entwürfe für dich. Du kannst ihn auch automatisch verschicken lassen. Für personalisierte Absätze kannst du Mistral Studio hinzufügen: Das ist die API von Mistral, die unabhängig vom Vibe-Chatkonto eingerichtet wird. Dein persönlicher Bewerbungstext bleibt in deiner Vorlage.
 
@@ -46,7 +46,7 @@ Im öffentlichen Modus erfasst der Radar je Suche standardmäßig zwei Ergebniss
 
 Das Streamlit-Dashboard zeigt neue passende Angebote, Bewerbungsentwürfe, offene Adressprüfungen, Antwortentwürfe und den Verlauf. Du kannst den Text ansehen und kopieren. Das Dashboard liest die SQLite-Datenbank des Workers.
 
-Unter **Angebote** kannst du das letzte Wochenende oder eigene Kalendertage in Münchner Zeit auswählen. **Veröffentlicht** zeigt Anzeigen mit einem belegten Veröffentlichungsdatum. **Zuerst gesehen** zeigt dagegen, wann MietRadar Anzeigen ohne belegtes Veröffentlichungsdatum erstmals erfasst hat. Die Datumsansicht zeigt auch erfasste Anzeigen ohne Entwurf. Ein Veröffentlichungsdatum ohne Uhrzeit reicht für die Datumsansicht. Der automatische Versand verwendet weiterhin nur Zeitangaben, die eine frische Anzeige belegen.
+Unter **Angebote** kannst du das letzte Wochenende oder eigene Kalendertage in Münchner Zeit auswählen. **Veröffentlicht** zeigt Anzeigen mit einem belegten Veröffentlichungsdatum. **Zuerst gesehen** zeigt dagegen, wann MietRadar Anzeigen ohne belegtes Veröffentlichungsdatum erstmals erfasst hat. Die Datumsansicht zeigt auch erfasste Anzeigen ohne Entwurf. Ein Veröffentlichungsdatum ohne Uhrzeit reicht für die Datumsansicht. Der Radar erstellt Bewerbungsentwürfe und versendet Bewerbungen ausschließlich für Liste A.
 
 Lokal: Installiere die Abhängigkeiten mit `pip install -r requirements-dashboard.txt` und hinterlege ein eigenes langes Passwort als `MUNICH_DASHBOARD_PASSWORD` in deiner privaten `config/.env`. Starte den Worker und öffne das Dashboard in einem zweiten Terminal:
 
@@ -64,7 +64,7 @@ Speichere auf Kleinanzeigen eine Suche für Münchner Mietwohnungen oder Auf Zei
 
 Bei einem eigenen Postfach für Suchalarme, etwa [mailbox.org](https://kb.mailbox.org/en/private/e-mail/e-mail-configuration/), kannst du `INBOX` direkt verwenden. Setze bei mailbox.org `MUNICH_IMAP_HOST=imap.mailbox.org`, den vollständigen Postfachnamen als Benutzer und ein [App-Passwort nur für IMAP](https://kb.mailbox.org/en/business/security-and-privacy/e-mail-password/). Kopiere den tatsächlichen Absender aus einem angekommenen Suchalarm.
 
-Der Radar verarbeitet direkte Inseratslinks aus den Suchalarm-Mails. Enthält der Alarm eine vollständige Münchner Adresse, prüft er dieselbe ÖPNV-Verbindung wie bei WG-Gesucht. Mit einer PLZ, einem Viertel oder einem [ungefähren Kartenpunkt](https://hilfe.kleinanzeigen.de/hc/de/articles/29128094755100-Neu-Immobilien-auf-der-Karte-ansehen) bleibt der Treffer zur Ortsprüfung offen. Wenn du im Inserat eine genaue Adresse findest, kannst du sie selbst prüfen lassen. Ein Entwurf entsteht erst, wenn die Route bestätigt ist.
+Der Radar verarbeitet direkte Inseratslinks aus den Suchalarm-Mails. Enthält der Alarm eine vollständige Münchner Adresse, vergibt er dieselben ÖPNV-Bewertungen wie bei WG-Gesucht. Mit einer PLZ, einem Viertel oder einem [ungefähren Kartenpunkt](https://hilfe.kleinanzeigen.de/hc/de/articles/29128094755100-Neu-Immobilien-auf-der-Karte-ansehen) bleibt der Treffer zur Ortsprüfung offen. Wenn du im Inserat eine genaue Adresse findest, kannst du sie selbst prüfen lassen.
 
 ```bash
 python src/munich_radar.py klein-review

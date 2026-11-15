@@ -96,3 +96,47 @@ class TransitRouterTest(unittest.TestCase):
         urlopen.side_effect = [response([GEOCODE]), response({"itineraries": []})]
         self.assertIsNone(TransitRouter().qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE))
         self.assertEqual(urlopen.call_count, 2)
+
+    @patch("src.munich_transit.urlopen")
+    def test_primary_check_and_tiers_use_the_correct_route_direction(self, urlopen):
+        coordinates = f"{GEOCODE['lat']:.7f},{GEOCODE['lon']:.7f}"
+        hbf, ost = STATIONS
+        primary_plans = [(coordinates, hbf, "30", "1800"), (coordinates, ost, "30", "1800")]
+        secondary_plans = [(ost, coordinates, "45", "2700"), (hbf, coordinates, "45", "2700")]
+        cases = (
+            (("06:42:00", "06:30:00"), ("a", None), primary_plans),
+            (("06:33:00", "06:38:00", "06:45:00"), ("b", 45), primary_plans + secondary_plans[:1]),
+            (("06:33:00", "06:38:00", "06:45:01", "06:25:01"), ("c", 26), primary_plans + secondary_plans),
+            (("06:45:00", "06:46:00", "06:47:00", "06:45:00"), ("c", 45), primary_plans + secondary_plans),
+            (("06:45:01", "06:46:00", "06:47:00", "06:45:01"), ("outside", None), primary_plans + secondary_plans),
+        )
+        for arrivals, expected, expected_plans in cases:
+            with self.subTest(arrivals=arrivals):
+                urlopen.reset_mock()
+                urlopen.side_effect = [response([GEOCODE])] + [
+                    response({"itineraries": [route("06:10:00", arrival)]}) for arrival in arrivals]
+                self.assertEqual(TransitRouter().classify(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), expected)
+                plans = [parse_qs(urlsplit(call.args[0].full_url).query) for call in urlopen.call_args_list[1:]]
+                self.assertEqual([
+                    (plan["fromPlace"][0], plan["toPlace"][0], plan["maxTravelTime"][0], plan["searchWindow"][0])
+                    for plan in plans
+                ], expected_plans)
+
+    @patch("src.munich_transit.urlopen")
+    def test_a_verified_primary_route_can_be_reused_for_the_strict_check(self, urlopen):
+        urlopen.side_effect = [response([GEOCODE]), response({"itineraries": [route("06:10:00", "06:30:00")]})]
+        router = TransitRouter()
+        self.assertEqual(router.classify(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), ("a", None))
+        self.assertIs(router.qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), True)
+        self.assertEqual(urlopen.call_count, 2)
+
+    @patch("src.munich_transit.urlopen")
+    def test_unknown_route_keeps_the_tier_unknown(self, urlopen):
+        for previous_checks in (1, 2):
+            with self.subTest(previous_checks=previous_checks):
+                urlopen.reset_mock()
+                urlopen.side_effect = [response([GEOCODE])] + [
+                    response({"itineraries": []}) for _ in range(previous_checks)
+                ] + [URLError("offline")]
+                self.assertEqual(TransitRouter().classify(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), (None, None))
+                self.assertEqual(urlopen.call_count, previous_checks + 2)

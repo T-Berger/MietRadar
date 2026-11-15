@@ -24,7 +24,7 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
             (newest, NOW - timedelta(minutes=5)), (unknown, NOW - timedelta(minutes=4)),
             (no_route, NOW - timedelta(minutes=2)),
         ]
-        router.qualifies.side_effect = lambda address, now: address != no_route.address
+        router.classify.side_effect = lambda address, now: ("outside", None) if address == no_route.address else ("a", None)
         sender = RecordingSender()
         queue = DeliveryQueue(sender, clock=lambda: NOW)
         radar = KleinanzeigenRadar(router, "Hi, ich bin 28.", "none", delivery=queue)
@@ -44,11 +44,13 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
         cutoff = NOW - timedelta(days=1)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             radar.scan(db, inbox, NOW, cutoff, 10, {})
-            router.qualifies.return_value = True
+            router.classify.return_value = ("a", None)
             self.assertTrue(radar.check_address(db, listing.id, "Musterstraße 12, 81667 München", NOW, cutoff)[0])
+            inbox.recent_items.return_value = []
             router.qualifies.return_value = False
             radar.scan(db, inbox, NOW, cutoff, 10, {})
             self.assertEqual(sender.attempts, [])
+        router.qualifies.assert_called_once()
 
 
 if __name__ == "__main__":
