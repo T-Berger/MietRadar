@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from kleinanzeigen_activity import EmailNotifier, install_activity, record_activity, record_replies
 from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
+from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
 from llm_personalizer import personalise_message
 from munich_delivery import DeliveryQueue, install_schema
 from munich_transit import TransitRouter
@@ -66,6 +67,7 @@ def _database(path: Path) -> sqlite3.Connection:
     install_schema(db)
     install_klein_review(db)
     install_activity(db)
+    install_reply_queue(db)
     return db
 
 
@@ -172,7 +174,8 @@ class Scanner:
                 if not saved.rowcount:
                     continue
             if self.delivery:
-                result = self.delivery.deliver(db, listing.id, listing.url, message, fresh_at, self.max_age)
+                result = self.delivery.deliver(db, listing.id, listing.url, message, fresh_at, self.max_age,
+                                               context=listing.description)
                 if result:
                     counts[result] += 1
         return counts
@@ -202,6 +205,15 @@ def _email_notifier() -> EmailNotifier | None:
     if not (os.getenv("MUNICH_NOTIFY_EMAIL_TO", "").strip() or os.getenv("MUNICH_NOTIFY_EMAIL_FROM", "").strip()):
         return None
     return EmailNotifier(_required("RESEND_API_KEY"), _required("MUNICH_NOTIFY_EMAIL_FROM"), _required("MUNICH_NOTIFY_EMAIL_TO"))
+
+
+def _outgoing_provider() -> str:
+    provider = os.getenv("MUNICH_OUTGOING_JUDGE_PROVIDER", "none").strip().lower()
+    if provider not in {"mistral", "none"}:
+        raise ValueError("MUNICH_OUTGOING_JUDGE_PROVIDER muss mistral oder none sein (none nutzt lokale Regeln)")
+    if provider == "mistral":
+        _required("MISTRAL_API_KEY")
+    return provider
 
 
 def _draft_settings() -> tuple[str, str]:
@@ -247,7 +259,8 @@ def main() -> int:
     load_dotenv(ROOT / "config" / ".env")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("watch", "scan", "drafts", "delivery", "done", "klein-review", "klein-address", "klein-activity"))
+    parser.add_argument("command", choices=("watch", "scan", "drafts", "delivery", "done", "klein-review", "klein-address",
+                                                "klein-activity", "klein-reply-drafts", "outgoing-checks"))
     parser.add_argument("id", nargs="?", help="Anzeigennummer, bei Kleinanzeigen mit ka- am Anfang")
     parser.add_argument("--address", help="Veröffentlichte Adresse für klein-address")
     args = parser.parse_args()
@@ -261,6 +274,28 @@ def main() -> int:
         max_age = timedelta(hours=_number("MUNICH_MAX_AGE_HOURS", 24, 1, 72))
         data_dir = Path(os.getenv("MUNICH_DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ROOT / "data")
         with closing(_database(data_dir / "munich_radar.sqlite3")) as db:
+            if args.command == "outgoing-checks":
+                query = "SELECT id, kind, approved, reason FROM outgoing_checks"
+                rows = db.execute(query + (" WHERE id = ?" if args.id else "") + " ORDER BY checked_at DESC LIMIT 50",
+                                  (args.id,) if args.id else ()).fetchall()
+                for item_id, kind, approved, reason in rows:
+                    print(f"{item_id} · {'Antwort' if kind == 'reply' else 'Bewerbung'} · {'freigegeben' if approved else 'zurückgehalten'}\n{reason}")
+                if not rows:
+                    print("Keine ausgehenden Nachrichten geprüft.")
+                return 0
+            if args.command == "klein-reply-drafts":
+                query = """SELECT d.id, d.listing_id, d.url, d.message, d.state, c.reason
+                           FROM klein_reply_drafts d LEFT JOIN outgoing_checks c ON c.id = d.id AND c.kind = 'reply'"""
+                rows = db.execute(query + (" WHERE d.id = ? OR d.listing_id = ?" if args.id else "")
+                                  + " ORDER BY d.received_at DESC LIMIT 30", (args.id, args.id) if args.id else ()).fetchall()
+                states = {"draft": "Entwurf", "held": "Zurückgehalten", "unconfirmed": "Versand unklar", "sent": "Gesendet"}
+                for reply_id, listing_id, url, message, state, reason in rows:
+                    print(f"{reply_id} · {listing_id or 'Kleinanzeigen'} · {states[state]}\n{url}\n{message}")
+                    if reason:
+                        print(reason)
+                if not rows:
+                    print("Keine Kleinanzeigen-Antwortentwürfe.")
+                return 0
             if args.command == "klein-activity":
                 query = "SELECT listing_id, url, subject, summary, occurred_at FROM klein_activity"
                 params = ()
@@ -338,22 +373,30 @@ def main() -> int:
             scanner = _scanner(max_age)
             reply_inbox, judge_provider = _reply_settings()
             notifier = _email_notifier()
+            outgoing_provider = _outgoing_provider()
+            reply_mode = os.getenv("KLEINANZEIGEN_REPLY_MODE", "draft").strip().lower()
+            if reply_mode not in {"auto", "draft"}:
+                raise ValueError("KLEINANZEIGEN_REPLY_MODE muss auto oder draft sein")
+            if reply_mode == "auto" and reply_inbox is None:
+                raise ValueError("Für automatische Antworten zuerst Kleinanzeigen-Antwortmails einrichten")
+            limit = _number("MUNICH_DAILY_SEND_LIMIT", 3, 1, 5)
+            reply_dispatcher = None
             with ExitStack() as sessions:
                 if _switch("MUNICH_AUTOSEND", False):
                     try:
                         from wg_delivery import BrowserSender
                     except ModuleNotFoundError as exc:
                         raise ValueError("Für den Versand: pip install -r requirements-send.txt") from exc
-                    limit = _number("MUNICH_DAILY_SEND_LIMIT", 3, 1, 5)
                     sender = BrowserSender(
                         data_dir / "munich_browser",
                         headless=_switch("MUNICH_BROWSER_HEADLESS", True),
                         email=os.getenv("WG_EMAIL", "").strip(), password=os.getenv("WG_PASSWORD", ""),
                     )
                     sessions.callback(sender.close)
-                    scanner.delivery = DeliveryQueue(sender, limit)
-                if _switch("KLEINANZEIGEN_AUTOSEND", False):
-                    if scanner.klein_alerts is None:
+                    scanner.delivery = DeliveryQueue(sender, limit, judge_provider=outgoing_provider)
+                klein_autosend = _switch("KLEINANZEIGEN_AUTOSEND", False)
+                if klein_autosend or reply_mode == "auto":
+                    if klein_autosend and scanner.klein_alerts is None:
                         raise ValueError("Für Kleinanzeigen-Versand zuerst Kleinanzeigen-Suchalarme einrichten")
                     try:
                         from kleinanzeigen_delivery import KleinanzeigenBrowserSender
@@ -363,10 +406,14 @@ def main() -> int:
                         data_dir / "kleinanzeigen_browser", headless=_switch("KLEINANZEIGEN_BROWSER_HEADLESS", True),
                     )
                     sessions.callback(klein_sender.close)
-                    scanner.klein_delivery = DeliveryQueue(klein_sender, _number("MUNICH_DAILY_SEND_LIMIT", 3, 1, 5))
+                    if klein_autosend:
+                        scanner.klein_delivery = DeliveryQueue(klein_sender, limit, judge_provider=outgoing_provider)
+                    if reply_mode == "auto":
+                        reply_dispatcher = ReplyDispatcher(klein_sender, outgoing_provider, limit)
                 interval = _number("MUNICH_POLL_SECONDS", 300, 60, 3600)
                 return _poll(scanner, db, interval, once=args.command == "scan",
-                             reply_inbox=reply_inbox, judge_provider=judge_provider, notifier=notifier)
+                             reply_inbox=reply_inbox, judge_provider=judge_provider, notifier=notifier,
+                             outgoing_provider=outgoing_provider, reply_dispatcher=reply_dispatcher)
     except (OSError, sqlite3.Error, ValueError) as exc:
         LOG.error("Start fehlgeschlagen: %s", exc)
         return 1
@@ -384,6 +431,7 @@ def _switch(name: str, default: bool) -> bool:
 def _poll(
     scanner: Scanner, db: sqlite3.Connection, interval: int, *, once: bool,
     reply_inbox: AlertsInbox | None = None, judge_provider: str = "none", notifier: EmailNotifier | None = None,
+    outgoing_provider: str = "none", reply_dispatcher: ReplyDispatcher | None = None,
 ) -> int:
     delay = interval
     retry_after: dict[str, datetime] = {}
@@ -399,15 +447,21 @@ def _poll(
             delay = min(max(600, delay * 2), 3600)
         now = datetime.now(timezone.utc)
         klein_paused = scanner.klein_delivery is not None and scanner.klein_delivery.paused
-        record_activity(db, now, klein_paused)
         if reply_inbox:
             try:
-                replied = record_replies(db, reply_inbox, judge_provider, now)
+                replied = record_replies(db, reply_inbox, judge_provider, now, outgoing_provider=outgoing_provider)
                 if replied:
                     counts["Kleinanzeigen-Antworten bewertet"] += replied
+                if reply_dispatcher and not klein_paused:
+                    answers = reply_dispatcher.run(db, now)
+                    if answers:
+                        counts["Kleinanzeigen-Antworten gesendet"] += answers
             except AlertsError as exc:
                 LOG.warning("Kleinanzeigen-Antworten nicht erreichbar: %s", exc)
                 failed = True
+        reply_paused = reply_dispatcher is not None and reply_dispatcher.paused
+        now = datetime.now(timezone.utc)
+        record_activity(db, now, klein_paused or reply_paused)
         if notifier:
             sent, ok = notifier.flush(db, now)
             if sent:
@@ -417,7 +471,7 @@ def _poll(
                 failed = True
         LOG.info("Scan fertig: %s", ", ".join(f"{n} {key}" for key, n in counts.items()) or "nichts Neues")
         if once:
-            return int(failed or klein_paused or (scanner.delivery is not None and scanner.delivery.paused))
+            return int(failed or klein_paused or reply_paused or (scanner.delivery is not None and scanner.delivery.paused))
         time.sleep(delay)
 
 

@@ -41,7 +41,7 @@ class DeliveryTest(unittest.TestCase):
     def test_expiry_is_rechecked_before_click_and_send_window_cannot_exceed_24h(self):
         listing = offer(1, 24)
         self.draft(listing)
-        times = iter((NOW, NOW + timedelta(seconds=1), NOW + timedelta(seconds=1)))
+        times = iter((NOW, NOW, NOW + timedelta(seconds=1), NOW + timedelta(seconds=1)))
         sender = RecordingSender()
         result = self.run_delivery(DeliveryQueue(sender, clock=lambda: next(times)), listing, timedelta(hours=72))
         self.assertIsNone(result)

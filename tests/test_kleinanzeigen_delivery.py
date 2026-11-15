@@ -13,6 +13,8 @@ from munich_delivery import DeliveryOutcome
 LISTING = "https://www.kleinanzeigen.de/s-anzeige/zimmer-in-muenchen/4212345678-199-6432"
 OTHER_LISTING = LISTING.replace("4212345678", "4212345679")
 INBOX = "https://www.kleinanzeigen.de/m-nachrichten.html"
+CONVERSATION = INBOX + "#ad:thread"
+LISTING_ID = "ka-4212345678"
 TEXT = "Hallo, ich interessiere mich für das Zimmer."
 
 
@@ -122,6 +124,86 @@ class KleinanzeigenSenderTest(unittest.TestCase):
         self.assertFalse(self.sender._confirmed(self.driver, LISTING, TEXT, after + timedelta(seconds=1)))
         outgoing.find_elements.side_effect = lambda by, selector: [timestamp] if selector == "time[datetime]" else []
         self.assertFalse(self.sender._confirmed(self.driver, LISTING, TEXT, after))
+
+
+class KleinanzeigenReplySenderTest(unittest.TestCase):
+    def setUp(self):
+        self.sender = KleinanzeigenBrowserSender(Path("unused-profile"))
+        self.driver = Mock(current_url=CONVERSATION, title="Meine Nachrichten")
+        self.sender._driver = self.driver
+        self.thread, self.form, self.outgoing = (element() for _ in range(3))
+        self.link = element(href=LISTING)
+        self.area = element()
+        self.submit = element("Senden")
+        self.draft = ""
+        self.visible_outgoing = False
+
+        self.area.send_keys.side_effect = lambda text: setattr(self, "draft", text)
+        self.area.get_attribute.side_effect = lambda name: self.draft if name == "value" else None
+        self.submit.is_enabled.side_effect = lambda: bool(self.draft)
+        self.submit.click.side_effect = lambda: setattr(self, "visible_outgoing", True)
+        self.driver.find_elements.side_effect = lambda by, selector: [self.thread] if selector.startswith("[role='log']") else []
+        self.thread.find_elements.side_effect = self.find_in_thread
+        self.form.find_elements.side_effect = lambda by, selector: (
+            [self.area] if selector == "textarea" else [self.submit] if selector.startswith("button,") else []
+        )
+        timestamp = element(datetime=(datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat())
+        self.outgoing.find_elements.side_effect = lambda by, selector: [timestamp] if selector == "time[datetime]" else [element(TEXT)]
+        wait = patch("kleinanzeigen_delivery.WebDriverWait", return_value=Mock(until=self.evaluate))
+        wait.start()
+        self.addCleanup(wait.stop)
+
+    def evaluate(self, predicate):
+        if value := predicate(self.driver):
+            return value
+        raise TimeoutException()
+
+    def find_in_thread(self, by, selector):
+        if selector == "a[href]":
+            return [self.link]
+        if selector.startswith("form,"):
+            return [self.form]
+        if selector.startswith("[data-direction=") and self.visible_outgoing:
+            return [self.outgoing]
+        return []
+
+    def test_reply_claim_precedes_click_and_new_matching_outgoing_text_confirms_delivery(self):
+        def claim():
+            self.assertEqual(self.draft, TEXT)
+            self.submit.click.assert_not_called()
+            return True
+
+        result = self.sender.send_reply(CONVERSATION, LISTING_ID, TEXT, claim)
+        self.assertIs(result, DeliveryOutcome.SENT)
+        self.driver.get.assert_called_once_with(CONVERSATION)
+        self.submit.click.assert_called_once_with()
+
+    def test_reply_refuses_generic_inbox_unsafe_characters_and_wrong_listing(self):
+        claim = Mock()
+        self.assertIs(self.sender.send_reply(INBOX, LISTING_ID, TEXT, claim), DeliveryOutcome.UNAVAILABLE)
+        self.assertIs(self.sender.send_reply(CONVERSATION, LISTING_ID, TEXT + "\n", claim), DeliveryOutcome.UNAVAILABLE)
+        self.driver.get.assert_not_called()
+        self.link = element(href=OTHER_LISTING)
+        self.assertIs(self.sender.send_reply(CONVERSATION, LISTING_ID, TEXT, claim), DeliveryOutcome.BLOCKED)
+        self.area.send_keys.assert_not_called()
+        claim.assert_not_called()
+        self.submit.click.assert_not_called()
+
+    def test_reply_leaves_existing_unsent_text_and_respects_claim_failure(self):
+        self.draft = "Eine ungesendete persönliche Nachricht"
+        claim = Mock()
+        self.assertIs(self.sender.send_reply(CONVERSATION, LISTING_ID, TEXT, claim), DeliveryOutcome.BLOCKED)
+        self.area.send_keys.assert_not_called()
+        claim.assert_not_called()
+        self.draft = ""
+        self.assertIs(self.sender.send_reply(CONVERSATION, LISTING_ID, TEXT, lambda: False), DeliveryOutcome.SKIPPED)
+        self.submit.click.assert_not_called()
+
+    def test_already_visible_matching_outgoing_message_does_not_confirm_new_send(self):
+        self.visible_outgoing = True
+        result = self.sender.send_reply(CONVERSATION, LISTING_ID, TEXT, lambda: True)
+        self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+        self.submit.click.assert_called_once_with()
 
 
 if __name__ == "__main__":
