@@ -4,10 +4,10 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from dashboard_data import load_dashboard
+from dashboard_data import load_dashboard, weekend_dates
 from munich_radar import _database
 
 
@@ -89,3 +89,51 @@ class DashboardDataTest(unittest.TestCase):
         data = load_dashboard(self.path, now=NOW)
         self.assertEqual(data.matches, ())
         self.assertEqual(data.wg_scan, (current, 2))
+
+    def test_weekend_postings_and_first_sightings_use_separate_berlin_dates(self):
+        monday = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
+        saturday, sunday = weekend_dates(monday.date())
+        self.assertEqual((saturday, sunday), (date(2026, 11, 14), date(2026, 11, 15)))
+        self.assertEqual(weekend_dates(saturday), (saturday, sunday))
+        saturday_start = datetime(2026, 11, 13, 23, tzinfo=timezone.utc).timestamp()
+        monday_start = datetime(2026, 11, 15, 23, tzinfo=timezone.utc).timestamp()
+
+        with closing(_database(self.path)) as db, db:
+            if "published_day" not in {row[1] for row in db.execute("PRAGMA table_info(wg_observations)")}:
+                db.execute("ALTER TABLE wg_observations ADD COLUMN published_day TEXT")
+            db.executemany("""INSERT INTO wg_observations (id, url, first_seen_at, last_seen_at, published_at, published_day)
+                              VALUES (?, 'https://www.wg-gesucht.de/test.html', ?, ?, ?, ?)""", [
+                ("old", saturday_start, monday_start, saturday_start - 1, None),
+                ("first-minute", saturday_start, monday_start, saturday_start, None),
+                ("last-minute", monday_start - 1, monday_start, monday_start - 1, None),
+                ("monday", monday_start, monday_start, monday_start, None),
+                ("day-only", saturday_start, monday_start, None, sunday.isoformat()),
+                ("sighting", saturday_start, monday_start, None, None),
+                ("fallback", saturday_start, monday_start, None, None),
+            ])
+            db.executemany("INSERT INTO drafts VALUES (?, ?, ?, ?, ?, ?)", [
+                ("first-minute", "https://www.wg-gesucht.de/12.html", saturday_start, "veröffentlicht", "Stale draft", 0),
+                ("sighting", "https://www.wg-gesucht.de/13.html", saturday_start, "zuerst gesehen", "Stale draft", 0),
+                ("fallback", "https://www.wg-gesucht.de/14.html", saturday_start, "veröffentlicht", "Stale draft", 0),
+                ("day-only", "https://www.wg-gesucht.de/15.html", monday_start - 1, "zuerst gesehen", "Draft", 0),
+            ])
+
+        postings = load_dashboard(self.path, now=monday, posting_window=(saturday, sunday))
+        self.assertEqual([(row.id, row.day, row.matched) for row in postings.dated_listings], [
+            ("last-minute", sunday, False), ("day-only", sunday, True),
+            ("first-minute", saturday, True), ("fallback", saturday, True),
+        ])
+        self.assertEqual([row.id for row in postings.matches], ["day-only"])
+        self.assertEqual(postings.matches[0].published_day, sunday)
+
+        sightings = load_dashboard(self.path, now=monday, posting_window=(saturday, sunday), date_basis="first_seen")
+        self.assertEqual([(row.id, row.day) for row in sightings.dated_listings], [("sighting", saturday)])
+
+    def test_published_drafts_remain_searchable_with_an_old_schema(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TABLE drafts (id TEXT, url TEXT, fresh_at REAL, basis TEXT, message TEXT, done INTEGER)")
+            db.execute("INSERT INTO drafts VALUES (?, ?, ?, ?, ?, ?)",
+                       ("12", "https://www.wg-gesucht.de/12.html", NOW.timestamp(), "Veröffentlicht", None, 1))
+
+        data = load_dashboard(self.path, now=NOW, posting_window=weekend_dates(NOW.date()))
+        self.assertEqual([(row.id, row.day) for row in data.dated_listings], [("12", NOW.date())])

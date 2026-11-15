@@ -5,7 +5,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.client import HTTPException
 from typing import Sequence
 from urllib.error import HTTPError, URLError
@@ -90,6 +90,7 @@ class Listing:
     wg_type: str | None = None
     district: str | None = None
     is_wg: bool = False
+    published_day: date | None = None
 
 
 def _search_url(url):
@@ -129,11 +130,18 @@ def _text(node):
     return _clean(node.get_text(" ", strip=True)) if node else ""
 
 
-def _publication(value):
+def _publication(value) -> datetime | date | None:
     if not isinstance(value, str):
         return None
     value = _clean(value)
     if not re.search(r"\d{1,2}:\d{2}", value):
+        try:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                return date.fromisoformat(value)
+            if re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", value):
+                return datetime.strptime(value, "%d.%m.%Y").date()
+        except ValueError:
+            pass
         return None
     try:
         result = datetime.fromisoformat(value)
@@ -179,26 +187,28 @@ def _online_age(text):
     return timedelta(minutes=int(count) * multiplier)
 
 
-def _details_publication(soup, listing_id):
+def _publication_fields(soup, listing_id):
     for element in soup.select('[itemprop="datePosted"], meta[property="article:published_time"]'):
-        published = _publication(
-            element.get("datetime") or element.get("content") or _text(element)
-        )
-        if published:
-            return published
+        yield element.get("datetime") or element.get("content") or _text(element)
     for item in _structured_listings(soup):
         url = item.get("url")
         ref = ListingRef.from_url(url) if isinstance(url, str) else None
         if ref and ref.id == listing_id:
-            published = _publication(item.get("datePosted"))
-            if published:
-                return published
+            yield item.get("datePosted")
     for label in soup.select("th, td"):
         if _text(label).casefold().rstrip(":") in {"veröffentlicht am", "inseriert am", "erstellt am"}:
-            published = _publication(_text(label.find_next_sibling(["td", "th"])))
-            if published:
-                return published
-    return None
+            yield _text(label.find_next_sibling(["td", "th"]))
+
+
+def _details_publication(soup, listing_id) -> tuple[datetime | None, date | None]:
+    published_day = None
+    for field in _publication_fields(soup, listing_id):
+        published = _publication(field)
+        if isinstance(published, datetime):
+            return published, None
+        if published is not None and published_day is None:
+            published_day = published
+    return None, published_day
 
 
 def _detail_address(soup):
@@ -370,16 +380,18 @@ class WGSource:
             ),
             None,
         )
+        published_at, published_day = _details_publication(soup, ref.id)
         return Listing(
             id=ref.id,
             url=listing_url,
             title=title,
             description=description,
-            published_at=_details_publication(soup, ref.id),
+            published_at=published_at,
             address=address,
             wanted=wanted,
             resident_ages=resident_ages,
             wg_type=wg_type,
             district=district,
             is_wg=bool(residents or wanted or urlsplit(listing_url).path.startswith("/wg-zimmer-")),
+            published_day=published_day,
         )

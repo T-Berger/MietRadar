@@ -91,6 +91,8 @@ class Scanner:
 
     def scan(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         cutoff = now - self.max_age
+        first_eligible_day = cutoff.astimezone(BERLIN).date()
+        current_day = now.astimezone(BERLIN).date()
         with db:
             # Keep IDs for deduplication, but remove expired personal drafts.
             db.execute("UPDATE drafts SET message = NULL WHERE message IS NOT NULL AND fresh_at < ?",
@@ -148,9 +150,15 @@ class Scanner:
                 continue
 
             published_at = listing.published_at
+            published_day = listing.published_day
             observation = observations.get(ref.id)
-            if observation and (published_at is None or published_at.tzinfo is not None):
-                published_at = record_details(db, ref.id, now, published_at)
+            if published_at is None or published_at.tzinfo is not None:
+                published_at, published_day = record_details(db, ref, now, published_at, published_day)
+            if published_at is None and published_day is not None:
+                counts["Veröffentlichungsdaten ohne Uhrzeit"] += 1
+                if not first_eligible_day <= published_day <= current_day:
+                    counts["außerhalb des Zeitfensters"] += 1
+                    continue
             if published_at is not None:
                 fresh_at, basis = published_at, "veröffentlicht"
             elif received_at is not None:
@@ -178,9 +186,10 @@ class Scanner:
             if draft:
                 # A new alert may not extend an existing listing's window.
                 fresh_at = min(fresh_at, datetime.fromtimestamp(draft[0], timezone.utc))
-            eligible.append((fresh_at, listing, basis, draft))
+            may_deliver = basis != FIRST_SEEN_BASIS and (published_at is not None or published_day is None)
+            eligible.append((fresh_at, listing, basis, draft, may_deliver))
 
-        for fresh_at, listing, basis, draft in sorted(eligible, key=lambda item: item[0], reverse=True):
+        for fresh_at, listing, basis, draft, may_deliver in sorted(eligible, key=lambda item: item[0], reverse=True):
             if not listing.address:
                 counts["keine prüfbare Adresse"] += 1
                 retry_after[listing.id] = now + timedelta(minutes=30)
@@ -204,7 +213,7 @@ class Scanner:
                 if not saved:
                     continue
                 counts["neue Entwürfe"] += 1
-            if self.delivery and basis != FIRST_SEEN_BASIS:
+            if self.delivery and may_deliver:
                 result = self.delivery.deliver(db, listing.id, listing.url, message, fresh_at, self.max_age,
                                                context=listing.description)
                 if result:

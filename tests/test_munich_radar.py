@@ -1,7 +1,8 @@
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -145,6 +146,37 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM drafts").fetchone(), (0,))
             scanner.scan(db, NOW + timedelta(hours=26), {})
             self.assertEqual(db.execute("SELECT id FROM drafts").fetchall(), [(new.id,)])
+
+    def test_records_calendar_day_without_drafting_definitely_old_listing(self):
+        old = replace(offer(1, None), published_day=date(2026, 11, 12))
+        source, router = Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.side_effect = [[], [ref(old)]]
+        source.details.return_value = old
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 12)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            scanner.scan(db, NOW, {})
+            scanner.scan(db, NOW + timedelta(hours=1), {})
+            self.assertEqual(db.execute("SELECT published_at, published_day FROM wg_observations").fetchone(),
+                             (None, "2026-11-12"))
+            self.assertEqual(db.execute("SELECT count(*) FROM drafts").fetchone(), (0,))
+        router.qualifies.assert_not_called()
+
+    def test_calendar_day_from_an_alert_never_qualifies_for_automatic_delivery(self):
+        known_day = replace(offer(1, None), published_day=date(2026, 11, 14))
+        alerts, source, router, delivery = Mock(), Mock(), Mock(), Mock()
+        alerts.recent.return_value = [ListingAlert(ref(known_day), NOW - timedelta(minutes=5))]
+        source.details.side_effect = [known_day, replace(known_day, published_day=None)]
+        router.qualifies.return_value = True
+        delivery.paused = False
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=72), 12, alerts, delivery=delivery)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            scanner.scan(db, NOW, {})
+            scanner.scan(db, NOW + timedelta(hours=1), {})
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM drafts").fetchone(), (1,))
+            self.assertEqual(db.execute("SELECT published_at, published_day FROM wg_observations").fetchone(),
+                             (None, "2026-11-14"))
+        delivery.deliver.assert_not_called()
 
 
 class AlertParsingTest(unittest.TestCase):
