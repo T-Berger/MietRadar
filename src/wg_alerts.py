@@ -11,14 +11,19 @@ from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr, parsedate_to_datetime
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from bs4 import BeautifulSoup
 
-from wg_source import Listing, ListingRef
+from wg_source import ListingRef
 
 
-_Item = TypeVar("_Item", ListingRef, Listing)
+class _Identified(Protocol):
+    @property
+    def id(self) -> str: ...
+
+
+_Item = TypeVar("_Item", bound=_Identified)
 
 
 class AlertsError(RuntimeError):
