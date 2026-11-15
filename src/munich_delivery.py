@@ -73,7 +73,8 @@ class DeliveryQueue:
             return False
         info = db.execute(
             """SELECT d.fresh_at FROM drafts d LEFT JOIN delivery s ON s.id = d.id
-               WHERE d.id = ? AND d.done = 0 AND d.message IS NOT NULL AND s.id IS NULL""",
+               WHERE d.id = ? AND d.done = 0 AND d.message IS NOT NULL AND s.id IS NULL
+                 AND d.basis != 'zuerst gesehen'""",
             (listing_id,),
         ).fetchone()
         if info is None or not cutoff.timestamp() <= info[0] <= now.timestamp():

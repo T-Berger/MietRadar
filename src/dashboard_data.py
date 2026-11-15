@@ -18,6 +18,8 @@ _TABLE_COLUMNS = {
     "klein_review": {"id", "url", "title", "fresh_at", "basis", "reason"},
     "klein_reply_drafts": {"id", "listing_id", "url", "message", "received_at", "state"},
     "klein_activity": {"kind", "listing_id", "url", "subject", "summary", "occurred_at"},
+    "wg_inventory_scan": {"id", "scanned_at"},
+    "wg_observations": {"last_seen_at"},
 }
 _PLATFORM_HOSTS = {"www.wg-gesucht.de", "wg-gesucht.de", "www.kleinanzeigen.de", "kleinanzeigen.de"}
 _MAX_ROWS = 100
@@ -73,6 +75,7 @@ class DashboardData:
     address_checks: tuple[AddressCheck, ...] = ()
     replies: tuple[Reply, ...] = ()
     activity: tuple[Activity, ...] = ()
+    wg_scan: tuple[float, int] | None = None
 
 
 def _platform_url(url: str) -> str | None:
@@ -149,6 +152,15 @@ def _activity(db: sqlite3.Connection, cutoff: float, until: float) -> tuple[Acti
                  for kind, listing_id, url, subject, summary, stamp in rows)
 
 
+def _wg_scan(db: sqlite3.Connection, tables: set[str]) -> tuple[float, int] | None:
+    if not {"wg_inventory_scan", "wg_observations"} <= tables:
+        return None
+    return db.execute("""
+        SELECT s.scanned_at, (SELECT COUNT(*) FROM wg_observations WHERE last_seen_at = s.scanned_at)
+        FROM wg_inventory_scan s WHERE s.id = 1 AND s.scanned_at IS NOT NULL
+    """).fetchone()
+
+
 def load_dashboard(
     db_path: Path | str, *, now: datetime | None = None, max_age_hours: int = 24,
 ) -> DashboardData:
@@ -174,6 +186,7 @@ def load_dashboard(
                 address_checks=_address_checks(db, cutoff, until) if "klein_review" in tables else (),
                 replies=_replies(db, tables, history_cutoff, until) if "klein_reply_drafts" in tables else (),
                 activity=_activity(db, history_cutoff, until) if "klein_activity" in tables else (),
+                wg_scan=_wg_scan(db, tables),
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")

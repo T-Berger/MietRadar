@@ -22,7 +22,7 @@ class KleinanzeigenRadarTest(unittest.TestCase):
     def test_combined_scan_keeps_ids_separate_and_sends_only_wg_gesucht(self):
         wg = offer(1, 1)
         klein = klein_offer(1)
-        source, router, inbox, delivery = Mock(), Mock(), Mock(), Mock()
+        source, router, inbox, delivery = Mock(inventory_scope="munich"), Mock(), Mock(), Mock()
         source.candidates.return_value = [ref(wg)]
         source.details.return_value = wg
         router.qualifies.return_value = True

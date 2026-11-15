@@ -74,3 +74,18 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.matches[0].state, "draft")
         self.assertEqual(data.matches[0].url, "https://www.wg-gesucht.de/12.html")
         self.assertEqual(data.address_checks, ())
+        self.assertIsNone(data.wg_scan)
+
+    def test_shows_latest_public_inventory_count_even_without_matches(self):
+        current = NOW.timestamp()
+        earlier = (NOW - timedelta(hours=1)).timestamp()
+        with closing(_database(self.path)) as db, db:
+            db.execute("INSERT INTO wg_inventory_scan (id, scope, scanned_at) VALUES (1, 'Munich', ?)", (current,))
+            db.executemany("""INSERT INTO wg_observations (id, url, first_seen_at, last_seen_at)
+                              VALUES (?, 'https://www.wg-gesucht.de/test.html', ?, ?)""", [
+                ("10", earlier, earlier), ("11", earlier, current), ("12", current, current),
+            ])
+
+        data = load_dashboard(self.path, now=NOW)
+        self.assertEqual(data.matches, ())
+        self.assertEqual(data.wg_scan, (current, 2))

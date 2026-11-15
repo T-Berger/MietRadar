@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, Mock, patch
 from munich_radar import Scanner, _database
 from wg_alerts import AlertsInbox, ListingAlert, extract_refs
 from wg_preferences import rejection_reason
-from wg_source import Listing, ListingRef
+from wg_source import Listing, ListingRef, WGSourceError
 
 
 NOW = datetime(2026, 11, 15, 10, 0, tzinfo=timezone.utc)
@@ -59,6 +59,7 @@ class ScannerTest(unittest.TestCase):
         )
         listing_by_id = {item.id: item for item in (older, stale, fresh, unknown, excluded, no_route)}
         source = Mock()
+        source.inventory_scope = "munich"
         source.candidates.return_value = [ref(item) for item in listing_by_id.values()]
         source.details.side_effect = lambda candidate: listing_by_id[candidate.id]
         router = Mock()
@@ -91,6 +92,59 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT id, basis FROM drafts").fetchall(), [(unknown.id, "Suchalarm erhalten")])
         source.candidates.assert_not_called()
         router.qualifies.assert_called_once()
+
+    def test_snapshots_cover_all_ids_and_first_observed_matches_remain_manual(self):
+        baseline, beyond_budget, new, stale = offer(1, None), offer(2, None), offer(3, None), offer(4, 36)
+        source, router, delivery = Mock(), Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.side_effect = [
+            [ref(baseline), ref(beyond_budget)],
+            [ref(baseline), ref(new)],
+            [ref(beyond_budget), ref(stale)],
+        ]
+        source.details.side_effect = [baseline, new, stale]
+        router.qualifies.return_value = True
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 1, delivery=delivery)
+        later = NOW + timedelta(hours=1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "radar.sqlite3"
+            with closing(_database(path)) as db:
+                counts = scanner.scan(db, NOW, {})
+                self.assertEqual(counts["WG-Gesucht-Angebote beobachtet"], 2)
+                source.details.assert_called_once_with(ref(baseline))
+                self.assertEqual(db.execute("SELECT count(*) FROM drafts").fetchone(), (0,))
+                self.assertEqual(db.execute("SELECT id FROM wg_observations ORDER BY id").fetchall(),
+                                 [(baseline.id,), (beyond_budget.id,)])
+            with closing(_database(path)) as db:
+                scanner.scan(db, later, {})
+                self.assertEqual(db.execute("SELECT id, fresh_at, basis FROM drafts").fetchall(),
+                                 [(new.id, later.timestamp(), "zuerst gesehen")])
+                scanner.scan(db, later + timedelta(hours=1), {})
+                self.assertEqual(db.execute("SELECT id FROM drafts").fetchall(), [(new.id,)])
+                self.assertEqual(db.execute("SELECT first_seen_at, last_seen_at, previous_scan_at FROM wg_observations WHERE id = ?",
+                                            (beyond_budget.id,)).fetchone(),
+                                 (NOW.timestamp(), (later + timedelta(hours=1)).timestamp(), None))
+                self.assertEqual(db.execute("SELECT published_at FROM wg_observations WHERE id = ?", (stale.id,)).fetchone(),
+                                 (stale.published_at.timestamp(),))
+        delivery.deliver.assert_not_called()
+
+    def test_failed_inventory_does_not_advance_the_baseline_and_a_long_gap_resets_it(self):
+        baseline, during_gap, new = offer(1, None), offer(2, None), offer(3, None)
+        source, router = Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.side_effect = [[ref(baseline)], WGSourceError("unavailable"), [ref(during_gap)], [ref(new)]]
+        source.details.side_effect = [baseline, during_gap, new]
+        router.qualifies.return_value = True
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 12)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            scanner.scan(db, NOW, {})
+            with self.assertRaises(WGSourceError):
+                scanner.scan(db, NOW + timedelta(hours=1), {})
+            self.assertEqual(db.execute("SELECT scanned_at FROM wg_inventory_scan WHERE id = 1").fetchone(), (NOW.timestamp(),))
+            scanner.scan(db, NOW + timedelta(hours=25), {})
+            self.assertEqual(db.execute("SELECT count(*) FROM drafts").fetchone(), (0,))
+            scanner.scan(db, NOW + timedelta(hours=26), {})
+            self.assertEqual(db.execute("SELECT id FROM drafts").fetchall(), [(new.id,)])
 
 
 class AlertParsingTest(unittest.TestCase):
