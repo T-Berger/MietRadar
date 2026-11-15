@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 from kleinanzeigen_source import extract_listings, normalize_munich_address
 from llm_personalizer import personalise_message
-from munich_delivery import DeliveryQueue
+from munich_delivery import DeliveryQueue, save_application_draft
 from munich_transit import TransitRouter
 from wg_alerts import AlertsInbox
 from wg_preferences import rejection_reason
@@ -51,6 +51,7 @@ class KleinanzeigenRadar:
     age: int = 28
     age_gap: int = 7
     delivery: DeliveryQueue | None = None
+    outgoing_provider: str = "none"
 
     def scan(
         self, db: sqlite3.Connection, inbox: AlertsInbox, now: datetime, cutoff: datetime,
@@ -103,7 +104,8 @@ class KleinanzeigenRadar:
                 if draft:
                     with db:
                         self._save_origin(db, listing.id, address)
-                elif self._save(db, listing.id, listing.url, listing.description, listing.is_wg, stamp.timestamp(), basis, address):
+                elif self._save(db, listing.id, listing.url, listing.description, listing.is_wg,
+                                stamp.timestamp(), basis, address, now):
                     counts["neue Kleinanzeigen-Entwürfe"] += 1
                 continue
             if match is False:
@@ -174,22 +176,22 @@ class KleinanzeigenRadar:
         match = self.router.qualifies(origin, now)
         if match is not True:
             return False, "Die ÖPNV-Fahrt konnte nicht geprüft werden." if match is None else "Keine ÖPNV-Verbindung innerhalb von 30 Minuten gefunden."
-        saved = self._save(db, listing_id, url, excerpt, bool(is_wg), fresh_at, basis, origin)
+        saved = self._save(db, listing_id, url, excerpt, bool(is_wg), fresh_at, basis, origin, now)
         return saved, "Entwurf gespeichert. Der Versandstatus steht unter delivery." if saved else "Der Treffer wurde bereits verarbeitet."
 
     def _save(
         self, db: sqlite3.Connection, listing_id: str, url: str, excerpt: str, is_wg: bool, fresh_at: float, basis: str,
-        address: str,
+        address: str, now: datetime,
     ) -> bool:
         message = personalise_message(
             self.template, excerpt, listing_url=url, provider=self.provider, listing_type="wg" if is_wg else "wohnung",
         )
         with db:
-            saved = db.execute(
-                "INSERT OR IGNORE INTO drafts(id, url, fresh_at, basis, message) VALUES (?, ?, ?, ?, ?)",
-                (listing_id, url, fresh_at, basis, message),
+            saved = save_application_draft(
+                db, listing_id, url, fresh_at, basis, message, context=excerpt,
+                provider=self.outgoing_provider, now=now,
             )
             db.execute("DELETE FROM klein_review WHERE id = ?", (listing_id,))
-            if saved.rowcount:
+            if saved:
                 self._save_origin(db, listing_id, address)
-        return bool(saved.rowcount)
+        return saved

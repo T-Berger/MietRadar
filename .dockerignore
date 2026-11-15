@@ -21,6 +21,8 @@
 !src/kleinanzeigen_reply_queue.py
 !src/kleinanzeigen_response.py
 !src/outgoing_judge.py
+!src/judge_smoke.py
+!src/integration_smoke.py
 !src/dashboard.py
 !src/dashboard_auth.py
 !src/dashboard_data.py

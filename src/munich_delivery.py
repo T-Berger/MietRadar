@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from typing import Protocol
 
-from outgoing_judge import judge_outgoing
+from outgoing_judge import OutgoingJudgment, judge_outgoing
 
 
 class DeliveryOutcome(Enum):
@@ -41,13 +41,34 @@ def install_schema(db: sqlite3.Connection) -> None:
     )""")
 
 
+def _record_outgoing(
+    db: sqlite3.Connection, item_id: str, message: str, kind: str, verdict: OutgoingJudgment, now: datetime,
+) -> None:
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    db.execute("INSERT OR REPLACE INTO outgoing_checks VALUES (?, ?, ?, ?, ?, ?)",
+               (item_id, kind, digest, verdict.approved, verdict.reason, now.timestamp()))
+
+
 def review_outgoing(db, item_id, message, *, kind, context="", provider="none", now):
     verdict = judge_outgoing(message, kind=kind, context=context, provider=provider)
-    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
     with db:
-        db.execute("INSERT OR REPLACE INTO outgoing_checks VALUES (?, ?, ?, ?, ?, ?)",
-                   (item_id, kind, digest, verdict.approved, verdict.reason, now.timestamp()))
+        _record_outgoing(db, item_id, message, kind, verdict, now)
     return verdict
+
+
+def save_application_draft(
+    db: sqlite3.Connection, listing_id: str, url: str, fresh_at: float, basis: str, message: str,
+    *, context: str, provider: str, now: datetime,
+) -> bool:
+    """Review the draft, then save both records in the caller's transaction."""
+    verdict = judge_outgoing(message, kind="application", context=context, provider=provider)
+    saved = db.execute(
+        "INSERT OR IGNORE INTO drafts(id, url, fresh_at, basis, message) VALUES (?, ?, ?, ?, ?)",
+        (listing_id, url, fresh_at, basis, message),
+    )
+    if saved.rowcount:
+        _record_outgoing(db, listing_id, message, "application", verdict, now)
+    return bool(saved.rowcount)
 
 
 class DeliveryQueue:

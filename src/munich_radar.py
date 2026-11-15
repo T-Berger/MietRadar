@@ -20,7 +20,7 @@ from kleinanzeigen_activity import EmailNotifier, install_activity, record_activ
 from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
 from llm_personalizer import personalise_message
-from munich_delivery import DeliveryQueue, install_schema
+from munich_delivery import DeliveryQueue, install_schema, save_application_draft
 from munich_transit import TransitRouter
 from wg_alerts import AlertsError, AlertsInbox
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
@@ -87,6 +87,7 @@ class Scanner:
     delivery: DeliveryQueue | None = None
     klein_alerts: AlertsInbox | None = None
     klein_delivery: DeliveryQueue | None = None
+    outgoing_provider: str = "none"
 
     def scan(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         cutoff = now - self.max_age
@@ -100,7 +101,10 @@ class Scanner:
 
         counts: Counter = Counter()
         if self.klein_alerts:
-            klein = KleinanzeigenRadar(self.router, self.template, self.provider, self.age, self.age_gap, self.klein_delivery)
+            klein = KleinanzeigenRadar(
+                self.router, self.template, self.provider, self.age, self.age_gap, self.klein_delivery,
+                outgoing_provider=self.outgoing_provider,
+            )
             try:
                 counts.update(klein.scan(db, self.klein_alerts, now, cutoff, self.limit, retry_after))
             except AlertsError as exc:
@@ -193,13 +197,13 @@ class Scanner:
                     self.template, listing.description, listing_url=listing.url, provider=self.provider,
                 )
                 with db:
-                    saved = db.execute(
-                        "INSERT OR IGNORE INTO drafts(id, url, fresh_at, basis, message) VALUES (?, ?, ?, ?, ?)",
-                        (listing.id, listing.url, fresh_at.timestamp(), basis, message),
+                    saved = save_application_draft(
+                        db, listing.id, listing.url, fresh_at.timestamp(), basis, message,
+                        context=listing.description, provider=self.outgoing_provider, now=now,
                     )
-                counts["neue Entwürfe"] += saved.rowcount
-                if not saved.rowcount:
+                if not saved:
                     continue
+                counts["neue Entwürfe"] += 1
             if self.delivery and basis != FIRST_SEEN_BASIS:
                 result = self.delivery.deliver(db, listing.id, listing.url, message, fresh_at, self.max_age,
                                                context=listing.description)
@@ -279,7 +283,7 @@ def _scanner(max_age: timedelta) -> Scanner:
         WGSource(search_urls or DEFAULT_SEARCH_URLS, pages), TransitRouter(os.getenv("MUNICH_TRANSIT_API_URL")),
         template, provider, max_age, limit, alerts,
         _number("MUNICH_APPLICANT_AGE", 28, 18, 100), _number("MUNICH_MAX_AGE_GAP", 7, 0, 100),
-        klein_alerts=klein_alerts,
+        klein_alerts=klein_alerts, outgoing_provider=_outgoing_provider(),
     )
 
 
@@ -356,7 +360,10 @@ def main() -> int:
             if args.command == "klein-address":
                 now = datetime.now(timezone.utc)
                 template, provider = _draft_settings()
-                klein = KleinanzeigenRadar(TransitRouter(os.getenv("MUNICH_TRANSIT_API_URL")), template, provider)
+                klein = KleinanzeigenRadar(
+                    TransitRouter(os.getenv("MUNICH_TRANSIT_API_URL")), template, provider,
+                    outgoing_provider=_outgoing_provider(),
+                )
                 saved, message = klein.check_address(db, args.id, args.address, now, now - max_age)
                 print(message)
                 return 0 if saved else 1
@@ -401,7 +408,7 @@ def main() -> int:
             scanner = _scanner(max_age)
             reply_inbox, judge_provider = _reply_settings()
             notifier = _email_notifier()
-            outgoing_provider = _outgoing_provider()
+            outgoing_provider = scanner.outgoing_provider
             reply_mode = os.getenv("KLEINANZEIGEN_REPLY_MODE", "draft").strip().lower()
             if reply_mode not in {"auto", "draft"}:
                 raise ValueError("KLEINANZEIGEN_REPLY_MODE muss auto oder draft sein")
