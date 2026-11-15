@@ -46,6 +46,8 @@ Im öffentlichen Modus erfasst der Radar je Suche standardmäßig zwei Ergebniss
 
 Das Streamlit-Dashboard zeigt neue passende Angebote, Bewerbungsentwürfe, offene Adressprüfungen, Antwortentwürfe und den Verlauf. Du kannst den Text ansehen und kopieren. Das Dashboard liest die SQLite-Datenbank des Workers.
 
+Unter **Angebote** kannst du das letzte Wochenende oder eigene Kalendertage in Münchner Zeit auswählen. **Veröffentlicht** zeigt Anzeigen mit einem belegten Veröffentlichungsdatum. **Zuerst gesehen** zeigt dagegen, wann MietRadar Anzeigen ohne belegtes Veröffentlichungsdatum erstmals erfasst hat. Die Datumsansicht zeigt auch erfasste Anzeigen ohne Entwurf. Ein Veröffentlichungsdatum ohne Uhrzeit reicht für die Datumsansicht. Der automatische Versand verwendet weiterhin nur Zeitangaben, die eine frische Anzeige belegen.
+
 Lokal: Installiere die Abhängigkeiten mit `pip install -r requirements-dashboard.txt` und hinterlege ein eigenes langes Passwort als `MUNICH_DASHBOARD_PASSWORD` in deiner privaten `config/.env`. Starte den Worker und öffne das Dashboard in einem zweiten Terminal:
 
 ```bash

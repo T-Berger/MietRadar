@@ -4,25 +4,24 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
-from zoneinfo import ZoneInfo
 
 import streamlit as st
 from dotenv import load_dotenv
 
 from dashboard_auth import logout_button, require_authentication
-from dashboard_data import load_dashboard
+from dashboard_data import BERLIN, RESULT_LIMIT, DateBasis, load_dashboard, weekend_dates
 
 
 ROOT = Path(__file__).resolve().parent.parent
-BERLIN = ZoneInfo("Europe/Berlin")
 STATES = {
     "draft": "Entwurf", "held": "Zurückgehalten", "sent": "Gesendet", "done": "Erledigt",
     "unconfirmed": "Versand unklar", "already_contacted": "Bereits kontaktiert", "unavailable": "Kontakt nicht verfügbar",
 }
 SMALL_WORDS = {"am", "an", "auf", "für", "im", "in", "mit", "und", "von", "zu", "zur"}
+WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
 INTRO = """
 <style>
   [data-testid="stMainBlockContainer"] { max-width: 64rem; padding-top: 2.75rem; }
@@ -39,6 +38,10 @@ INTRO = """
 
 def _date(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, BERLIN).strftime("%d.%m.%Y · %H:%M")
+
+
+def _posting_day(day: date) -> str:
+    return f"Veröffentlicht am {WEEKDAYS[day.weekday()]}, {day:%d.%m.%Y}"
 
 
 def _headline(url: str | None) -> str:
@@ -70,9 +73,7 @@ def _location_link(url: str | None, label: str = "Anzeige öffnen") -> None:
 
 def _matches(rows, hours: int, wg_scan: tuple[float, int] | None) -> None:
     st.subheader("Neue Mietangebote", anchor=False)
-    if wg_scan is not None:
-        timestamp, count = wg_scan
-        st.caption(f"Letzte WG-Gesucht-Suche: {_date(timestamp)} · Sichtbare Anzeigen erfasst: {count}")
+    _scan_status(wg_scan)
     platforms = sorted({row.platform for row in rows})
     if not rows:
         st.info(f"Keine passenden Angebote in den letzten {hours} Stunden.")
@@ -86,13 +87,66 @@ def _matches(rows, hours: int, wg_scan: tuple[float, int] | None) -> None:
             st.caption(f"{row.platform} · {row.id} · {STATES.get(row.state, 'Entwurf')}")
             st.caption(f"{row.basis.capitalize()}: {_date(row.fresh_at)}")
             if row.basis == "zuerst gesehen":
-                st.caption("Veröffentlichungsdatum unbekannt · nur als Entwurf")
+                posting = _posting_day(row.published_day) if row.published_day else "Veröffentlichungsdatum unbekannt"
+                st.caption(f"{posting} · nur als Entwurf")
             if row.review_reason:
                 st.caption(row.review_reason)
             _location_link(row.url)
             if row.message:
                 with st.expander("Bewerbung anzeigen"):
                     st.code(row.message, language=None, wrap_lines=True)
+
+
+def _scan_status(wg_scan: tuple[float, int] | None) -> None:
+    if wg_scan is not None:
+        timestamp, count = wg_scan
+        st.caption(f"Letzte WG-Gesucht-Suche: {_date(timestamp)} · Sichtbare Anzeigen erfasst: {count}")
+
+
+def _date_filter(today: date) -> tuple[DateBasis | None, tuple[date, date] | None]:
+    current = "Aktuelle Treffer"
+    weekend = "Dieses Wochenende" if today.weekday() >= 5 else "Letztes Wochenende"
+    custom = "Eigener Zeitraum"
+    selected = st.selectbox("Zeitraum für Angebote", [current, weekend, custom])
+    if selected == current:
+        return None, None
+    date_label = st.radio("Datum filtern nach", ["Veröffentlicht", "Zuerst gesehen"])
+    basis: DateBasis = "first_seen" if date_label == "Zuerst gesehen" else "published"
+    start, end = weekend_dates(today)
+    if selected == weekend:
+        return basis, (start, min(end, today))
+    days = st.date_input("Von – bis", (start, min(end, today)), max_value=today, format="DD.MM.YYYY")
+    return basis, days if isinstance(days, tuple) and len(days) == 2 else None
+
+
+def _dated_offers(rows, days: tuple[date, date] | None, basis: DateBasis, wg_scan: tuple[float, int] | None) -> None:
+    sightings = basis == "first_seen"
+    st.subheader("Zuerst erfasste Mietangebote" if sightings else "Veröffentlichte Mietangebote", anchor=False)
+    _scan_status(wg_scan)
+    if days is None:
+        st.info("Wähle ein Start- und Enddatum.")
+        return
+    start, end = days
+    st.caption(f"{start:%d.%m.%Y} bis {end:%d.%m.%Y} · Münchner Zeit")
+    if sightings:
+        st.caption("Die erste Suche erfasst auch Anzeigen, die schon online sind.")
+    if not rows:
+        st.info("Für diesen Zeitraum gibt es keine Erstsichtungen ohne Veröffentlichungsdatum." if sightings else
+                "Für diesen Zeitraum wurde kein Veröffentlichungsdatum bestätigt. Unter „Zuerst gesehen“ stehen die Erstsichtungen ohne Datum.")
+        return
+    if len(rows) == RESULT_LIMIT:
+        st.caption(f"Anzeige auf {RESULT_LIMIT} Ergebnisse begrenzt.")
+    for row in rows:
+        with st.container(border=True):
+            st.subheader(_headline(row.url), anchor=False)
+            status = "Filter erfüllt" if row.matched else "Erfasst"
+            st.caption(f"{row.platform} · {row.id} · {status}")
+            if sightings:
+                st.caption(f"Zuerst gesehen am {WEEKDAYS[row.day.weekday()]}, {row.day:%d.%m.%Y}")
+                st.caption("Veröffentlichungsdatum unbekannt")
+            else:
+                st.caption(_posting_day(row.day))
+            _location_link(row.url)
 
 
 def _addresses(rows) -> None:
@@ -145,11 +199,6 @@ def main() -> None:
     st.html(INTRO)
     require_authentication()
 
-    with st.sidebar:
-        st.header("MietRadar")
-        st.button("Aktualisieren", icon=":material/refresh:")
-        logout_button()
-
     directory = Path(os.getenv("MUNICH_DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ROOT / "data")
     try:
         hours = int(os.getenv("MUNICH_MAX_AGE_HOURS", "24"))
@@ -158,7 +207,15 @@ def main() -> None:
     except ValueError:
         st.error("MUNICH_MAX_AGE_HOURS muss zwischen 1 und 72 liegen.")
         return
-    data = load_dashboard(directory / "munich_radar.sqlite3", max_age_hours=hours)
+    now = datetime.now(timezone.utc)
+    with st.sidebar:
+        st.header("MietRadar")
+        st.button("Aktualisieren", icon=":material/refresh:")
+        date_basis, date_window = _date_filter(now.astimezone(BERLIN).date())
+        logout_button()
+
+    data = load_dashboard(directory / "munich_radar.sqlite3", now=now, max_age_hours=hours,
+                          posting_window=date_window, date_basis=date_basis or "published")
     if data.status == "missing":
         st.info("MietRadar hat hier noch keine Datenbank angelegt. Starte den Worker für den ersten Suchlauf.")
         return
@@ -167,12 +224,19 @@ def main() -> None:
         return
 
     matches, drafts, pending = st.columns(3)
-    matches.metric("Neue Angebote", len(data.matches), border=True)
+    if date_basis:
+        label = "Zuerst erfasste Angebote" if date_basis == "first_seen" else "Veröffentlichte Angebote"
+        matches.metric(label, len(data.dated_listings), border=True)
+    else:
+        matches.metric("Neue Angebote", len(data.matches), border=True)
     drafts.metric("Bewerbungsentwürfe", sum(bool(row.message) for row in data.matches), border=True)
     pending.metric("Adressen zur Prüfung", len(data.address_checks), border=True)
     offers, address, replies, activity = st.tabs(["Angebote", "Adresse prüfen", "Antwortentwürfe", "Verlauf"])
     with offers:
-        _matches(data.matches, hours, data.wg_scan)
+        if date_basis:
+            _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan)
+        else:
+            _matches(data.matches, hours, data.wg_scan)
     with address:
         _addresses(data.address_checks)
     with replies:

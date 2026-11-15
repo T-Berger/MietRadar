@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from wg_source import ListingRef
 
@@ -39,10 +39,15 @@ def install_observations(db: sqlite3.Connection) -> None:
             last_seen_at REAL NOT NULL,
             previous_scan_at REAL,
             details_checked_at REAL,
-            published_at REAL
+            published_at REAL,
+            published_day TEXT
         );
         CREATE INDEX IF NOT EXISTS wg_observations_last_seen ON wg_observations(last_seen_at);
     """)
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        if not any(column[1] == "published_day" for column in db.execute("PRAGMA table_info(wg_observations)")):
+            db.execute("ALTER TABLE wg_observations ADD COLUMN published_day TEXT")
 
 
 def record_inventory(
@@ -74,10 +79,17 @@ def record_inventory(
 
 
 def record_details(
-    db: sqlite3.Connection, listing_id: str, now: datetime, published_at: datetime | None,
-) -> datetime | None:
+    db: sqlite3.Connection, ref: ListingRef, now: datetime, published_at: datetime | None,
+    published_day: date | None = None,
+) -> tuple[datetime | None, date | None]:
     published = published_at.timestamp() if published_at is not None else None
+    day = published_day.isoformat() if published_day is not None else None
+    stamp = now.timestamp()
     with db:
+        if published is not None or day is not None:
+            # Search alerts can yield publication evidence without a public inventory snapshot.
+            db.execute("""INSERT OR IGNORE INTO wg_observations (id, url, first_seen_at, last_seen_at)
+                          VALUES (?, ?, ?, ?)""", (ref.id, ref.url, stamp, stamp))
         row = db.execute("""
             UPDATE wg_observations
             SET details_checked_at = MAX(COALESCE(details_checked_at, 0), ?),
@@ -85,7 +97,12 @@ def record_details(
                     WHEN ? IS NULL THEN published_at
                     WHEN published_at IS NULL THEN ?
                     ELSE MIN(published_at, ?)
-                END
-            WHERE id = ? RETURNING published_at
-        """, (now.timestamp(), published, published, published, listing_id)).fetchone()
-    return datetime.fromtimestamp(row[0], timezone.utc) if row and row[0] is not None else None
+                END,
+                published_day = COALESCE(MIN(published_day, ?), published_day, ?)
+            WHERE id = ? RETURNING published_at, published_day
+        """, (stamp, published, published, published, day, day, ref.id)).fetchone()
+    if row is None:
+        return published_at, published_day
+    timestamp, day = row
+    return (datetime.fromtimestamp(timestamp, timezone.utc) if timestamp is not None else None,
+            date.fromisoformat(day) if day is not None else None)

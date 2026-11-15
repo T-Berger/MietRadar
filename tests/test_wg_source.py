@@ -1,7 +1,7 @@
 import io
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.error import HTTPError
 from urllib.request import Request
 
@@ -109,11 +109,26 @@ class PublicPageTests(unittest.TestCase):
         self.assertEqual(listing.description, "Sonniges Zimmer.\nWir kochen gern zusammen.")
         self.assertTrue(listing.is_wg)
         self.assertIsNone(listing.published_at)
+        self.assertIsNone(listing.published_day)
+
+    def test_publication_day_does_not_supply_a_time(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/123.html")
+        self.stub_pages({ref.url: """
+            <h1 class="detailed-view-title">Zimmer</h1>
+            <table>
+                <tr><td>Online:</td><td>16.11.2026</td></tr>
+                <tr><td>Veröffentlicht am:</td><td>14.11.2026</td></tr>
+            </table>
+        """})
+        listing = self.source.details(ref)
+        self.assertEqual(listing.published_day, date(2026, 11, 14))
+        self.assertIsNone(listing.published_at)
 
     def test_explicit_publication_and_incomplete_address(self):
         ref = ListingRef.from_url(f"{BASE_URL}/123.html")
         self.stub_pages({ref.url: """
             <h1 class="detailed-view-title">Zimmer</h1>
+            <meta itemprop="datePosted" content="2026-11-15">
             <meta itemprop="datePosted" content="2026-11-15T10:25:00+01:00">
             <a href="#map_container"><span class="section_panel_detail">Nymphenburger Straße<br>80634 München</span></a>
         """})
