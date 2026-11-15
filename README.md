@@ -29,16 +29,18 @@ cp config/message.txt.example config/message.txt
 
 1. Ersetze den Beispieltext in `config/message.txt` durch deine eigenen Angaben. Mit `{LLM_TEXT}` legst du fest, wo ein kurzer persönlicher Absatz stehen soll.
 2. Die ÖPNV-Prüfung nutzt [Transitous](https://transitous.org/) mit [MOTIS](https://github.com/motis-project/motis) und Geodaten von [OpenStreetMap](https://www.openstreetmap.org/copyright). Der öffentliche Dienst braucht keinen API-Schlüssel. Die Fahrpläne stammen aus den [Transitous-Datenquellen](https://transitous.org/sources/). Stimme einen dauerhaften automatisierten Betrieb mit Transitous ab oder setze `MUNICH_TRANSIT_API_URL` auf eine eigene MOTIS-Instanz. [Nutzungsbedingungen für die öffentliche API](https://transitous.org/api/)
-3. Wähle in `config/.env` eine Quelle. **`MUNICH_SOURCE=alerts`** empfiehlt sich im Alltag: Richte auf WG-Gesucht einen [Suchauftrag mit E-Mail-Benachrichtigung](https://www.wg-gesucht.de/hilfebereich.html) ein und leite die passenden Suchalarm-Mails per Postfachregel in einen eigenen Ordner. Setze `MUNICH_IMAP_HOST`, `MUNICH_IMAP_USER`, `MUNICH_IMAP_PASSWORD`, `MUNICH_IMAP_FOLDER` und `MUNICH_ALERT_SENDER` (die genaue Absenderadresse deiner Suchalarm-Mails). Der Radar liest den Ordner per IMAP über TLS und folgt direkten WG-Gesucht-Inseratslinks. Wenn das ursprüngliche Datum öffentlich ist, gilt dieses; sonst zählt der Eingang des Suchalarms. Das wird im Entwurf gekennzeichnet. **`MUNICH_SOURCE=public`** liest die öffentlichen Suchseiten und verlangt einen expliziten Veröffentlichungszeitpunkt. WG-Gesucht blendet ihn oft aus; dann kann dieser Modus keine Entwürfe für diese Anzeigen erstellen. Mit `MUNICH_SEARCH_URLS` kannst du im öffentlichen Modus deine eigenen WG-Gesucht-Suchergebnislinks hinterlegen.
+3. Wähle in `config/.env` eine Quelle. **`MUNICH_SOURCE=alerts`** liest Suchalarm-Mails von WG-Gesucht. Richte dafür auf der Plattform einen [Suchauftrag mit E-Mail-Benachrichtigung](https://www.wg-gesucht.de/hilfebereich.html) ein und leite die passenden Mails per Postfachregel in einen eigenen Ordner. Setze `MUNICH_IMAP_HOST`, `MUNICH_IMAP_USER`, `MUNICH_IMAP_PASSWORD`, `MUNICH_IMAP_FOLDER` und `MUNICH_ALERT_SENDER` (die genaue Absenderadresse). Der Radar liest den Ordner per IMAP über TLS. Wenn das Veröffentlichungsdatum vorliegt, gilt dieses; sonst zählt der Eingang des Suchalarms. **`MUNICH_SOURCE=public`** liest die öffentlichen Suchseiten. Mit `MUNICH_SEARCH_URLS` kannst du eigene WG-Gesucht-Suchergebnislinks hinterlegen.
 4. Optional: Setze `MUNICH_LLM_PROVIDER=mistral` und `MISTRAL_API_KEY` aus [Mistral Studio](https://docs.mistral.ai/api/endpoint/chat). `MISTRAL_MODEL` ist optional (`mistral-small-latest`). Sonst nutzt der Radar die Vorlage direkt.
 
 ```bash
 python src/munich_radar.py scan          # einmal suchen
-python src/munich_radar.py watch         # regelmäßig suchen, standardmäßig alle 5 Minuten
+python src/munich_radar.py watch         # sofort und danach stündlich suchen
 python src/munich_radar.py drafts        # aktuelle Treffer, neueste zuerst
 python src/munich_radar.py drafts 123456 # Bewerbungstext zu einer Anzeige anzeigen
 python src/munich_radar.py done 123456   # nach dem Abschicken oder Verwerfen ausblenden
 ```
+
+Im öffentlichen Modus erfasst der Radar je Suche standardmäßig zwei Ergebnisseiten (`MUNICH_WG_SEARCH_PAGES`) und prüft pro Lauf höchstens 24 Detailseiten (`MUNICH_MAX_CANDIDATES`). Die SQLite-Datenbank merkt sich, wann sie eine Anzeigen-ID zuerst und zuletzt gesehen hat. Der erste vollständige Lauf erfasst den Bestand. Ist ein zuvor nicht erfasstes Inserat bei einem Folgelauf zu sehen, kann es ohne öffentliches Veröffentlichungsdatum als **Zuerst gesehen** in die Entwürfe kommen. Dieser Zeitpunkt beschreibt die Beobachtung durch MietRadar. Für den automatischen Versand reicht er nicht. Auf Railway bleibt die Historie auf dem `/data`-Volume erhalten.
 
 ### Dashboard öffnen
 
@@ -57,6 +59,8 @@ Auf Railway: Setze `MUNICH_DASHBOARD_ENABLED=true` und `MUNICH_DASHBOARD_PASSWOR
 ### Kleinanzeigen ergänzen
 
 Speichere auf Kleinanzeigen eine Suche für Münchner Mietwohnungen oder Auf Zeit & WG mit der Angebotsart **Angebote** und aktiviere die [E-Mail-Suchbenachrichtigung](https://hilfe.kleinanzeigen.de/hc/de/articles/17102975598492-Ich-m%C3%B6chte-automatisch-neue-Suchergebnisse-zu-meiner-Suche-erhalten-Wie-richte-ich-das-ein). Sortiere diese Mails per Postfachregel in einen separaten IMAP-Ordner. Setze `KLEINANZEIGEN_IMAP_FOLDER` und `KLEINANZEIGEN_ALERT_SENDER` auf diesen Ordner und die genaue Absenderadresse. Die Zugangsdaten kommen aus `MUNICH_IMAP_HOST`, `MUNICH_IMAP_USER` und `MUNICH_IMAP_PASSWORD`. Die gleichen Variablen gelten auf Railway.
+
+Bei einem eigenen Postfach für Suchalarme, etwa [mailbox.org](https://kb.mailbox.org/en/private/e-mail/e-mail-configuration/), kannst du `INBOX` direkt verwenden. Setze bei mailbox.org `MUNICH_IMAP_HOST=imap.mailbox.org`, den vollständigen Postfachnamen als Benutzer und ein [App-Passwort nur für IMAP](https://kb.mailbox.org/en/business/security-and-privacy/e-mail-password/). Kopiere den tatsächlichen Absender aus einem angekommenen Suchalarm.
 
 Der Radar verarbeitet direkte Inseratslinks aus den Suchalarm-Mails. Enthält der Alarm eine vollständige Münchner Adresse, prüft er dieselbe ÖPNV-Verbindung wie bei WG-Gesucht. Mit einer PLZ, einem Viertel oder einem [ungefähren Kartenpunkt](https://hilfe.kleinanzeigen.de/hc/de/articles/29128094755100-Neu-Immobilien-auf-der-Karte-ansehen) bleibt der Treffer zur Ortsprüfung offen. Wenn du im Inserat eine genaue Adresse findest, kannst du sie selbst prüfen lassen. Ein Entwurf entsteht erst, wenn die Route bestätigt ist.
 

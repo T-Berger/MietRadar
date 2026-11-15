@@ -38,6 +38,15 @@ class DeliveryTest(unittest.TestCase):
     def run_delivery(self, queue, listing, max_age=timedelta(hours=24)):
         return queue.deliver(self.db, listing.id, listing.url, "Hi!", listing.published_at, max_age)
 
+    def test_first_seen_draft_is_never_sent_automatically(self):
+        listing = offer(1, 1)
+        self.draft(listing)
+        with self.db:
+            self.db.execute("UPDATE drafts SET basis = 'zuerst gesehen' WHERE id = ?", (listing.id,))
+        sender = Mock()
+        self.assertIsNone(self.run_delivery(DeliveryQueue(sender, clock=lambda: NOW), listing))
+        sender.send.assert_not_called()
+
     def test_expiry_is_rechecked_before_click_and_send_window_cannot_exceed_24h(self):
         listing = offer(1, 24)
         self.draft(listing)
@@ -76,6 +85,7 @@ class DeliveryTest(unittest.TestCase):
         self.draft(done, done=1)
         by_id = {item.id: item for item in (older, newest, done, stale, nonmatch)}
         source, router = Mock(), Mock()
+        source.inventory_scope = "munich"
         source.candidates.return_value = [ref(item) for item in by_id.values()]
         source.details.side_effect = lambda candidate: by_id[candidate.id]
         router.qualifies.side_effect = lambda address, now: address != nonmatch.address

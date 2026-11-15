@@ -23,6 +23,7 @@ from llm_personalizer import personalise_message
 from munich_delivery import DeliveryQueue, install_schema
 from munich_transit import TransitRouter
 from wg_alerts import AlertsError, AlertsInbox
+from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
 from wg_preferences import rejection_reason
 from wg_source import DEFAULT_SEARCH_URLS, WGListingGone, WGSource, WGSourceError
 
@@ -68,6 +69,7 @@ def _database(path: Path) -> sqlite3.Connection:
     install_klein_review(db)
     install_activity(db)
     install_reply_queue(db)
+    install_observations(db)
     return db
 
 
@@ -104,12 +106,24 @@ class Scanner:
             except AlertsError as exc:
                 LOG.warning("Kleinanzeigen-Suchalarm nicht erreichbar: %s", exc)
 
+        observations = {}
         if self.alerts:
             refs = [(alert.ref, alert.received_at) for alert in self.alerts.recent(cutoff, self.limit)]
         else:
-            refs = [(ref, None) for ref in self.source.candidates()]
+            inventory = self.source.candidates()
+            observations = record_inventory(db, inventory, self.source.inventory_scope, now, cutoff)
+            counts["WG-Gesucht-Angebote beobachtet"] = len(inventory)
+            candidates = sorted(
+                (ref for ref in inventory if ref.id in observations),
+                key=lambda ref: (
+                    observations[ref.id].recent_first_seen(cutoff) is None,
+                    observations[ref.id].details_checked_at or 0,
+                ),
+            )
+            refs = [(ref, None) for ref in candidates]
 
         eligible = []
+        detail_reads = 0
         for ref, received_at in refs:
             if ref.id in retry_after:
                 continue
@@ -119,6 +133,9 @@ class Scanner:
             ).fetchone()
             if draft and (not self.delivery or self.delivery.paused or not draft[1] or draft[2] or draft[3]):
                 continue
+            if detail_reads >= self.limit:
+                break
+            detail_reads += 1
             try:
                 listing = self.source.details(ref)
             except WGListingGone:
@@ -126,7 +143,17 @@ class Scanner:
                 retry_after[ref.id] = now + self.max_age
                 continue
 
-            fresh_at = listing.published_at if listing.published_at is not None else received_at
+            published_at = listing.published_at
+            observation = observations.get(ref.id)
+            if observation and (published_at is None or published_at.tzinfo is not None):
+                published_at = record_details(db, ref.id, now, published_at)
+            if published_at is not None:
+                fresh_at, basis = published_at, "veröffentlicht"
+            elif received_at is not None:
+                fresh_at, basis = received_at, "Suchalarm erhalten"
+            else:
+                fresh_at = observation.recent_first_seen(cutoff) if observation else None
+                basis = FIRST_SEEN_BASIS
             if fresh_at is None or fresh_at.tzinfo is None:
                 counts["kein Veröffentlichungsdatum"] += 1
                 retry_after[ref.id] = now + timedelta(minutes=15)
@@ -147,7 +174,7 @@ class Scanner:
             if draft:
                 # A new alert may not extend an existing listing's window.
                 fresh_at = min(fresh_at, datetime.fromtimestamp(draft[0], timezone.utc))
-            eligible.append((fresh_at, listing, "veröffentlicht" if listing.published_at else "Suchalarm erhalten", draft))
+            eligible.append((fresh_at, listing, basis, draft))
 
         for fresh_at, listing, basis, draft in sorted(eligible, key=lambda item: item[0], reverse=True):
             if not listing.address:
@@ -173,7 +200,7 @@ class Scanner:
                 counts["neue Entwürfe"] += saved.rowcount
                 if not saved.rowcount:
                     continue
-            if self.delivery:
+            if self.delivery and basis != FIRST_SEEN_BASIS:
                 result = self.delivery.deliver(db, listing.id, listing.url, message, fresh_at, self.max_age,
                                                context=listing.description)
                 if result:
@@ -246,9 +273,10 @@ def _scanner(max_age: timedelta) -> Scanner:
     search_urls = tuple(url.strip() for url in os.getenv("MUNICH_SEARCH_URLS", "").split(",") if url.strip())
     template, provider = _draft_settings()
 
-    limit = _number("MUNICH_MAX_CANDIDATES", 12, 1, 40)
+    limit = _number("MUNICH_MAX_CANDIDATES", 24, 1, 40)
+    pages = _number("MUNICH_WG_SEARCH_PAGES", 2, 1, 3)
     return Scanner(
-        WGSource(search_urls or DEFAULT_SEARCH_URLS, limit), TransitRouter(os.getenv("MUNICH_TRANSIT_API_URL")),
+        WGSource(search_urls or DEFAULT_SEARCH_URLS, pages), TransitRouter(os.getenv("MUNICH_TRANSIT_API_URL")),
         template, provider, max_age, limit, alerts,
         _number("MUNICH_APPLICANT_AGE", 28, 18, 100), _number("MUNICH_MAX_AGE_GAP", 7, 0, 100),
         klein_alerts=klein_alerts,
@@ -410,7 +438,7 @@ def main() -> int:
                         scanner.klein_delivery = DeliveryQueue(klein_sender, limit, judge_provider=outgoing_provider)
                     if reply_mode == "auto":
                         reply_dispatcher = ReplyDispatcher(klein_sender, outgoing_provider, limit)
-                interval = _number("MUNICH_POLL_SECONDS", 300, 60, 3600)
+                interval = _number("MUNICH_POLL_SECONDS", 3600, 60, 3600)
                 return _poll(scanner, db, interval, once=args.command == "scan",
                              reply_inbox=reply_inbox, judge_provider=judge_provider, notifier=notifier,
                              outgoing_provider=outgoing_provider, reply_dispatcher=reply_dispatcher)
@@ -436,6 +464,7 @@ def _poll(
     delay = interval
     retry_after: dict[str, datetime] = {}
     while True:
+        started = time.monotonic()
         failed = False
         counts: Counter = Counter()
         try:
@@ -472,7 +501,7 @@ def _poll(
         LOG.info("Scan fertig: %s", ", ".join(f"{n} {key}" for key, n in counts.items()) or "nichts Neues")
         if once:
             return int(failed or klein_paused or reply_paused or (scanner.delivery is not None and scanner.delivery.paused))
-        time.sleep(delay)
+        time.sleep(max(1, delay - (time.monotonic() - started)))
 
 
 if __name__ == "__main__":

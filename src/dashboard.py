@@ -68,8 +68,11 @@ def _location_link(url: str | None, label: str = "Anzeige öffnen") -> None:
         st.link_button(label, url, icon=":material/open_in_new:")
 
 
-def _matches(rows, hours: int) -> None:
+def _matches(rows, hours: int, wg_scan: tuple[float, int] | None) -> None:
     st.subheader("Neue Mietangebote", anchor=False)
+    if wg_scan is not None:
+        timestamp, count = wg_scan
+        st.caption(f"Letzte WG-Gesucht-Suche: {_date(timestamp)} · Sichtbare Anzeigen erfasst: {count}")
     platforms = sorted({row.platform for row in rows})
     if not rows:
         st.info(f"Keine passenden Angebote in den letzten {hours} Stunden.")
@@ -82,6 +85,8 @@ def _matches(rows, hours: int) -> None:
             st.subheader(_headline(row.url), anchor=False)
             st.caption(f"{row.platform} · {row.id} · {STATES.get(row.state, 'Entwurf')}")
             st.caption(f"{row.basis.capitalize()}: {_date(row.fresh_at)}")
+            if row.basis == "zuerst gesehen":
+                st.caption("Veröffentlichungsdatum unbekannt · nur als Entwurf")
             if row.review_reason and row.state == "held":
                 st.text(row.review_reason)
             _location_link(row.url)
@@ -167,7 +172,7 @@ def main() -> None:
     pending.metric("Adressen zur Prüfung", len(data.address_checks), border=True)
     offers, address, replies, activity = st.tabs(["Angebote", "Adresse prüfen", "Antwortentwürfe", "Verlauf"])
     with offers:
-        _matches(data.matches, hours)
+        _matches(data.matches, hours, data.wg_scan)
     with address:
         _addresses(data.address_checks)
     with replies:

@@ -46,9 +46,10 @@ class PublicPageTests(unittest.TestCase):
             self.assertIsNone(ListingRef.from_url(url), url)
 
     def test_visit_order_keeps_update_time_separate_from_publication(self):
-        def card(listing_id, age, class_name=""):
+        def card(listing_id, age, class_name="", partner=""):
             return f"""
                 <a class="wgg-list-card offer_list_item {class_name}" data-id="{listing_id}"
+                    data-campaign_partner="{partner}"
                     href="/wg-zimmer-in-Muenchen.{listing_id}.html">
                   <span class="card-offer-online-status">
                     <span class="sr-only">Online:</span><span class="card-subtitle">{age}</span>
@@ -71,11 +72,15 @@ class PublicPageTests(unittest.TestCase):
             self.source.search_urls[0]: (
                 f'<script type="application/ld+json">{metadata}</script>'
                 + card("10", "3 Std.") + card("12", "20 Min.") + card("13", "1 Min.", "premium_sticky_asset")
+                + '<div class="text-center"><a class="black_text_link" href="/wg-zimmer-in-Muenchen.90.0.1.1.html">&gt;</a></div>'
+            ),
+            f"{BASE_URL}/wg-zimmer-in-Muenchen.90.0.1.1.html": (
+                card("14", "6 Std.") + card("15", "1 Min.", partner="Wunderflats")
+                + '<div class="text-center"><a class="black_text_link" href="/wg-zimmer-in-Muenchen.90.0.1.2.html">&gt;</a></div>'
             ),
             self.source.search_urls[1]: card("11", "2 Min.") + card("12", "3 Std."),
         })
-        first, second = self.source.candidates()
-        self.assertEqual((first.id, second.id), ("11", "12"))
+        self.assertEqual([item.id for item in self.source.candidates()], ["11", "12", "10", "14"])
 
     def test_reads_public_listing_fields_and_ignores_lock_placeholder(self):
         ref = ListingRef.from_url(f"{BASE_URL}/123.html")

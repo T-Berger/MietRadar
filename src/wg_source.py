@@ -1,5 +1,6 @@
 """Read public WG-Gesucht search and listing pages."""
 
+import hashlib
 import json
 import re
 import time
@@ -33,7 +34,6 @@ _SEARCH_PATTERN = re.compile(
 )
 _BERLIN = ZoneInfo("Europe/Berlin")
 _LAYOUT_LIMIT = 4 * 1024 * 1024
-_PARTNER_NAMES = re.compile(r"housinganywhere|spacest|medici|spotahome|uniplaces", re.I)
 
 
 class WGSourceError(Exception):
@@ -229,7 +229,7 @@ def _parse_candidates(soup):
     for card in soup.select("a.wgg-list-card.offer_list_item[data-id]"):
         if (
             "premium_sticky_asset" in card.get("class", [])
-            or _PARTNER_NAMES.search(card.get("data-campaign_partner", ""))
+            or card.get("data-campaign_partner", "").strip()
         ):
             continue
         ref = ListingRef.from_url(card.get("href", ""))
@@ -240,17 +240,40 @@ def _parse_candidates(soup):
     return results
 
 
+def _next_page(soup, current_url):
+    current = urlsplit(current_url)
+    current_page = re.fullmatch(r"(.*\.)(\d+)\.html", current.path, re.I)
+    for link in soup.select('a[rel~="next"][href], .text-center > a.black_text_link[href]'):
+        if "next" not in link.get("rel", []) and _text(link) not in {">", "›", "»"}:
+            continue
+        try:
+            target = _search_url(urljoin(current_url, link["href"]))
+        except ValueError:
+            continue
+        if not current_page:
+            return target
+        prefix, page_number = current_page.groups()
+        if urlsplit(target).path.lower() == f"{prefix}{int(page_number) + 1}.html".lower():
+            return target
+    return None
+
+
 class WGSource:
-    def __init__(self, search_urls: Sequence[str], max_candidates: int, min_request_interval: float = 1.0):
-        if max_candidates < 1:
-            raise ValueError("max_candidates muss mindestens 1 sein.")
+    def __init__(self, search_urls: Sequence[str], pages_per_search: int = 2, min_request_interval: float = 1.0):
+        if not 1 <= pages_per_search <= 3:
+            raise ValueError("pages_per_search muss zwischen 1 und 3 liegen.")
         self.search_urls = tuple(dict.fromkeys(_search_url(url) for url in search_urls))
         if not self.search_urls:
             raise ValueError("Mindestens eine WG-Gesucht-Such-URL ist erforderlich.")
-        self.max_candidates = max_candidates
+        self.pages_per_search = pages_per_search
         self.min_request_interval = min_request_interval
         self._last_request = 0.0
         self._opener = build_opener(_PublicRedirect())
+
+    @property
+    def inventory_scope(self) -> str:
+        coverage = json.dumps([sorted(self.search_urls), self.pages_per_search])
+        return hashlib.sha256(coverage.encode()).hexdigest()
 
     def _get_html(self, url, *, detail=False):
         wait = self._last_request + self.min_request_interval - time.monotonic()
@@ -288,23 +311,27 @@ class WGSource:
 
     def candidates(self) -> list[ListingRef]:
         candidates = []
-        for url in self.search_urls:
-            soup = self._get_html(url)
-            page = _parse_candidates(soup)
-            if not page and not soup.select_one("a.wgg-list-card.offer_list_item[data-id]"):
-                headings = " ".join(_text(heading).casefold() for heading in soup.select("h1, h2, h3"))
-                if not re.search(r"keine (?:passenden )?(?:angebote|anzeigen)|\b0 (?:wg-zimmer|angebote|wohnungen)", headings):
-                    raise WGSourceError("WG-Gesucht hat keine erkennbaren Suchergebnisse geliefert.")
-            candidates.extend(page)
+        for starting_url in self.search_urls:
+            url = starting_url
+            visited = set()
+            for _ in range(self.pages_per_search):
+                if url is None or url in visited:
+                    break
+                visited.add(url)
+                soup = self._get_html(url)
+                page = _parse_candidates(soup)
+                if not page and not soup.select_one("a.wgg-list-card.offer_list_item[data-id]"):
+                    headings = " ".join(_text(heading).casefold() for heading in soup.select("h1, h2, h3"))
+                    if not re.search(r"keine (?:passenden )?(?:angebote|anzeigen)|\b0 (?:wg-zimmer|angebote|wohnungen)", headings):
+                        raise WGSourceError("WG-Gesucht hat keine erkennbaren Suchergebnisse geliefert.")
+                candidates.extend(page)
+                url = _next_page(soup, url)
 
-        # Compare candidates across categories before applying the global request budget.
-        # The public update time sets visit order only. Details determine publication.
+        # Detail requests have a separate budget. The visible update time only sets visit order.
         candidates.sort(key=lambda item: item[1])
         unique = {}
         for ref, _ in candidates:
             unique.setdefault(ref.id, ref)
-            if len(unique) == self.max_candidates:
-                break
         return list(unique.values())
 
     def details(self, ref: ListingRef) -> Listing:
