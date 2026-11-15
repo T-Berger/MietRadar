@@ -1,6 +1,6 @@
+-r requirements-radar.txt
 scrapy>=2.11.0
 selenium>=4.15.0
-python-dotenv>=1.0.0
 webdriver-manager>=4.0.0
 undetected-chromedriver>=3.5.5
 setuptools>=70.0.0
@@ -27,7 +27,7 @@ kagglehub>=0.2.0
 
 # ── LLM personalisation — optional remote API providers ───────────────────────
 # Select the backend via LLM_PROVIDER in config/.env: gemma_local (default),
-# gemini, or openai. Only install what you actually use.
+# gemini, openai, or mistral (uses the Python standard library).
 #
 # Gemini (Developer API key OR Vertex AI project/billing — e.g. free credits):
 #   pip install google-genai
