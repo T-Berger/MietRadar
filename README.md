@@ -42,7 +42,7 @@ python src/munich_radar.py done 123456   # nach dem Abschicken oder Verwerfen au
 
 ### Kleinanzeigen ergänzen
 
-Speichere auf Kleinanzeigen eine Suche für Münchner Mietwohnungen oder Auf Zeit & WG und aktiviere die [E-Mail-Suchbenachrichtigung](https://hilfe.kleinanzeigen.de/hc/de/articles/17102975598492-Ich-m%C3%B6chte-automatisch-neue-Suchergebnisse-zu-meiner-Suche-erhalten-Wie-richte-ich-das-ein). Sortiere diese Mails per Postfachregel in einen separaten IMAP-Ordner. Setze `KLEINANZEIGEN_IMAP_FOLDER` und `KLEINANZEIGEN_ALERT_SENDER` auf diesen Ordner und die genaue Absenderadresse. Die Zugangsdaten kommen aus `MUNICH_IMAP_HOST`, `MUNICH_IMAP_USER` und `MUNICH_IMAP_PASSWORD`. Die gleichen Variablen gelten auf Railway.
+Speichere auf Kleinanzeigen eine Suche für Münchner Mietwohnungen oder Auf Zeit & WG mit der Angebotsart **Angebote** und aktiviere die [E-Mail-Suchbenachrichtigung](https://hilfe.kleinanzeigen.de/hc/de/articles/17102975598492-Ich-m%C3%B6chte-automatisch-neue-Suchergebnisse-zu-meiner-Suche-erhalten-Wie-richte-ich-das-ein). Sortiere diese Mails per Postfachregel in einen separaten IMAP-Ordner. Setze `KLEINANZEIGEN_IMAP_FOLDER` und `KLEINANZEIGEN_ALERT_SENDER` auf diesen Ordner und die genaue Absenderadresse. Die Zugangsdaten kommen aus `MUNICH_IMAP_HOST`, `MUNICH_IMAP_USER` und `MUNICH_IMAP_PASSWORD`. Die gleichen Variablen gelten auf Railway.
 
 Der Radar verarbeitet direkte Inseratslinks aus den Suchalarm-Mails. Enthält der Alarm eine vollständige Münchner Adresse, prüft er dieselbe ÖPNV-Verbindung wie bei WG-Gesucht. Mit einer PLZ, einem Viertel oder einem [ungefähren Kartenpunkt](https://hilfe.kleinanzeigen.de/hc/de/articles/29128094755100-Neu-Immobilien-auf-der-Karte-ansehen) bleibt der Treffer zur Ortsprüfung offen. Wenn du im Inserat eine genaue Adresse findest, kannst du sie selbst prüfen lassen. Ein Entwurf entsteht erst, wenn die Route bestätigt ist.
 
@@ -52,7 +52,7 @@ python src/munich_radar.py klein-address ka-1234567890 --address 'Musterstraße 
 python src/munich_radar.py drafts ka-1234567890
 ```
 
-Kleinanzeigen-Nachrichten verschickst du aus dem verlinkten Inserat. Angaben zum WG-Profil, die in der Alarm-Mail fehlen, kannst du dort vor dem Abschicken prüfen.
+Bei Kleinanzeigen kann der Radar Entwürfe bereithalten oder sie automatisch über das normale Kontaktformular verschicken. Angaben zum WG-Profil können nur geprüft werden, soweit sie in der Suchalarm-Mail stehen.
 
 ### Automatisch bewerben
 
@@ -60,15 +60,26 @@ Kleinanzeigen-Nachrichten verschickst du aus dem verlinkten Inserat. Angaben zum
 2. Setze `WG_EMAIL`, `WG_PASSWORD` und `MUNICH_AUTOSEND=true` in `config/.env`. Starte `python src/munich_radar.py watch`. Auch `scan` verschickt Bewerbungen, wenn die Option gesetzt ist.
 3. Mit `python src/munich_radar.py delivery` siehst du den Versandstatus. `MUNICH_AUTOSEND=false` schaltet wieder auf Entwürfe um.
 
-Der Versand gilt für WG-Gesucht. Er prüft die München-Filter auch bei vorhandenen Entwürfen erneut und verarbeitet die neuesten Treffer zuerst. Direkt vor dem Klick gilt eine feste Obergrenze von **24 Stunden**. Eine kürzere Einstellung aus `MUNICH_MAX_AGE_HOURS` gilt weiterhin. Bei Suchalarmen kann der Maileingang als Aktualitätssignal dienen, wenn WG-Gesucht das Veröffentlichungsdatum ausblendet. Standardmäßig sind höchstens drei Versandversuche je 24 Stunden erlaubt (`MUNICH_DAILY_SEND_LIMIT`, 1–5).
+Der Versand verarbeitet die neuesten Treffer zuerst. Direkt vor dem Klick gilt eine feste Obergrenze von **24 Stunden**. Eine kürzere Einstellung aus `MUNICH_MAX_AGE_HOURS` gilt weiterhin. Bei Suchalarmen kann der Maileingang als Aktualitätssignal dienen, wenn das Veröffentlichungsdatum fehlt. Standardmäßig sind insgesamt höchstens drei Versandversuche je 24 Stunden erlaubt (`MUNICH_DAILY_SEND_LIMIT`, 1–5).
 
 Wenn WG-Gesucht eine zusätzliche Prüfung anzeigt, pausiert der Versand. Entwürfe werden weiter erstellt. Bei einem unklaren Ergebnis wird dieselbe Anzeige nicht erneut automatisch angeschrieben; prüf zuerst das WG-Gesucht-Postfach. Starte den Worker neu, sobald das Login oder die Prüfung geklärt ist. Verwende für den München-Radar und den alten WG-Gesucht-Bot keinen gleichzeitigen Versand auf demselben Konto.
+
+#### Automatischer Kleinanzeigen-Versand
+
+1. Melde dich einmal selbst bei Kleinanzeigen in einem separaten Chrome- oder Chromium-Profil an. Der Radar erwartet das Browserprofil unter `data/kleinanzeigen_browser` (relativ zum Repo) oder unter `$MUNICH_DATA_DIR/kleinanzeigen_browser`. Schließe das Profil vor dem Worker-Start. Auf macOS kannst du es so öffnen:
+
+   ```bash
+   open -na 'Google Chrome' --args --user-data-dir="$PWD/data/kleinanzeigen_browser" https://www.kleinanzeigen.de/m-einloggen.html
+   ```
+
+2. Setze `KLEINANZEIGEN_AUTOSEND=true` und starte `watch`. Die Kleinanzeigen-Suchalarme müssen konfiguriert sein. Ein Entwurf aus `klein-address` kann im nächsten Lauf verschickt werden, solange der selbst eingetragene Standort die ÖPNV-Prüfung erneut besteht und die Anzeige noch frisch ist.
+3. Prüfe `python src/munich_radar.py delivery`. Der Radar markiert einen Versand als bestätigt, wenn er die gesendete Nachricht im Nachrichtenverlauf erkennt. Bei Anmeldung, Verifikation oder unklarem Ergebnis pausiert der Versand. Unklare Versuche werden nicht automatisch wiederholt.
 
 ### Auf Railway betreiben
 
 Verbinde das Repo als [Dockerfile-Service](https://docs.railway.com/builds/dockerfiles) mit Railway. Das Image startet `watch` und enthält Chromium und den zugehörigen Treiber. Betreibe eine Instanz und hänge ein privates [Volume](https://docs.railway.com/volumes) unter `/data` an. Dort bleiben Entwürfe, Versandstatus und Browserprofil erhalten. Der Dienst braucht keine öffentliche Domain und keinen HTTP-Healthcheck.
 
-Trage die Variablen aus der lokalen Anleitung in Railway ein, inklusive `MUNICH_MESSAGE_TEMPLATE` als mehrzeilige Variable. Lass den Dienst zuerst im Entwurfsmodus laufen. Zum automatischen Versand setze `MUNICH_AUTOSEND=true` und die WG-Gesucht-Zugangsdaten. Der Versand braucht einen erfolgreichen Browserstart mit aktiver Chromium-Sandbox und eine reguläre Anmeldung. Wenn Railway den Browser nicht starten kann oder WG-Gesucht eine zusätzliche Verifikation verlangt, pausiert der Versand; in diesem Fall kannst du den Versand lokal betreiben.
+Trage die Variablen aus der lokalen Anleitung in Railway ein, inklusive `MUNICH_MESSAGE_TEMPLATE` als mehrzeilige Variable. Lass den Dienst zuerst im Entwurfsmodus laufen. Der Versand braucht einen erfolgreichen Browserstart mit aktiver Chromium-Sandbox und eine reguläre Anmeldung. Für Kleinanzeigen muss das Browserprofil auf dem Host bereits angemeldet sein. Ohne interaktive Anmeldung auf dem Host kannst du den Kleinanzeigen-Versand lokal betreiben.
 
 Mit [Railway SSH](https://docs.railway.com/cli/ssh) kannst du Entwürfe und Versandstatus lesen:
 

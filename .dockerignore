@@ -12,6 +12,7 @@
 !src/llm_personalizer.py
 !src/kleinanzeigen_source.py
 !src/kleinanzeigen_radar.py
+!src/kleinanzeigen_delivery.py
 !config/
 !config/llm_persona.txt
 !scripts/
