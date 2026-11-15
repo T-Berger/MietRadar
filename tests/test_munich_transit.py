@@ -4,57 +4,95 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 from urllib.error import URLError
+from urllib.parse import parse_qs, urlsplit
 
-from src.munich_transit import ROUTES_URL, STATIONS, TransitRouter
+from src.munich_transit import DEFAULT_TRANSIT_API_URL, STATIONS, TransitRouter
 
 
 ORIGIN = "Beispielstraße 1, 81667 München"
 FRIDAY_BEFORE_CLOCK_CHANGE = datetime(2026, 3, 27, 15, tzinfo=timezone.utc)
+GEOCODE = {
+    "type": "ADDRESS", "street": "Beispielstraße", "houseNumber": "1", "zip": "81667",
+    "lat": 48.128, "lon": 11.603, "country": "DE",
+    "areas": [{"name": "München", "adminLevel": 6}],
+}
 
 
 def response(payload):
     return io.StringIO(json.dumps(payload))
 
 
+def route(start, end, mode="SUBURBAN"):
+    return {"startTime": f"2026-03-30T{start}Z", "endTime": f"2026-03-30T{end}Z",
+            "legs": [{"mode": "WALK"}, {"mode": mode}]}
+
+
 class TransitRouterTest(unittest.TestCase):
     @patch("src.munich_transit.urlopen")
-    def test_checks_both_stations_and_accepts_exact_limit(self, urlopen):
+    def test_checks_both_stations_and_counts_waiting_with_dst(self, urlopen):
         urlopen.side_effect = [
-            response({"routes": [{"duration": "1800.000000001s"}]}),
-            response({"routes": [{"duration": "2100s"}, {"duration": "1800s"}]}),
+            response([GEOCODE]),
+            response({"itineraries": [route("06:12:00", "06:30:01")]}),
+            response({"itineraries": [route("06:10:00", "06:30:00")]}),
         ]
-        self.assertIs(TransitRouter("key").qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), True)
+        self.assertIs(TransitRouter().qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), True)
         requests = [call.args[0] for call in urlopen.call_args_list]
-        self.assertEqual([request.full_url for request in requests], [ROUTES_URL, ROUTES_URL])
-        bodies = [json.loads(request.data) for request in requests]
-        self.assertEqual([body["destination"]["address"] for body in bodies], list(STATIONS))
-        self.assertEqual(bodies[0]["origin"], {"address": ORIGIN})
-        self.assertEqual(bodies[0]["travelMode"], "TRANSIT")
-        self.assertEqual(bodies[0]["departureTime"], "2026-03-30T06:00:00Z")
+        self.assertTrue(all(req.full_url.startswith(DEFAULT_TRANSIT_API_URL + "/") for req in requests))
+        self.assertIn("MietRadar", requests[0].get_header("User-agent"))
+        addresses = parse_qs(urlsplit(requests[0].full_url).query)
+        self.assertEqual(addresses["text"], [ORIGIN])
+        plans = [parse_qs(urlsplit(req.full_url).query, keep_blank_values=True) for req in requests[1:]]
+        self.assertEqual(tuple(plan["toPlace"][0] for plan in plans), STATIONS)
+        self.assertEqual(plans[0]["time"], ["2026-03-30T06:00:00Z"])
+        self.assertEqual(plans[0]["directModes"], [""])
 
     @patch("src.munich_transit.urlopen")
-    def test_rejects_over_limit_and_no_connection(self, urlopen):
-        urlopen.side_effect = [response({"routes": [{"duration": "1801s"}]}), response({})]
-        self.assertIs(TransitRouter("key").qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), False)
+    def test_rejects_walking_only_and_no_transit(self, urlopen):
+        urlopen.side_effect = [
+            response([GEOCODE]),
+            response({"itineraries": [route("06:00:00", "06:03:00", mode="WALK")]}),
+            response({"itineraries": []}),
+        ]
+        self.assertIs(TransitRouter().qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), False)
 
     @patch("src.munich_transit.urlopen")
     def test_failed_station_stays_unknown_without_other_match(self, urlopen):
-        urlopen.side_effect = [URLError("offline"), response({"routes": [{"duration": "2100s"}]})]
-        self.assertIsNone(TransitRouter("key").qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE))
-
-    @patch("src.munich_transit.urlopen")
-    def test_partial_address_match_does_not_qualify(self, urlopen):
         urlopen.side_effect = [
-            response({
-                "routes": [{"duration": "900s"}],
-                "geocodingResults": {"origin": {"partialMatch": True}},
-            }),
-            response({}),
+            response([GEOCODE]), URLError("offline"), response({"itineraries": []}),
         ]
-        self.assertIsNone(TransitRouter("key").qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE))
+        self.assertIsNone(TransitRouter().qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE))
 
     @patch("src.munich_transit.urlopen")
-    def test_missing_key_or_address_makes_no_request(self, urlopen):
-        self.assertIsNone(TransitRouter(None).qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE))
-        self.assertIsNone(TransitRouter("key").qualifies(" ", FRIDAY_BEFORE_CLOCK_CHANGE))
+    def test_partial_address_and_wrong_municipality_do_not_qualify(self, urlopen):
+        urlopen.return_value = response([
+            dict(GEOCODE, houseNumber="10"),
+            dict(GEOCODE, zip="81669"),
+            dict(GEOCODE, areas=[{"name": "Landkreis München", "adminLevel": 6}]),
+        ])
+        self.assertIsNone(TransitRouter().qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE))
+        urlopen.assert_called_once()
+
+    @patch("src.munich_transit.urlopen")
+    def test_incomplete_address_does_not_make_a_request(self, urlopen):
+        self.assertIsNone(TransitRouter().qualifies("81667 München", FRIDAY_BEFORE_CLOCK_CHANGE))
+        self.assertIsNone(TransitRouter().qualifies("Beispielstraße 1, 81667 Berlin", FRIDAY_BEFORE_CLOCK_CHANGE))
         urlopen.assert_not_called()
+
+    @patch("src.munich_transit.urlopen")
+    def test_custom_instance_and_repeated_address_share_cached_route(self, urlopen):
+        urlopen.side_effect = [
+            response([GEOCODE, dict(GEOCODE, lat=48.1281)]),
+            response({"itineraries": [route("06:00:00", "06:20:00")]}),
+        ]
+        router = TransitRouter("http://motis.railway.internal:8080")
+        self.assertIs(router.qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), True)
+        self.assertIs(router.qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), True)
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertTrue(urlopen.call_args.args[0].full_url.startswith("http://motis.railway.internal:8080/api/v6/plan?"))
+
+    @patch("src.munich_transit.MAX_REQUESTS_PER_DAY", 2)
+    @patch("src.munich_transit.urlopen")
+    def test_daily_request_budget_leaves_unchecked_station_unknown(self, urlopen):
+        urlopen.side_effect = [response([GEOCODE]), response({"itineraries": []})]
+        self.assertIsNone(TransitRouter().qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE))
+        self.assertEqual(urlopen.call_count, 2)

@@ -236,7 +236,7 @@ def _scanner(max_age: timedelta) -> Scanner:
 
     limit = _number("MUNICH_MAX_CANDIDATES", 12, 1, 40)
     return Scanner(
-        WGSource(search_urls or DEFAULT_SEARCH_URLS, limit), TransitRouter(_required("GOOGLE_MAPS_API_KEY")),
+        WGSource(search_urls or DEFAULT_SEARCH_URLS, limit), TransitRouter(os.getenv("MUNICH_TRANSIT_API_URL")),
         template, provider, max_age, limit, alerts,
         _number("MUNICH_APPLICANT_AGE", 28, 18, 100), _number("MUNICH_MAX_AGE_GAP", 7, 0, 100),
         klein_alerts=klein_alerts,
@@ -293,7 +293,7 @@ def main() -> int:
             if args.command == "klein-address":
                 now = datetime.now(timezone.utc)
                 template, provider = _draft_settings()
-                klein = KleinanzeigenRadar(TransitRouter(_required("GOOGLE_MAPS_API_KEY")), template, provider)
+                klein = KleinanzeigenRadar(TransitRouter(os.getenv("MUNICH_TRANSIT_API_URL")), template, provider)
                 saved, message = klein.check_address(db, args.id, args.address, now, now - max_age)
                 print(message)
                 return 0 if saved else 1
