@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
+from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from llm_personalizer import personalise_message
 from munich_delivery import DeliveryQueue, install_schema
 from munich_transit import TransitRouter
@@ -62,6 +63,7 @@ def _database(path: Path) -> sqlite3.Connection:
         )
     """)
     install_schema(db)
+    install_klein_review(db)
     return db
 
 
@@ -77,6 +79,7 @@ class Scanner:
     age: int = 28
     age_gap: int = 7
     delivery: DeliveryQueue | None = None
+    klein_alerts: AlertsInbox | None = None
 
     def scan(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         cutoff = now - self.max_age
@@ -87,12 +90,20 @@ class Scanner:
         for listing_id, retry in list(retry_after.items()):
             if retry <= now:
                 del retry_after[listing_id]
+
+        counts: Counter = Counter()
+        if self.klein_alerts:
+            klein = KleinanzeigenRadar(self.router, self.template, self.provider, self.age, self.age_gap)
+            try:
+                counts.update(klein.scan(db, self.klein_alerts, now, cutoff, self.limit, retry_after))
+            except AlertsError as exc:
+                LOG.warning("Kleinanzeigen-Suchalarm nicht erreichbar: %s", exc)
+
         if self.alerts:
             refs = [(alert.ref, alert.received_at) for alert in self.alerts.recent(cutoff, self.limit)]
         else:
             refs = [(ref, None) for ref in self.source.candidates()]
 
-        counts: Counter = Counter()
         eligible = []
         for ref, received_at in refs:
             if ref.id in retry_after:
@@ -164,17 +175,14 @@ class Scanner:
         return counts
 
 
-def _scanner(max_age: timedelta) -> Scanner:
-    mode = os.getenv("MUNICH_SOURCE", "public").strip().lower()
-    if mode not in {"public", "alerts"}:
-        raise ValueError("MUNICH_SOURCE muss public oder alerts sein")
-    alerts = None
-    if mode == "alerts":
-        alerts = AlertsInbox(
-            _required("MUNICH_IMAP_HOST"), _required("MUNICH_IMAP_USER"), _required("MUNICH_IMAP_PASSWORD"),
-            _required("MUNICH_IMAP_FOLDER"), _required("MUNICH_ALERT_SENDER"),
-        )
-    search_urls = tuple(url.strip() for url in os.getenv("MUNICH_SEARCH_URLS", "").split(",") if url.strip())
+def _inbox(folder_variable: str, sender_variable: str) -> AlertsInbox:
+    return AlertsInbox(
+        _required("MUNICH_IMAP_HOST"), _required("MUNICH_IMAP_USER"), _required("MUNICH_IMAP_PASSWORD"),
+        _required(folder_variable), _required(sender_variable),
+    )
+
+
+def _draft_settings() -> tuple[str, str]:
     provider = os.getenv("MUNICH_LLM_PROVIDER", "none").strip().lower()
     if provider not in {"none", "mistral"}:
         raise ValueError("MUNICH_LLM_PROVIDER muss none oder mistral sein")
@@ -190,12 +198,26 @@ def _scanner(max_age: timedelta) -> Scanner:
         raise ValueError("Die Bewerbungsvorlage braucht eigenen Text")
     if provider == "mistral" and "{LLM_TEXT}" not in template:
         raise ValueError("Für Mistral muss die Bewerbungsvorlage {LLM_TEXT} enthalten")
+    return template, provider
+
+
+def _scanner(max_age: timedelta) -> Scanner:
+    mode = os.getenv("MUNICH_SOURCE", "public").strip().lower()
+    if mode not in {"public", "alerts"}:
+        raise ValueError("MUNICH_SOURCE muss public oder alerts sein")
+    alerts = _inbox("MUNICH_IMAP_FOLDER", "MUNICH_ALERT_SENDER") if mode == "alerts" else None
+    klein_alerts = None
+    if os.getenv("KLEINANZEIGEN_IMAP_FOLDER", "").strip() or os.getenv("KLEINANZEIGEN_ALERT_SENDER", "").strip():
+        klein_alerts = _inbox("KLEINANZEIGEN_IMAP_FOLDER", "KLEINANZEIGEN_ALERT_SENDER")
+    search_urls = tuple(url.strip() for url in os.getenv("MUNICH_SEARCH_URLS", "").split(",") if url.strip())
+    template, provider = _draft_settings()
 
     limit = _number("MUNICH_MAX_CANDIDATES", 12, 1, 40)
     return Scanner(
         WGSource(search_urls or DEFAULT_SEARCH_URLS, limit), TransitRouter(_required("GOOGLE_MAPS_API_KEY")),
         template, provider, max_age, limit, alerts,
         _number("MUNICH_APPLICANT_AGE", 28, 18, 100), _number("MUNICH_MAX_AGE_GAP", 7, 0, 100),
+        klein_alerts=klein_alerts,
     )
 
 
@@ -203,15 +225,41 @@ def main() -> int:
     load_dotenv(ROOT / "config" / ".env")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("watch", "scan", "drafts", "delivery", "done"))
-    parser.add_argument("id", nargs="?", help="Anzeigennummer für drafts/delivery/done")
+    parser.add_argument("command", choices=("watch", "scan", "drafts", "delivery", "done", "klein-review", "klein-address"))
+    parser.add_argument("id", nargs="?", help="Anzeigennummer, bei Kleinanzeigen mit ka- am Anfang")
+    parser.add_argument("--address", help="Veröffentlichte Adresse für klein-address")
     args = parser.parse_args()
     if (args.command == "done" and not args.id) or (args.id and args.command in {"watch", "scan"}):
         parser.error("done braucht eine ID; watch und scan nehmen keine ID an")
+    if args.command == "klein-address" and (not args.id or not args.id.startswith("ka-") or not args.address):
+        parser.error("klein-address braucht eine Kleinanzeigen-ID mit ka- und --address")
+    if args.address and args.command != "klein-address":
+        parser.error("--address ist nur für klein-address gedacht")
     try:
         max_age = timedelta(hours=_number("MUNICH_MAX_AGE_HOURS", 24, 1, 72))
         data_dir = Path(os.getenv("MUNICH_DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ROOT / "data")
         with closing(_database(data_dir / "munich_radar.sqlite3")) as db:
+            if args.command == "klein-review":
+                cutoff = datetime.now(timezone.utc) - max_age
+                query = "SELECT id, url, title, fresh_at, basis, reason FROM klein_review WHERE fresh_at >= ?"
+                params = (cutoff.timestamp(),)
+                if args.id:
+                    query += " AND id = ?"
+                    params += (args.id,)
+                rows = db.execute(query + " ORDER BY fresh_at DESC, id DESC", params).fetchall()
+                for listing_id, url, title, stamp, basis, reason in rows:
+                    when = datetime.fromtimestamp(stamp, BERLIN).strftime("%d.%m.%Y %H:%M %Z")
+                    print(f"{listing_id} · {title or 'Kleinanzeigen'} · {reason} · {basis}: {when}\n{url}")
+                if not rows:
+                    print("Keine aktuellen Kleinanzeigen-Treffer zur Ortsprüfung.")
+                return 0
+            if args.command == "klein-address":
+                now = datetime.now(timezone.utc)
+                template, provider = _draft_settings()
+                klein = KleinanzeigenRadar(TransitRouter(_required("GOOGLE_MAPS_API_KEY")), template, provider)
+                saved, message = klein.check_address(db, args.id, args.address, now, now - max_age)
+                print(message)
+                return 0 if saved else 1
             if args.command == "done":
                 with db:
                     updated = db.execute("UPDATE drafts SET done = 1, message = NULL WHERE id = ?", (args.id,))
