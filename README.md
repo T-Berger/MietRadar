@@ -75,6 +75,14 @@ Wenn WG-Gesucht eine zusätzliche Prüfung anzeigt, pausiert der Versand. Entwü
 2. Setze `KLEINANZEIGEN_AUTOSEND=true` und starte `watch`. Die Kleinanzeigen-Suchalarme müssen konfiguriert sein. Ein Entwurf aus `klein-address` kann im nächsten Lauf verschickt werden, solange der selbst eingetragene Standort die ÖPNV-Prüfung erneut besteht und die Anzeige noch frisch ist.
 3. Prüfe `python src/munich_radar.py delivery`. Der Radar markiert einen Versand als bestätigt, wenn er die gesendete Nachricht im Nachrichtenverlauf erkennt. Bei Anmeldung, Verifikation oder unklarem Ergebnis pausiert der Versand. Unklare Versuche werden nicht automatisch wiederholt.
 
+#### Antworten sortieren und Hinweise bekommen
+
+Aktiviere in Kleinanzeigen unter **Meins → Einstellungen → E-Mails** die Option **Nachrichten von Nutzern**. Lege für Kopien deiner Wohnungsgespräche einen separaten IMAP-Ordner an und setze `KLEINANZEIGEN_REPLIES_IMAP_FOLDER` und `KLEINANZEIGEN_REPLY_SENDER` auf diesen Ordner und die genaue Absenderadresse der Nachrichten-Kopien. Der Radar liest diesen Ordner mit denselben IMAP-Zugangsdaten wie die Suchalarme. [Kleinanzeigen-E-Mail-Einstellungen](https://hilfe.kleinanzeigen.de/hc/de/articles/17145751363996-Zu-viele-E-Mails-So-schaltest-du-Benachrichtigungen-aus)
+
+Der Radar ordnet Antworten in **Besichtigung**, **Rückfrage**, **Absage**, **Vorsicht** oder **Sonstiges** ein. Er schreibt kurz dazu, worum es geht, und setzt eine Priorität. Du antwortest selbst. Standardmäßig nutzt er lokale Regeln. Mit `KLEINANZEIGEN_JUDGE_PROVIDER=mistral` und deinem `MISTRAL_API_KEY` sendet er für die Einordnung einen kurzen Antwortausschnitt an Mistral. Er entfernt erkennbare E-Mail-Adressen, Telefonnummern und Links.
+
+Mit `python src/munich_radar.py klein-activity` siehst du Treffer, Ortsprüfungen, Versandstatus und bewertete Antworten. Wenn du diese Hinweise automatisch per E-Mail bekommen willst, setze `RESEND_API_KEY`, `MUNICH_NOTIFY_EMAIL_FROM` (Absender aus deinem Resend-Konto) und `MUNICH_NOTIFY_EMAIL_TO` (deine E-Mail-Adresse). Der Versand läuft über die [Resend HTTPS API](https://resend.com/docs/api-reference/emails/send-email) und funktioniert auch auf Railway Hobby. Ältere Hinweise findest du bis zu 30 Tage im lokalen Verlauf.
+
 ### Auf Railway betreiben
 
 Verbinde das Repo als [Dockerfile-Service](https://docs.railway.com/builds/dockerfiles) mit Railway. Das Image startet `watch` und enthält Chromium und den zugehörigen Treiber. Betreibe eine Instanz und hänge ein privates [Volume](https://docs.railway.com/volumes) unter `/data` an. Dort bleiben Entwürfe, Versandstatus und Browserprofil erhalten. Der Dienst braucht keine öffentliche Domain und keinen HTTP-Healthcheck.
@@ -87,6 +95,7 @@ Mit [Railway SSH](https://docs.railway.com/cli/ssh) kannst du Entwürfe und Vers
 railway ssh -- start-mietradar python /app/src/munich_radar.py drafts
 railway ssh -- start-mietradar python /app/src/munich_radar.py delivery
 railway ssh -- start-mietradar python /app/src/munich_radar.py klein-review
+railway ssh -- start-mietradar python /app/src/munich_radar.py klein-activity
 ```
 
 Die Idee, neue Inserate für eine persönliche Nachricht zu priorisieren, kommt von [jonasdieker/wg-gesucht-bot](https://github.com/jonasdieker/wg-gesucht-bot). Der München-Radar setzt diesen Ablauf eigenständig um.
