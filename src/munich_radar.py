@@ -1,4 +1,4 @@
-"""Poll Munich listings and queue fresh drafts for manual review and sending."""
+"""Poll Munich listings, draft an application, and optionally send it."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from llm_personalizer import personalise_message
+from munich_delivery import DeliveryQueue, install_schema
 from munich_transit import TransitRouter
 from wg_alerts import AlertsError, AlertsInbox
 from wg_preferences import rejection_reason
@@ -60,6 +61,7 @@ def _database(path: Path) -> sqlite3.Connection:
             done INTEGER NOT NULL DEFAULT 0
         )
     """)
+    install_schema(db)
     return db
 
 
@@ -74,6 +76,7 @@ class Scanner:
     alerts: AlertsInbox | None = None
     age: int = 28
     age_gap: int = 7
+    delivery: DeliveryQueue | None = None
 
     def scan(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         cutoff = now - self.max_age
@@ -92,7 +95,13 @@ class Scanner:
         counts: Counter = Counter()
         eligible = []
         for ref, received_at in refs:
-            if ref.id in retry_after or db.execute("SELECT 1 FROM drafts WHERE id = ?", (ref.id,)).fetchone():
+            if ref.id in retry_after:
+                continue
+            draft = db.execute(
+                """SELECT d.fresh_at, d.message, d.done, s.state FROM drafts d
+                   LEFT JOIN delivery s ON s.id = d.id WHERE d.id = ?""", (ref.id,),
+            ).fetchone()
+            if draft and (not self.delivery or self.delivery.paused or not draft[1] or draft[2] or draft[3]):
                 continue
             try:
                 listing = self.source.details(ref)
@@ -119,9 +128,12 @@ class Scanner:
                 counts[reason] += 1
                 retry_after[ref.id] = now + self.max_age
                 continue
-            eligible.append((fresh_at, listing, "veröffentlicht" if listing.published_at else "Suchalarm erhalten"))
+            if draft:
+                # A new alert may not extend an existing listing's window.
+                fresh_at = min(fresh_at, datetime.fromtimestamp(draft[0], timezone.utc))
+            eligible.append((fresh_at, listing, "veröffentlicht" if listing.published_at else "Suchalarm erhalten", draft))
 
-        for fresh_at, listing, basis in sorted(eligible, key=lambda item: item[0], reverse=True):
+        for fresh_at, listing, basis, draft in sorted(eligible, key=lambda item: item[0], reverse=True):
             if not listing.address:
                 counts["keine prüfbare Adresse"] += 1
                 retry_after[listing.id] = now + timedelta(minutes=30)
@@ -131,15 +143,24 @@ class Scanner:
                 counts["ÖPNV über 30 Minuten" if match is False else "ÖPNV nicht prüfbar"] += 1
                 retry_after[listing.id] = now + (self.max_age if match is False else timedelta(minutes=10))
                 continue
-            message = personalise_message(
-                self.template, listing.description, listing_url=listing.url, provider=self.provider,
-            )
-            with db:
-                saved = db.execute(
-                    "INSERT OR IGNORE INTO drafts(id, url, fresh_at, basis, message) VALUES (?, ?, ?, ?, ?)",
-                    (listing.id, listing.url, fresh_at.timestamp(), basis, message),
+            if draft:
+                message = draft[1]
+            else:
+                message = personalise_message(
+                    self.template, listing.description, listing_url=listing.url, provider=self.provider,
                 )
-            counts["neue Entwürfe"] += saved.rowcount
+                with db:
+                    saved = db.execute(
+                        "INSERT OR IGNORE INTO drafts(id, url, fresh_at, basis, message) VALUES (?, ?, ?, ?, ?)",
+                        (listing.id, listing.url, fresh_at.timestamp(), basis, message),
+                    )
+                counts["neue Entwürfe"] += saved.rowcount
+                if not saved.rowcount:
+                    continue
+            if self.delivery:
+                result = self.delivery.deliver(db, listing.id, listing.url, message, fresh_at, self.max_age)
+                if result:
+                    counts[result] += 1
         return counts
 
 
@@ -182,8 +203,8 @@ def main() -> int:
     load_dotenv(ROOT / "config" / ".env")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("watch", "scan", "drafts", "done"))
-    parser.add_argument("id", nargs="?", help="Anzeigennummer für drafts/done")
+    parser.add_argument("command", choices=("watch", "scan", "drafts", "delivery", "done"))
+    parser.add_argument("id", nargs="?", help="Anzeigennummer für drafts/delivery/done")
     args = parser.parse_args()
     if (args.command == "done" and not args.id) or (args.id and args.command in {"watch", "scan"}):
         parser.error("done braucht eine ID; watch und scan nehmen keine ID an")
@@ -198,7 +219,9 @@ def main() -> int:
                 return 0 if updated.rowcount else 1
             if args.command == "drafts":
                 cutoff = datetime.now(timezone.utc) - max_age
-                query = "SELECT id, url, fresh_at, basis, message FROM drafts WHERE done = 0 AND message IS NOT NULL AND fresh_at >= ?"
+                query = """SELECT id, url, fresh_at, basis, message FROM drafts
+                           WHERE done = 0 AND message IS NOT NULL AND fresh_at >= ?
+                           AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.id = drafts.id AND state = 'unconfirmed')"""
                 params: tuple = (cutoff.timestamp(),)
                 if args.id:
                     query += " AND id = ?"
@@ -212,29 +235,71 @@ def main() -> int:
                     if args.id:
                         print(f"\n{message}")
                 return 0
+            if args.command == "delivery":
+                query = """SELECT s.id, s.state, s.recorded_at, d.url FROM delivery s JOIN drafts d ON d.id = s.id"""
+                labels = {"unconfirmed": "Unklar – bitte im WG-Gesucht-Postfach prüfen", "sent": "Gesendet",
+                          "already_contacted": "Bereits kontaktiert", "unavailable": "Kontakt nicht verfügbar"}
+                if args.id:
+                    rows = db.execute(query + " WHERE s.id = ?", (args.id,)).fetchall()
+                else:
+                    rows = db.execute(query + " ORDER BY s.recorded_at DESC LIMIT 50").fetchall()
+                for listing_id, state, stamp, url in rows:
+                    when = datetime.fromtimestamp(stamp, BERLIN).strftime("%d.%m.%Y %H:%M %Z")
+                    print(f"{listing_id} · {labels[state]} · {when}\n{url}")
+                if not rows:
+                    print("Keine Versanddaten.")
+                return 0
 
             scanner = _scanner(max_age)
-            interval = _number("MUNICH_POLL_SECONDS", 300, 60, 3600)
-            delay = interval
-            retry_after: dict[str, datetime] = {}
-            while True:
-                try:
-                    counts = scanner.scan(db, datetime.now(timezone.utc), retry_after)
-                    LOG.info("Scan fertig: %s", ", ".join(f"{n} {key}" for key, n in counts.items()) or "nichts Neues")
-                    delay = interval
-                    if args.command == "scan":
-                        return 0
-                except (WGSourceError, AlertsError) as exc:
-                    LOG.warning("Scan pausiert: %s", exc)
-                    if args.command == "scan":
-                        return 1
-                    delay = min(max(600, delay * 2), 3600)
-                time.sleep(delay)
+            sender = None
+            try:
+                if _switch("MUNICH_AUTOSEND", False):
+                    try:
+                        from wg_delivery import BrowserSender
+                    except ModuleNotFoundError as exc:
+                        raise ValueError("Für den Versand: pip install -r requirements-send.txt") from exc
+                    limit = _number("MUNICH_DAILY_SEND_LIMIT", 3, 1, 5)
+                    sender = BrowserSender(
+                        data_dir / "munich_browser",
+                        headless=_switch("MUNICH_BROWSER_HEADLESS", True),
+                        email=os.getenv("WG_EMAIL", "").strip(), password=os.getenv("WG_PASSWORD", ""),
+                    )
+                    scanner.delivery = DeliveryQueue(sender, limit)
+                interval = _number("MUNICH_POLL_SECONDS", 300, 60, 3600)
+                return _poll(scanner, db, interval, once=args.command == "scan")
+            finally:
+                if sender is not None:
+                    sender.close()
     except (OSError, sqlite3.Error, ValueError) as exc:
         LOG.error("Start fehlgeschlagen: %s", exc)
         return 1
     except KeyboardInterrupt:
         return 0
+
+
+def _switch(name: str, default: bool) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{name} muss true oder false sein")
+    return value == "true"
+
+
+def _poll(scanner: Scanner, db: sqlite3.Connection, interval: int, *, once: bool) -> int:
+    delay = interval
+    retry_after: dict[str, datetime] = {}
+    while True:
+        try:
+            counts = scanner.scan(db, datetime.now(timezone.utc), retry_after)
+            LOG.info("Scan fertig: %s", ", ".join(f"{n} {key}" for key, n in counts.items()) or "nichts Neues")
+            delay = interval
+            if once:
+                return int(scanner.delivery is not None and scanner.delivery.paused)
+        except (WGSourceError, AlertsError) as exc:
+            LOG.warning("Scan pausiert: %s", exc)
+            if once:
+                return 1
+            delay = min(max(600, delay * 2), 3600)
+        time.sleep(delay)
 
 
 if __name__ == "__main__":

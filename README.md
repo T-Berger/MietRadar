@@ -15,7 +15,7 @@ Der Radar sucht WG-Zimmer, Einzimmerwohnungen und Wohnungen in München. Er prü
 
 - **Lage:** Zum Hauptbahnhof **oder** zum Ostbahnhof dauert es mit dem ÖPNV inklusive Fußwegen höchstens 30 Minuten. Als Vergleich dient die Abfahrt am nächsten Werktag (Mo–Fr) um 08:00 Uhr Münchner Zeit. Anzeigen ohne aussagekräftige öffentliche Adresse oder prüfbare Route landen nicht in der Entwurfsliste.
 - **WG:** Klar formulierte Gesuche nur für Studierende oder nur für Frauen werden aussortiert. Liegt ein genanntes Alter der Mitbewohnenden außerhalb von **21 bis 35 einschließlich**, wird die Anzeige übersprungen. Fehlende Altersangaben werden akzeptiert. Der Textfilter erfasst gängige Formulierungen; prüf die Anzeige vor dem Abschicken noch einmal.
-- **Bewerbung:** Die Entwürfe bleiben auf deinem Rechner. Der Radar verschickt keine Nachrichten. Öffne das Inserat und schick den Entwurf selbst ab. Für personalisierte Absätze kannst du Mistral Studio hinzufügen: Das ist die API von Mistral, die unabhängig vom Vibe-Chatkonto eingerichtet wird. Dein persönlicher Bewerbungstext bleibt in deiner Vorlage.
+- **Bewerbung:** Standardmäßig speichert der Radar Entwürfe für dich. Du kannst ihn auch automatisch verschicken lassen. Für personalisierte Absätze kannst du Mistral Studio hinzufügen: Das ist die API von Mistral, die unabhängig vom Vibe-Chatkonto eingerichtet wird. Dein persönlicher Bewerbungstext bleibt in deiner Vorlage.
 
 ### Lokal starten
 
@@ -39,6 +39,16 @@ python src/munich_radar.py drafts        # aktuelle Treffer, neueste zuerst
 python src/munich_radar.py drafts 123456 # Bewerbungstext zu einer Anzeige anzeigen
 python src/munich_radar.py done 123456   # nach dem Abschicken oder Verwerfen ausblenden
 ```
+
+### Automatisch bewerben
+
+1. Installiere die Browser-Abhängigkeiten (`pip install -r requirements-send.txt`) und Chrome oder Chromium. Füll zuerst deine eigene deutsche Bewerbungsvorlage aus.
+2. Setze `WG_EMAIL`, `WG_PASSWORD` und `MUNICH_AUTOSEND=true` in `config/.env`. Starte `python src/munich_radar.py watch`. Auch `scan` verschickt Bewerbungen, wenn die Option gesetzt ist.
+3. Mit `python src/munich_radar.py delivery` siehst du den Versandstatus. `MUNICH_AUTOSEND=false` schaltet wieder auf Entwürfe um.
+
+Der Versand prüft die München-Filter auch bei vorhandenen Entwürfen erneut und verarbeitet die neuesten Treffer zuerst. Direkt vor dem Klick gilt eine feste Obergrenze von **24 Stunden**; eine kürzere Einstellung aus `MUNICH_MAX_AGE_HOURS` gilt weiterhin. Bei Suchalarmen kann der Maileingang als Aktualitätssignal dienen, wenn WG-Gesucht das Veröffentlichungsdatum ausblendet. Standardmäßig sind höchstens drei Versandversuche je 24 Stunden erlaubt (`MUNICH_DAILY_SEND_LIMIT`, 1–5).
+
+Wenn WG-Gesucht eine zusätzliche Prüfung anzeigt, pausiert der Versand. Entwürfe werden weiter erstellt. Bei einem unklaren Ergebnis wird dieselbe Anzeige nicht erneut automatisch angeschrieben; prüf zuerst das WG-Gesucht-Postfach. Starte den Worker neu, sobald das Login oder die Prüfung geklärt ist. Verwende für den München-Radar und den alten WG-Gesucht-Bot keinen gleichzeitigen Versand auf demselben Konto.
 
 Die Idee, neue Inserate für eine persönliche Nachricht zu priorisieren, kommt von [jonasdieker/wg-gesucht-bot](https://github.com/jonasdieker/wg-gesucht-bot). Der München-Radar setzt diesen Ablauf eigenständig um.
 
