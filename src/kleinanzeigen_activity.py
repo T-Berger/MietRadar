@@ -12,6 +12,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from kleinanzeigen_judge import judge_reply
+from kleinanzeigen_reply_queue import save_reply_draft
 from kleinanzeigen_replies import extract_replies
 from wg_alerts import AlertsInbox
 
@@ -52,10 +53,19 @@ def record_activity(db: sqlite3.Connection, now: datetime, sending_paused: bool 
     cutoff = (now - timedelta(hours=24)).timestamp()
     with db:
         db.execute("DELETE FROM klein_activity WHERE occurred_at < ?", ((now - timedelta(days=30)).timestamp(),))
+        db.execute("UPDATE klein_reply_drafts SET context = '', message = '' WHERE received_at < ? AND (context <> '' OR message <> '')",
+                   ((now - timedelta(days=30)).timestamp(),))
         db.execute("""INSERT OR IGNORE INTO klein_activity (id, kind, listing_id, url, subject, summary, occurred_at)
             SELECT 'review:' || r.id, 'review', r.id, r.url, 'Kleinanzeigen-Adresse prüfen',
                    'Die ÖPNV-Verbindung ist noch nicht bestätigt. Der Treffer steht unter klein-review.', r.fresh_at
             FROM klein_review r WHERE r.fresh_at BETWEEN ? AND ?
+        """, (cutoff, now.timestamp()))
+        db.execute("""INSERT OR IGNORE INTO klein_activity (id, kind, listing_id, url, subject, summary, occurred_at)
+            SELECT 'reply-delivery:' || state || ':' || id, 'delivery', listing_id, url,
+                   CASE state WHEN 'sent' THEN 'Kleinanzeigen-Antwort gesendet' ELSE 'Antwortversand unklar' END,
+                   CASE state WHEN 'sent' THEN 'Die geprüfte Antwort ist im Kleinanzeigen-Postfach sichtbar.'
+                              ELSE 'Bitte prüfe den Verlauf. Der Radar wiederholt den Versuch nicht.' END, attempted_at
+            FROM klein_reply_drafts WHERE attempted_at BETWEEN ? AND ? AND state IN ('sent', 'unconfirmed')
         """, (cutoff, now.timestamp()))
         db.execute("""INSERT OR IGNORE INTO klein_activity (id, kind, listing_id, url, subject, summary, occurred_at)
             SELECT 'match:' || d.id, 'match', d.id, d.url, 'Neuer Kleinanzeigen-Treffer',
@@ -84,7 +94,9 @@ def record_activity(db: sqlite3.Connection, now: datetime, sending_paused: bool 
         ).save(db)
 
 
-def record_replies(db: sqlite3.Connection, inbox: AlertsInbox, provider: str, now: datetime) -> int:
+def record_replies(
+    db: sqlite3.Connection, inbox: AlertsInbox, provider: str, now: datetime, *, outgoing_provider: str = "none",
+) -> int:
     count = 0
     for reply, received in inbox.recent_items(now - timedelta(days=7), 20, extract_replies):
         event_id = f"reply:{reply.id}"
@@ -93,6 +105,7 @@ def record_replies(db: sqlite3.Connection, inbox: AlertsInbox, provider: str, no
         if reply.listing_id and not db.execute("SELECT 1 FROM drafts WHERE id = ?", (reply.listing_id,)).fetchone():
             continue
         judgment = judge_reply(reply.text, provider=provider)
+        save_reply_draft(db, reply, judgment, received, provider, outgoing_provider)
         summary = f"Priorität {judgment.urgency}. {judgment.summary}"
         count += Activity(
             event_id, "reply", reply.listing_id, reply.url,

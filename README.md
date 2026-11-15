@@ -62,6 +62,8 @@ Bei Kleinanzeigen kann der Radar Entwürfe bereithalten oder sie automatisch üb
 
 Der Versand verarbeitet die neuesten Treffer zuerst. Direkt vor dem Klick gilt eine feste Obergrenze von **24 Stunden**. Eine kürzere Einstellung aus `MUNICH_MAX_AGE_HOURS` gilt weiterhin. Bei Suchalarmen kann der Maileingang als Aktualitätssignal dienen, wenn das Veröffentlichungsdatum fehlt. Standardmäßig sind insgesamt höchstens drei Versandversuche je 24 Stunden erlaubt (`MUNICH_DAILY_SEND_LIMIT`, 1–5).
 
+Der München-Radar prüft jede automatische Bewerbung und Antwort vor dem Versand. Standardmäßig prüft er lokal auf offene Platzhalter, vertrauliche Angaben und riskante Zusagen. Mit `MUNICH_OUTGOING_JUDGE_PROVIDER=mistral` kommt eine Mistral-Prüfung hinzu. Nur eine ausdrückliche Freigabe erlaubt den Versand. Bei einem API-Fehler bleibt die Nachricht liegen. Die Gründe stehen unter `python src/munich_radar.py outgoing-checks`.
+
 Wenn WG-Gesucht eine zusätzliche Prüfung anzeigt, pausiert der Versand. Entwürfe werden weiter erstellt. Bei einem unklaren Ergebnis wird dieselbe Anzeige nicht erneut automatisch angeschrieben; prüf zuerst das WG-Gesucht-Postfach. Starte den Worker neu, sobald das Login oder die Prüfung geklärt ist. Verwende für den München-Radar und den alten WG-Gesucht-Bot keinen gleichzeitigen Versand auf demselben Konto.
 
 #### Automatischer Kleinanzeigen-Versand
@@ -79,7 +81,10 @@ Wenn WG-Gesucht eine zusätzliche Prüfung anzeigt, pausiert der Versand. Entwü
 
 Aktiviere in Kleinanzeigen unter **Meins → Einstellungen → E-Mails** die Option **Nachrichten von Nutzern**. Lege für Kopien deiner Wohnungsgespräche einen separaten IMAP-Ordner an und setze `KLEINANZEIGEN_REPLIES_IMAP_FOLDER` und `KLEINANZEIGEN_REPLY_SENDER` auf diesen Ordner und die genaue Absenderadresse der Nachrichten-Kopien. Der Radar liest diesen Ordner mit denselben IMAP-Zugangsdaten wie die Suchalarme. [Kleinanzeigen-E-Mail-Einstellungen](https://hilfe.kleinanzeigen.de/hc/de/articles/17145751363996-Zu-viele-E-Mails-So-schaltest-du-Benachrichtigungen-aus)
 
-Der Radar ordnet Antworten in **Besichtigung**, **Rückfrage**, **Absage**, **Vorsicht** oder **Sonstiges** ein. Er schreibt kurz dazu, worum es geht, und setzt eine Priorität. Du antwortest selbst. Standardmäßig nutzt er lokale Regeln. Mit `KLEINANZEIGEN_JUDGE_PROVIDER=mistral` und deinem `MISTRAL_API_KEY` sendet er für die Einordnung einen kurzen Antwortausschnitt an Mistral. Er entfernt erkennbare E-Mail-Adressen, Telefonnummern und Links.
+Der Radar ordnet Antworten in **Besichtigung**, **Rückfrage**, **Absage**, **Vorsicht** oder **Sonstiges** ein. Er schreibt kurz dazu, worum es geht, und setzt eine Priorität. Standardmäßig nutzt er lokale Regeln. Mit `KLEINANZEIGEN_JUDGE_PROVIDER=mistral` und deinem `MISTRAL_API_KEY` sendet er für die Einordnung einen kurzen Antwortausschnitt an Mistral. Er entfernt erkennbare E-Mail-Adressen, Telefonnummern und Links.
+
+- `KLEINANZEIGEN_REPLY_MODE=draft` bereitet Antworten zur Durchsicht vor. Sie stehen unter `python src/munich_radar.py klein-reply-drafts`.
+- `KLEINANZEIGEN_REPLY_MODE=auto` darf eine klare Besichtigungseinladung oder eine Frage nach weiterem Interesse einmal pro Inserat unverbindlich beantworten. Dafür braucht der Radar einen eindeutigen Nachrichtenverlauf und das angemeldete Kleinanzeigen-Profil. Termine, Unterlagen, Zahlungen und unklare Fälle bleiben bei dir. Die Option für Erstbewerbungen (`KLEINANZEIGEN_AUTOSEND`) lässt sich unabhängig davon setzen.
 
 Mit `python src/munich_radar.py klein-activity` siehst du Treffer, Ortsprüfungen, Versandstatus und bewertete Antworten. Wenn du diese Hinweise automatisch per E-Mail bekommen willst, setze `RESEND_API_KEY`, `MUNICH_NOTIFY_EMAIL_FROM` (Absender aus deinem Resend-Konto) und `MUNICH_NOTIFY_EMAIL_TO` (deine E-Mail-Adresse). Der Versand läuft über die [Resend HTTPS API](https://resend.com/docs/api-reference/emails/send-email) und funktioniert auch auf Railway Hobby. Ältere Hinweise findest du bis zu 30 Tage im lokalen Verlauf.
 
@@ -96,6 +101,7 @@ railway ssh -- start-mietradar python /app/src/munich_radar.py drafts
 railway ssh -- start-mietradar python /app/src/munich_radar.py delivery
 railway ssh -- start-mietradar python /app/src/munich_radar.py klein-review
 railway ssh -- start-mietradar python /app/src/munich_radar.py klein-activity
+railway ssh -- start-mietradar python /app/src/munich_radar.py klein-reply-drafts
 ```
 
 Die Idee, neue Inserate für eine persönliche Nachricht zu priorisieren, kommt von [jonasdieker/wg-gesucht-bot](https://github.com/jonasdieker/wg-gesucht-bot). Der München-Radar setzt diesen Ablauf eigenständig um.

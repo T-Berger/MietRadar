@@ -13,6 +13,7 @@ COPY requirements-radar.txt requirements-send.txt ./
 RUN pip install --no-cache-dir -r requirements-send.txt
 COPY src/munich_radar.py src/munich_transit.py src/munich_delivery.py src/wg_source.py src/wg_alerts.py src/wg_preferences.py src/wg_delivery.py src/llm_personalizer.py src/kleinanzeigen_source.py src/kleinanzeigen_radar.py src/kleinanzeigen_delivery.py ./src/
 COPY src/kleinanzeigen_activity.py src/kleinanzeigen_judge.py src/kleinanzeigen_replies.py ./src/
+COPY src/kleinanzeigen_reply_queue.py src/kleinanzeigen_response.py src/outgoing_judge.py ./src/
 COPY config/llm_persona.txt ./config/
 COPY --chmod=755 scripts/start-mietradar.sh /usr/local/bin/start-mietradar
 

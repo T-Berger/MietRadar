@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from typing import Protocol
+
+from outgoing_judge import judge_outgoing
 
 
 class DeliveryOutcome(Enum):
@@ -31,6 +34,20 @@ def install_schema(db: sqlite3.Connection) -> None:
             attempted_at REAL
         )
     """)
+    db.execute("""CREATE TABLE IF NOT EXISTS outgoing_checks (
+        id TEXT NOT NULL, kind TEXT NOT NULL, message_hash TEXT NOT NULL,
+        approved INTEGER NOT NULL, reason TEXT NOT NULL, checked_at REAL NOT NULL,
+        PRIMARY KEY (id, kind)
+    )""")
+
+
+def review_outgoing(db, item_id, message, *, kind, context="", provider="none", now):
+    verdict = judge_outgoing(message, kind=kind, context=context, provider=provider)
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    with db:
+        db.execute("INSERT OR REPLACE INTO outgoing_checks VALUES (?, ?, ?, ?, ?, ?)",
+                   (item_id, kind, digest, verdict.approved, verdict.reason, now.timestamp()))
+    return verdict
 
 
 class DeliveryQueue:
@@ -39,11 +56,13 @@ class DeliveryQueue:
         sender: Sender,
         limit: int = 3,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        *, judge_provider: str = "none",
     ) -> None:
         self.sender = sender
         self.limit = limit
         self.clock = clock
         self.paused = False
+        self.judge_provider = judge_provider
 
     def _eligible(self, db: sqlite3.Connection, listing_id: str, fresh_at: datetime, max_age: timedelta) -> bool:
         now = self.clock()
@@ -59,16 +78,23 @@ class DeliveryQueue:
         ).fetchone()
         if info is None or not cutoff.timestamp() <= info[0] <= now.timestamp():
             return False
-        attempts = db.execute("SELECT COUNT(*) FROM delivery WHERE attempted_at >= ?",
-                              ((now - timedelta(days=1)).timestamp(),)).fetchone()[0]
+        last_day = (now - timedelta(days=1)).timestamp()
+        attempts = db.execute("""SELECT
+            (SELECT COUNT(*) FROM delivery WHERE attempted_at >= ?) +
+            (SELECT COUNT(*) FROM klein_reply_drafts WHERE attempted_at >= ?)
+        """, (last_day, last_day)).fetchone()[0]
         return attempts < self.limit
 
     def deliver(
         self, db: sqlite3.Connection, listing_id: str, url: str, message: str,
         fresh_at: datetime, max_age: timedelta,
+        *, context: str = "",
     ) -> str | None:
         if self.paused or not self._eligible(db, listing_id, fresh_at, max_age):
             return None
+        if not review_outgoing(db, listing_id, message, kind="application", context=context,
+                               provider=self.judge_provider, now=self.clock()).approved:
+            return "Bewerbung vom Prüfer zurückgehalten"
 
         reserved = False
 

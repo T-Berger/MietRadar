@@ -16,6 +16,9 @@
 !src/kleinanzeigen_activity.py
 !src/kleinanzeigen_judge.py
 !src/kleinanzeigen_replies.py
+!src/kleinanzeigen_reply_queue.py
+!src/kleinanzeigen_response.py
+!src/outgoing_judge.py
 !config/
 !config/llm_persona.txt
 !scripts/

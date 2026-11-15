@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Callable
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -10,6 +12,7 @@ from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
+from kleinanzeigen_replies import _inbox_link
 from kleinanzeigen_source import _reference
 from munich_delivery import DeliveryOutcome
 from wg_delivery import BrowserSender, _label, _xpath_text
@@ -20,6 +23,7 @@ _HOSTS = {"www.kleinanzeigen.de", "kleinanzeigen.de"}
 _CONTACT = "nachricht schreiben"
 _SEND = "nachricht senden"
 _INBOX_LINK = "zu meinen nachrichten"
+_REPLY_SEND = {_SEND, "senden"}
 _INTERACTIVE = "button, a[href], input[type='submit'], [role='button']"
 _LOGIN_OR_VERIFICATION = (
     "input[type='password'], input[autocomplete='one-time-code'], input[name='otp'], "
@@ -53,6 +57,13 @@ def _is_inbox(url: str) -> bool:
     return _page(url) and urlsplit(url).path == _INBOX_PATH
 
 
+def _conversation_url(url: str) -> str | None:
+    canonical_url = _inbox_link(url)
+    if canonical_url and urlsplit(canonical_url).fragment:
+        return canonical_url
+    return None
+
+
 def _visible(scope, selector: str):
     return [element for element in scope.find_elements(By.CSS_SELECTOR, selector) if element.is_displayed()]
 
@@ -79,15 +90,28 @@ def _has_optional_contact_data(scope) -> bool:
     return any(item.get_attribute("required") or item.get_attribute("value") for item in fields)
 
 
-def _timestamp_after(element, submitted_at: datetime) -> bool:
+def _message_timestamps(element) -> set[datetime]:
+    results = set()
     for stamp in _visible(element, "time[datetime]"):
         try:
             value = datetime.fromisoformat((stamp.get_attribute("datetime") or "").replace("Z", "+00:00"))
         except ValueError:
             continue
-        if value.tzinfo is not None and value >= submitted_at:
-            return True
-    return False
+        if value.tzinfo is not None:
+            results.add(value)
+    return results
+
+
+def _outgoing_timestamps(thread, text: str) -> set[datetime]:
+    exact = _xpath_text(" ".join(text.split()))
+    timestamps = set()
+    for message in _visible(thread, _OUTGOING):
+        matching_body = any(item.is_displayed() for item in message.find_elements(
+            By.XPATH, f".//*[not(self::time) and not(self::textarea) and normalize-space(.)={exact}]",
+        ))
+        if matching_body:
+            timestamps.update(_message_timestamps(message))
+    return timestamps
 
 
 class KleinanzeigenBrowserSender(BrowserSender):
@@ -140,20 +164,103 @@ class KleinanzeigenBrowserSender(BrowserSender):
         if self._blocked(driver) or not _is_inbox(driver.current_url):
             return False
 
-        exact = _xpath_text(" ".join(text.split()))
         for thread in _visible(driver, _THREAD):
             # The conversation must visibly identify the same listing. A copy
             # of the text in an inbox preview or another thread does not count.
             if not any((reference := _reference(link.get_attribute("href") or "")) and reference.url == url
                        for link in _visible(thread, "a[href]")):
                 continue
-            for message in _visible(thread, _OUTGOING):
-                matching_body = any(item.is_displayed() for item in message.find_elements(
-                    By.XPATH, f".//*[not(self::time) and not(self::textarea) and normalize-space(.)={exact}]",
-                ))
-                if matching_body and _timestamp_after(message, submitted_at):
-                    return True
+            if any(timestamp >= submitted_at for timestamp in _outgoing_timestamps(thread, text)):
+                return True
         return False
+
+    def _reply_thread(self, driver, conversation: str, listing_id: str):
+        if _conversation_url(driver.current_url) != conversation:
+            return None
+        matching = []
+        for thread in _visible(driver, _THREAD):
+            ids = {ref.id for link in _visible(thread, "a[href]")
+                   if (ref := _reference(link.get_attribute("href") or ""))}
+            if ids == {listing_id}:
+                matching.append(thread)
+        return matching[0] if len(matching) == 1 else None
+
+    def _reply_composer(self, driver, conversation: str, listing_id: str):
+        if self._blocked(driver):
+            return DeliveryOutcome.BLOCKED
+        thread = self._reply_thread(driver, conversation, listing_id)
+        if thread is None:
+            return None
+        matches = []
+        for form in _visible(thread, "form, [role='form']"):
+            if not _on_site_control(form, "action") or _has_optional_contact_data(form):
+                continue
+            areas = [area for area in _visible(form, "textarea") if _enabled(area) and not area.get_attribute("readonly")]
+            buttons = [button for button in _visible(form, _INTERACTIVE)
+                       if (_label(button) or (button.get_attribute("aria-label") or "").strip().casefold()) in _REPLY_SEND
+                       and _on_site_control(button, "formaction")]
+            if len(areas) == 1 and len(buttons) == 1:
+                matches.append((thread, areas[0], buttons[0]))
+        return matches[0] if len(matches) == 1 else None
+
+    def send_reply(
+        self, url: str, listing_id: str, text: str, before_submit: Callable[[], bool],
+    ) -> DeliveryOutcome:
+        """Send one single-line reply in the explicitly identified conversation."""
+        conversation = _conversation_url(url)
+        # Selenium interprets some characters as keys, including Enter, which can
+        # submit an inbox message before the callback. Only accept plain text.
+        if not conversation or not re.fullmatch(r"ka-[0-9]+", listing_id) or not text.strip():
+            return DeliveryOutcome.UNAVAILABLE
+        if any(unicodedata.category(char) in {"Cc", "Cf", "Co"} for char in text):
+            return DeliveryOutcome.UNAVAILABLE
+
+        claimed = False
+        try:
+            driver = self._browser()
+            wait = WebDriverWait(driver, 12)
+            driver.get(conversation)
+            composer = wait.until(lambda browser: self._reply_composer(browser, conversation, listing_id))
+            if isinstance(composer, DeliveryOutcome):
+                return composer
+            _, area, _ = composer
+            if (area.get_attribute("value") or "").strip():
+                return DeliveryOutcome.BLOCKED
+            area.send_keys(text)
+
+            def filled_composer(browser):
+                current = self._reply_composer(browser, conversation, listing_id)
+                if isinstance(current, DeliveryOutcome):
+                    return current
+                if current and current[1].get_attribute("value") == text and _enabled(current[2]):
+                    return current
+                return None
+
+            composer = wait.until(filled_composer)
+            if isinstance(composer, DeliveryOutcome):
+                return composer
+            thread, _, submit = composer
+            previous = _outgoing_timestamps(thread, text)
+            if not before_submit():
+                return DeliveryOutcome.SKIPPED
+
+            claimed = True
+            submitted_at = datetime.now(timezone.utc).replace(microsecond=0)
+            submit.click()
+
+            def confirmed(browser):
+                if self._blocked(browser):
+                    return DeliveryOutcome.BLOCKED
+                current_thread = self._reply_thread(browser, conversation, listing_id)
+                if current_thread is None:
+                    return None
+                new = _outgoing_timestamps(current_thread, text) - previous
+                return DeliveryOutcome.SENT if any(stamp >= submitted_at for stamp in new) else None
+
+            result = wait.until(confirmed)
+            return DeliveryOutcome.SENT if result is DeliveryOutcome.SENT else DeliveryOutcome.UNCONFIRMED
+        except (OSError, WebDriverException):
+            return DeliveryOutcome.UNCONFIRMED if claimed else DeliveryOutcome.BLOCKED
 
     def send(self, url: str, text: str, before_submit: Callable[[], bool]) -> DeliveryOutcome:
         listing = _reference(url)
