@@ -17,8 +17,9 @@ from dotenv import load_dotenv
 
 from dashboard_auth import logout_button, require_authentication
 from dashboard_data import (
-    BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, ListingProfile, MapListing, Match,
-    ProviderFilter, Reply, SecondaryListing, filter_listing_providers, load_dashboard, map_listings, weekend_dates,
+    BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, HiddenListing, ListingProfile,
+    MapListing, Match, ProviderFilter, Reply, SecondaryListing, filter_listing_providers, load_dashboard,
+    map_listings, set_listing_hidden, weekend_dates,
 )
 from listing_profiles import valid_listing_coordinates
 from munich_transit import HAUPTBAHNHOF, OSTBAHNHOF
@@ -36,6 +37,7 @@ STATES = {
     "edited": "Entwurf bearbeitet", "queued": "Freigegeben · wartet auf Versand", "failed": "Versand nicht erfolgt",
 }
 _REVIEW_NOTICE = "mietradar_application_review_notice"
+_VISIBILITY_NOTICE = "mietradar_listing_visibility_notice"
 SMALL_WORDS = {"am", "an", "auf", "für", "im", "in", "mit", "und", "von", "zu", "zur"}
 WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
 RENT_LABELS = {"warm": "Warmmiete", "cold": "Kaltmiete", "total": "Gesamtmiete"}
@@ -139,6 +141,31 @@ def _location_link(url: str | None, label: str = "Anzeige öffnen") -> None:
         st.link_button(label, url, icon=":material/open_in_new:")
 
 
+def _change_listing_visibility(db_path: Path, listing_id: str, hidden: bool, title: str, url: str | None) -> None:
+    try:
+        set_listing_hidden(db_path, listing_id, hidden, title=title, url=url)
+    except (OSError, sqlite3.Error):
+        st.session_state[_VISIBILITY_NOTICE] = (False, "Die Änderung konnte gerade nicht gespeichert werden.")
+    else:
+        message = "Angebot ausgeblendet. Du findest es unter „Ausgeblendet“." if hidden else "Angebot wieder eingeblendet."
+        st.session_state[_VISIBILITY_NOTICE] = (True, message)
+
+
+def _offer_actions(
+    db_path: Path, listing_id: str, title: str, url: str | None, *, view: str, hidden: bool = False,
+) -> None:
+    with st.container(horizontal=True):
+        _location_link(url)
+        st.button(
+            "Wieder einblenden" if hidden else "Ausblenden",
+            key=f"{view}_visibility_{listing_id}",
+            icon=":material/visibility:" if hidden else ":material/visibility_off:",
+            help=None if hidden else "Blendet das Angebot im Dashboard aus. Eine Versandfreigabe bleibt gültig.",
+            on_click=_change_listing_visibility,
+            args=(db_path, listing_id, not hidden, title, url),
+        )
+
+
 def _format_value(value: float | None, unit: str) -> str | None:
     if not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
         return None
@@ -181,7 +208,7 @@ def _map_facts(row: MapListing) -> str:
     return " · ".join(filter(None, (row.platform, provider, recipient, f"{route} {direction}", rent, area)))
 
 
-def _listing_map(rows: tuple[MapListing, ...]) -> None:
+def _listing_map(rows: tuple[MapListing, ...], db_path: Path) -> None:
     import plotly.graph_objects as go
 
     st.subheader("Angebote auf der Karte", anchor=False)
@@ -241,8 +268,9 @@ def _listing_map(rows: tuple[MapListing, ...]) -> None:
         key=f"map_listing_{selected_id or 'list'}",
     )
     if chosen:
-        st.caption(_map_facts(pins[chosen]))
-        _location_link(pins[chosen].url)
+        row = pins[chosen]
+        st.caption(_map_facts(row))
+        _offer_actions(db_path, row.id, row.title, row.url, view="map")
 
 
 def _offer_location_map(profile: ListingProfile | None, title: str, *, key: str) -> None:
@@ -483,7 +511,8 @@ def _matches(
                 status=f"{tier} · {status}", date_label=f"{date_label} · {row.id}", route=route,
                 map_key=f"current_map_{row.id}" if row.state != "unavailable" else None,
             )
-            _location_link(row.url)
+            _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
+                           row.url, view="current")
             _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
                          attachment=attachment)
     if not shown:
@@ -514,7 +543,8 @@ def _date_filter(today: date) -> tuple[DateBasis | None, tuple[date, date] | Non
 
 def _dated_offers(
     rows: tuple[DatedListing, ...], days: tuple[date, date] | None, basis: DateBasis,
-    wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile], *, provider_filtered: bool = False,
+    wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile], db_path: Path,
+    *, provider_filtered: bool = False,
 ) -> None:
     sightings = basis == "first_seen"
     st.subheader("Zuerst erfasste Mietangebote" if sightings else "Veröffentlichte Mietangebote", anchor=False)
@@ -550,23 +580,28 @@ def _dated_offers(
                 status = f"{tier} · {status}"
             _listing_card(profile, title=_headline(row.url), platform=row.platform,
                           status=status, date_label=date_label, route=route, map_key=f"dated_map_{row.id}")
-            _location_link(row.url)
+            _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
+                           row.url, view="dated")
 
 
-def _addresses(rows: tuple[AddressCheck, ...], profiles: dict[str, ListingProfile]) -> None:
+def _addresses(rows: tuple[AddressCheck, ...], profiles: dict[str, ListingProfile], db_path: Path) -> None:
     st.subheader("Adresse prüfen", anchor=False)
     if not rows:
         st.info("Keine Kleinanzeigen-Angebote zur Ortsprüfung.")
         return
     for row in rows:
         with st.container(border=True):
-            _listing_card(profiles.get(row.id), title=row.title or _headline(row.url), platform="Kleinanzeigen",
+            profile = profiles.get(row.id)
+            title = (profile.title if profile else None) or row.title or _headline(row.url)
+            _listing_card(profile, title=title, platform="Kleinanzeigen",
                           status="Adresse prüfen", date_label=f"{_date(row.fresh_at)} · {row.id}",
                           note=row.reason)
-            _location_link(row.url)
+            _offer_actions(db_path, row.id, title, row.url, view="address")
 
 
-def _secondary_offers(rows: tuple[SecondaryListing, ...], hours: int, profiles: dict[str, ListingProfile]) -> None:
+def _secondary_offers(
+    rows: tuple[SecondaryListing, ...], hours: int, profiles: dict[str, ListingProfile], db_path: Path,
+) -> None:
     st.caption("Bis zu 45 Min. mit dem ÖPNV ab Ostbahnhof für B oder ab Hauptbahnhof für C. Passt beides, gilt B.")
     if not rows:
         st.info(f"Keine Angebote der Kategorie B oder C in den letzten {hours} Stunden.")
@@ -579,10 +614,24 @@ def _secondary_offers(rows: tuple[SecondaryListing, ...], hours: int, profiles: 
         for row in offers:
             station = "Hauptbahnhof" if row.station == "Hbf" else row.station
             with st.container(border=True):
-                _listing_card(profiles.get(row.id), title=row.title or _headline(row.url), platform=row.platform,
+                profile = profiles.get(row.id)
+                title = (profile.title if profile else None) or row.title or _headline(row.url)
+                _listing_card(profile, title=title, platform=row.platform,
                               status="", date_label=f"{row.basis.capitalize()} · {_date(row.fresh_at)}",
                               route=(f"Ab {station}", f"{row.minutes} Min."), map_key=f"secondary_map_{row.id}")
-                _location_link(row.url)
+                _offer_actions(db_path, row.id, title, row.url, view="secondary")
+
+
+def _hidden_offers(rows: tuple[HiddenListing, ...], db_path: Path) -> None:
+    st.subheader("Ausgeblendete Angebote", anchor=False)
+    if not rows:
+        st.info("Du hast noch keine Angebote ausgeblendet.")
+        return
+    for row in rows:
+        with st.container(border=True):
+            st.text(row.title)
+            st.caption(f"{row.platform} · Ausgeblendet am {_date(row.hidden_at)}")
+            _offer_actions(db_path, row.id, row.title, row.url, view="hidden", hidden=True)
 
 
 def _replies(rows: tuple[Reply, ...], *, wg_enabled: bool, wg_status: tuple[float, bool] | None) -> None:
@@ -664,6 +713,12 @@ def main() -> None:
     data = filter_listing_providers(data, provider)
     if notice := st.session_state.pop(_REVIEW_NOTICE, None):
         st.success(notice)
+    if visibility_notice := st.session_state.pop(_VISIBILITY_NOTICE, None):
+        success, message = visibility_notice
+        if success:
+            st.toast(message)
+        else:
+            st.error(message)
 
     matches, drafts, pending = st.columns(3)
     if date_basis:
@@ -673,8 +728,8 @@ def main() -> None:
         matches.metric("Neue Angebote", len(data.matches), border=True)
     drafts.metric("Bewerbungsentwürfe", sum(bool(row.message) for row in data.matches), border=True)
     pending.metric("Adressen zur Prüfung", len(data.address_checks), border=True)
-    offers, map_tab, secondary, address, replies, activity = st.tabs(
-        ["Angebote", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf"],
+    offers, map_tab, secondary, address, replies, activity, hidden = st.tabs(
+        ["Angebote", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf", "Ausgeblendet"],
         key="mietradar_tab", on_change="rerun",
     )
     with offers:
@@ -689,7 +744,7 @@ def main() -> None:
             else:
                 _credit_proof(db_path, attachment)
         if date_basis:
-            _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan, data.listing_profiles,
+            _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan, data.listing_profiles, db_path,
                           provider_filtered=provider != "all")
         else:
             _matches(data.matches, hours, data.wg_scan, data.listing_profiles, db_path,
@@ -697,16 +752,19 @@ def main() -> None:
                      reviewed_send=reviewed_send, attachment=attachment)
     if map_tab.open:
         with map_tab:
-            _listing_map(map_listings(data, date_filtered=date_basis is not None))
+            _listing_map(map_listings(data, date_filtered=date_basis is not None), db_path)
     with secondary:
-        _secondary_offers(data.secondary_offers, hours, data.listing_profiles)
+        _secondary_offers(data.secondary_offers, hours, data.listing_profiles, db_path)
     with address:
-        _addresses(data.address_checks, data.listing_profiles)
+        _addresses(data.address_checks, data.listing_profiles, db_path)
     with replies:
         _replies(data.replies, wg_enabled=os.getenv("MUNICH_WG_REPLY_DRAFTS", "").strip().lower() == "true",
                  wg_status=data.wg_inbox_status)
     with activity:
         _activity(data.activity)
+    if hidden.open:
+        with hidden:
+            _hidden_offers(data.hidden_listings, db_path)
 
 
 if __name__ == "__main__":

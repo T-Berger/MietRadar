@@ -1,4 +1,4 @@
-"""Read a private dashboard snapshot from the MietRadar worker database."""
+"""Read dashboard data and save listing visibility in the MietRadar database."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ _TABLE_COLUMNS = {
     "munich_secondary_offers": {"id", "url", "title", "fresh_at", "basis", "tier", "station", "minutes"},
     "listing_availability": {"id", "reason"},
     "listing_profiles": {"id", "title", "rent_eur", "rent_kind", "area_sqm", "summary", "fit", "fit_reason"},
+    "dashboard_hidden_listings": {"id", "url", "title", "hidden_at"},
 }
 _PLATFORM_HOSTS = {"www.wg-gesucht.de", "wg-gesucht.de", "www.kleinanzeigen.de", "kleinanzeigen.de"}
 WG_REPLY_INBOX = "https://www.wg-gesucht.de/nachrichten.html"
@@ -132,6 +133,15 @@ class AddressCheck:
 
 
 @dataclass(frozen=True)
+class HiddenListing:
+    id: str
+    platform: str
+    url: str | None
+    title: str
+    hidden_at: float
+
+
+@dataclass(frozen=True)
 class Reply:
     id: str
     listing_id: str | None
@@ -169,6 +179,7 @@ class DashboardData:
     application_reviews_available: bool = False
     wg_inbox_status: tuple[float, bool] | None = None
     dated_secondary_offers: tuple[SecondaryListing, ...] = ()
+    hidden_listings: tuple[HiddenListing, ...] = ()
 
 
 def filter_listing_providers(data: DashboardData, provider: ProviderFilter) -> DashboardData:
@@ -221,7 +232,7 @@ def map_listings(data: DashboardData, *, date_filtered: bool = False) -> tuple[M
     return tuple(listings.values())
 
 
-def _platform_url(url: str) -> str | None:
+def _platform_url(url: str | None) -> str | None:
     if not url or any(character.isspace() or ord(character) < 32 for character in url):
         return None
     try:
@@ -231,6 +242,34 @@ def _platform_url(url: str) -> str | None:
     if parts.scheme != "https" or parts.netloc.lower() not in _PLATFORM_HOSTS:
         return None
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
+
+
+def set_listing_hidden(
+    db_path: Path | str, listing_id: str, hidden: bool, *, title: str = "Mietangebot", url: str | None = None,
+) -> None:
+    """Hide a listing by its stable ID or restore it across dashboard visits."""
+    with closing(sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=rw", uri=True, timeout=2)) as db, db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS dashboard_hidden_listings (
+                id TEXT PRIMARY KEY, url TEXT, title TEXT NOT NULL, hidden_at REAL NOT NULL
+            )
+        """)
+        if hidden:
+            db.execute("""
+                INSERT INTO dashboard_hidden_listings(id, url, title, hidden_at) VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+            """, (listing_id, _platform_url(url), title or "Mietangebot", datetime.now(timezone.utc).timestamp()))
+        else:
+            db.execute("DELETE FROM dashboard_hidden_listings WHERE id = ?", (listing_id,))
+
+
+def _hidden_listings(db: sqlite3.Connection, tables: set[str]) -> tuple[HiddenListing, ...]:
+    if "dashboard_hidden_listings" not in tables:
+        return ()
+    rows = db.execute("SELECT id, url, title, hidden_at FROM dashboard_hidden_listings ORDER BY hidden_at DESC, id DESC")
+    return tuple(HiddenListing(listing_id, "Kleinanzeigen" if listing_id.startswith("ka-") else "WG-Gesucht",
+                               _platform_url(url), title, hidden_at)
+                 for listing_id, url, title, hidden_at in rows)
 
 
 def _wg_reply_url(url: str) -> str:
@@ -289,6 +328,12 @@ def _availability_filter(db: sqlite3.Connection, tables: set[str], listing_id: s
     )"""
 
 
+def _not_hidden(tables: set[str], listing_id: str) -> str:
+    if "dashboard_hidden_listings" not in tables:
+        return "1"
+    return f"NOT EXISTS (SELECT 1 FROM dashboard_hidden_listings hidden WHERE hidden.id = {listing_id})"
+
+
 def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: float) -> tuple[Match, ...]:
     if "drafts" not in tables:
         return ()
@@ -323,6 +368,7 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
         WHERE d.fresh_at BETWEEN ? AND ?
           AND ((d.done = 0 AND d.message IS NOT NULL) OR {state} IS NOT NULL)
           AND ({available} OR {state} IN ('sent', 'already_contacted', 'unconfirmed'))
+          AND {_not_hidden(tables, 'd.id')}
           {secondary_filter}
         ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
     """, parameters)
@@ -351,7 +397,8 @@ def _address_checks(db: sqlite3.Connection, tables: set[str], cutoff: float, unt
     available = _availability_filter(db, tables, "r.id")
     rows = db.execute(f"""
         SELECT r.id, r.url, r.title, r.fresh_at, r.basis, r.reason FROM klein_review r
-        WHERE r.fresh_at BETWEEN ? AND ? AND {available} ORDER BY r.fresh_at DESC, r.id DESC LIMIT ?
+        WHERE r.fresh_at BETWEEN ? AND ? AND {available} AND {_not_hidden(tables, 'r.id')}
+        ORDER BY r.fresh_at DESC, r.id DESC LIMIT ?
     """, (cutoff, until, RESULT_LIMIT))
     return tuple(AddressCheck(item, _platform_url(url), title, stamp, basis, reason)
                  for item, url, title, stamp, basis, reason in rows)
@@ -370,7 +417,7 @@ def _secondary_offers(
         params = (until, *ids)
     rows = db.execute(f"""
         SELECT m.id, m.url, m.title, m.fresh_at, m.basis, m.tier, m.station, m.minutes FROM munich_secondary_offers m
-        WHERE {scope} AND m.minutes BETWEEN 1 AND 45 AND {available}
+        WHERE {scope} AND m.minutes BETWEEN 1 AND 45 AND {available} AND {_not_hidden(tables, 'm.id')}
         ORDER BY m.fresh_at DESC, m.id DESC LIMIT ?
     """, (*params, RESULT_LIMIT))
     return tuple(
@@ -481,6 +528,7 @@ def _dated_listings(
     has_observation_day = "published_day" in observation_columns
     matched = "EXISTS (SELECT 1 FROM drafts d WHERE d.id = o.id)" if has_drafts else "0"
     observations_filter = _availability_filter(db, tables, "o.id")
+    visible_observation = _not_hidden(tables, "o.id")
 
     if basis == "first_seen":
         if not has_observations or "first_seen_at" not in observation_columns:
@@ -493,7 +541,7 @@ def _dated_listings(
             SELECT o.id, o.url, o.first_seen_at, {matched}
             FROM wg_observations o
             WHERE o.first_seen_at >= ? AND o.first_seen_at < ? AND o.first_seen_at <= ?
-            AND o.published_at IS NULL AND {observations_filter} {unknown_day} {unknown_draft}
+            AND o.published_at IS NULL AND {observations_filter} AND {visible_observation} {unknown_day} {unknown_draft}
             ORDER BY o.first_seen_at DESC, o.id DESC LIMIT ?
         """, timestamp_params)
         return tuple(DatedListing(item, "WG-Gesucht", _platform_url(url), datetime.fromtimestamp(stamp, BERLIN).date(), bool(is_match))
@@ -504,7 +552,7 @@ def _dated_listings(
         for item, url, stamp, is_match in db.execute(f"""
             SELECT o.id, o.url, o.published_at, {matched}
             FROM wg_observations o WHERE o.published_at >= ? AND o.published_at < ? AND o.published_at <= ?
-            AND {observations_filter}
+            AND {observations_filter} AND {visible_observation}
             ORDER BY o.published_at DESC, o.id DESC LIMIT ?
         """, timestamp_params):
             day = datetime.fromtimestamp(stamp, BERLIN).date()
@@ -514,7 +562,7 @@ def _dated_listings(
             for item, url, day_string, is_match in db.execute(f"""
                 SELECT o.id, o.url, o.published_day, {matched}
                 FROM wg_observations o WHERE o.published_at IS NULL AND o.published_day BETWEEN ? AND ?
-                AND {observations_filter}
+                AND {observations_filter} AND {visible_observation}
                 ORDER BY o.published_day DESC, o.id DESC LIMIT ?
             """, (start_day.isoformat(), end_day.isoformat(), RESULT_LIMIT)):
                 if day := _parse_day(day_string):
@@ -530,7 +578,8 @@ def _dated_listings(
         for item, url, stamp in db.execute(f"""
             SELECT d.id, d.url, d.fresh_at FROM drafts d
             WHERE lower(d.basis) = 'veröffentlicht' AND d.fresh_at >= ? AND d.fresh_at < ? AND d.fresh_at <= ?
-            AND {drafts_filter} {fallback} ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
+            AND {drafts_filter} AND {_not_hidden(tables, 'd.id')} {fallback}
+            ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
         """, timestamp_params):
             day = datetime.fromtimestamp(stamp, BERLIN).date()
             platform = "Kleinanzeigen" if item.startswith("ka-") else "WG-Gesucht"
@@ -581,6 +630,7 @@ def load_dashboard(
                 application_reviews_available="application_reviews" in tables,
                 wg_inbox_status=_wg_inbox_status(db, tables),
                 dated_secondary_offers=dated_secondary_offers,
+                hidden_listings=_hidden_listings(db, tables),
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")
