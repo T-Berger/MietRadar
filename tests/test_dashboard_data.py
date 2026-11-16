@@ -12,6 +12,7 @@ from pathlib import Path
 from dashboard_data import load_dashboard, weekend_dates
 from listing_profiles import record_listing_route
 from munich_radar import _database
+from rental_availability import AVAILABILITY_POLICY_VERSION, record_listing_availability
 
 
 NOW = datetime(2026, 11, 15, 12, tzinfo=timezone.utc)
@@ -47,6 +48,8 @@ class DashboardDataTest(unittest.TestCase):
             db.execute("INSERT INTO klein_review VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                        ("ka-44", "https://www.kleinanzeigen.de/s-anzeige/wohnung/44-203-650",
                         "Zimmer", "", 1, recent, "Suchalarm", "Adresse fehlt"))
+            for listing_id in ("12", "13", "14", "ka-44"):
+                record_listing_availability(db, listing_id, None)
             db.execute("INSERT INTO klein_reply_drafts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                        ("reply-1", "ka-55", "https://www.kleinanzeigen.de/m-nachrichten.html#test",
                         "Danke", "", expired, 0, "draft", None))
@@ -73,6 +76,7 @@ class DashboardDataTest(unittest.TestCase):
         previous_digest = sha256(b"Previous message").hexdigest()
         with closing(_database(self.path)) as db, db:
             for listing_id, check_digest in (("12", digest), ("13", previous_digest)):
+                record_listing_availability(db, listing_id, None)
                 db.execute("INSERT INTO drafts VALUES (?, ?, ?, ?, ?, ?)",
                            (listing_id, f"https://www.wg-gesucht.de/{listing_id}.html",
                             now, "Veröffentlicht", message, 0))
@@ -131,18 +135,33 @@ class DashboardDataTest(unittest.TestCase):
         self.assertIsNone(data.listing_profiles["12"].route_minutes)
         self.assertIsNone(data.wg_scan)
 
-    def test_hides_excluded_availability_in_the_active_cards_without_losing_delivery_status(self):
+    def test_previous_availability_schema_filters_only_recorded_exclusions(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TABLE drafts (id TEXT, url TEXT, fresh_at REAL, basis TEXT, message TEXT, done INTEGER)")
+            db.execute("CREATE TABLE listing_availability (id TEXT PRIMARY KEY, reason TEXT)")
+            db.execute("INSERT INTO listing_availability VALUES ('12', 'Einzug erst nächstes Jahr')")
+            db.executemany("INSERT INTO drafts VALUES (?, ?, ?, 'Veröffentlicht', 'Hallo', 0)", [
+                (listing_id, f"https://www.wg-gesucht.de/{listing_id}.html", NOW.timestamp())
+                for listing_id in ("12", "13")
+            ])
+        self.assertEqual([row.id for row in load_dashboard(self.path, now=NOW).matches], ["13"])
+
+    def test_requires_current_availability_in_active_cards_without_losing_delivery_status(self):
         now = NOW.timestamp()
         with closing(_database(self.path)) as db, db:
-            db.execute("CREATE TABLE IF NOT EXISTS listing_availability (id TEXT PRIMARY KEY, reason TEXT)")
-            db.executemany("INSERT INTO listing_availability VALUES (?, ?)", [
+            for listing_id, reason in [
                 ("20", "Einzug erst nächstes Jahr"),
                 ("21", None),
-                ("23", "Zwischenmiete unter vier Monaten"),
                 ("24", "Zwischenmiete unter vier Monaten"),
                 ("25", "Zwischenmiete unter vier Monaten"),
                 ("ka-28", "Einzug erst nächstes Jahr"),
+                ("ka-29", None),
                 ("31", "Zwischenmiete unter vier Monaten"),
+                ("32", None),
+            ]:
+                record_listing_availability(db, listing_id, reason)
+            db.executemany("INSERT INTO listing_availability (id, reason, policy_version) VALUES (?, NULL, ?)", [
+                (listing_id, AVAILABILITY_POLICY_VERSION - 1) for listing_id in ("26", "ka-30", "33")
             ])
             db.executemany("INSERT INTO drafts VALUES (?, 'https://www.wg-gesucht.de/test.html', ?, ?, ?, ?)", [
                 ("20", now, "veröffentlicht", "Entwurf bleibt gespeichert", 0),
@@ -151,6 +170,7 @@ class DashboardDataTest(unittest.TestCase):
                 ("23", now, "veröffentlicht", None, 1),
                 ("24", now, "veröffentlicht", "Status unklar", 0),
                 ("25", now, "veröffentlicht", "Kontakt nicht verfügbar", 0),
+                ("26", now, "veröffentlicht", "Vorher als verfügbar geprüft", 0),
             ])
             db.executemany("INSERT INTO delivery VALUES (?, ?, ?, ?)", [
                 ("23", "sent", now, now),
@@ -159,41 +179,52 @@ class DashboardDataTest(unittest.TestCase):
             ])
             db.executemany("""INSERT INTO klein_review (id, url, title, excerpt, is_wg, fresh_at, basis, reason)
                               VALUES (?, 'https://www.kleinanzeigen.de/test', 'WG-Zimmer', '', 1, ?, 'veröffentlicht', 'Adresse fehlt')""",
-                           [("ka-28", now), ("ka-29", now)])
+                           [(f"ka-{listing_id}", now) for listing_id in (28, 29, 30, 34)])
             db.executemany("""INSERT INTO munich_secondary_offers
                 VALUES (?, 'https://www.wg-gesucht.de/test.html', 'WG-Zimmer', ?, 'veröffentlicht', 'b', 'Ostbahnhof', 45)""",
-                           [("31", now), ("32", now)])
+                           [(str(listing_id), now) for listing_id in (31, 32, 33, 34)])
 
         data = load_dashboard(self.path, now=NOW)
         self.assertEqual(data.status, "ready")
         self.assertEqual([(row.id, row.state) for row in data.matches],
-                         [("24", "unconfirmed"), ("23", "sent"), ("22", "draft"), ("21", "draft")])
+                         [("24", "unconfirmed"), ("23", "sent"), ("21", "draft")])
         self.assertEqual([row.id for row in data.address_checks], ["ka-29"])
         self.assertEqual([row.id for row in data.secondary_offers], ["32"])
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT message FROM drafts WHERE id = '20'").fetchone(),
                              ("Entwurf bleibt gespeichert",))
+            self.assertEqual(db.execute("SELECT message FROM drafts WHERE id = '26'").fetchone(),
+                             ("Vorher als verfügbar geprüft",))
 
     def test_hides_availability_exclusions_in_all_dated_listing_sources(self):
         now = NOW.timestamp()
         day = NOW.date()
         with closing(_database(self.path)) as db, db:
-            db.execute("CREATE TABLE IF NOT EXISTS listing_availability (id TEXT PRIMARY KEY, reason TEXT)")
-            db.executemany("INSERT INTO listing_availability VALUES (?, ?)", [
+            for listing_id, reason in [
                 ("10", "Einzug erst nächstes Jahr"),
+                ("11", None),
                 ("12", "Einzug erst nächstes Jahr"),
+                ("13", None),
                 ("14", "Zwischenmiete unter vier Monaten"),
+                ("15", None),
                 ("ka-16", "Einzug erst nächstes Jahr"),
+                ("ka-17", None),
+            ]:
+                record_listing_availability(db, listing_id, reason)
+            db.executemany("INSERT INTO listing_availability (id, reason, policy_version) VALUES (?, NULL, ?)", [
+                ("18", AVAILABILITY_POLICY_VERSION - 1),
+                ("ka-20", AVAILABILITY_POLICY_VERSION - 1),
             ])
             db.executemany("""INSERT INTO wg_observations (id, url, first_seen_at, last_seen_at, published_at, published_day)
                               VALUES (?, 'https://www.wg-gesucht.de/test.html', ?, ?, ?, ?)""", [
                 ("10", now, now, now, None), ("11", now, now, now, None),
                 ("12", now, now, None, day.isoformat()), ("13", now, now, None, day.isoformat()),
                 ("14", now, now, None, None), ("15", now, now, None, None),
+                ("18", now, now, now, None), ("19", now, now, None, day.isoformat()),
             ])
             db.executemany("""INSERT INTO drafts
                               VALUES (?, 'https://www.kleinanzeigen.de/test', ?, 'veröffentlicht', 'Hallo', 0)""",
-                           [("ka-16", now), ("ka-17", now)])
+                           [(f"ka-{listing_id}", now) for listing_id in (16, 17, 20, 21)])
 
         posted = load_dashboard(self.path, now=NOW, posting_window=(day, day))
         self.assertEqual({row.id for row in posted.dated_listings}, {"11", "13", "ka-17"})
@@ -270,6 +301,8 @@ class DashboardDataTest(unittest.TestCase):
         photo_url = "https://img.wg-gesucht.de/media/up/2026/43/" + "a" * 64 + "_179317855502694671775502672029.sized.JPEG"
         unrelated_photo = "https://img.kleinanzeigen.de/api/v1/prod-ads/images/16/00000000-0000-4000-8000-000000000000?rule=%24_59.AUTO"
         with closing(_database(self.path)) as db, db:
+            for listing_id in ("12", "ka-77"):
+                record_listing_availability(db, listing_id, None)
             db.execute("""CREATE TABLE IF NOT EXISTS listing_profiles (
                 id TEXT PRIMARY KEY, title TEXT NOT NULL, rent_eur REAL, rent_kind TEXT,
                 area_sqm REAL, summary TEXT, fit TEXT, fit_reason TEXT
@@ -327,6 +360,8 @@ class DashboardDataTest(unittest.TestCase):
         with closing(_database(self.path)) as db, db:
             if "published_day" not in {row[1] for row in db.execute("PRAGMA table_info(wg_observations)")}:
                 db.execute("ALTER TABLE wg_observations ADD COLUMN published_day TEXT")
+            for listing_id in ("old", "first-minute", "last-minute", "monday", "day-only", "sighting", "fallback"):
+                record_listing_availability(db, listing_id, None)
             db.executemany("""INSERT INTO wg_observations (id, url, first_seen_at, last_seen_at, published_at, published_day)
                               VALUES (?, 'https://www.wg-gesucht.de/test.html', ?, ?, ?, ?)""", [
                 ("old", saturday_start, monday_start, saturday_start - 1, None),

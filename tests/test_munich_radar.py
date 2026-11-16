@@ -9,9 +9,11 @@ from unittest.mock import MagicMock, Mock, patch
 
 from llm_personalizer import application_render_signature
 from munich_radar import Scanner, _database
+from munich_tiers import save_secondary_offer
+from rental_availability import AVAILABILITY_POLICY_VERSION
 from wg_alerts import AlertsInbox, ListingAlert, extract_refs
 from wg_preferences import rejection_reason
-from wg_source import Listing, ListingRef, WGSourceError
+from wg_source import Listing, ListingRef, WGAccessBlocked, WGListingGone, WGSourceError
 
 
 NOW = datetime(2026, 11, 15, 10, 0, tzinfo=timezone.utc)
@@ -120,6 +122,73 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT message FROM drafts WHERE id = ?", (late.id,)).fetchone(),
                              ("Mein Entwurf",))
         router.classify.assert_called_once_with(long.address, NOW)
+
+    def test_rechecks_outdated_visible_offers_before_loading_new_offer_details(self):
+        draft = replace(offer(1, 1), available_from=date(2027, 1, 15))
+        secondary = replace(offer(2, 2), available_from=date(2026, 12, 6), available_until=date(2027, 1, 31))
+        fresh = offer(3, 0)
+        source, router = Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.return_value = [ref(fresh), ref(draft)]
+        listings = {listing.id: listing for listing in (draft, secondary, fresh)}
+        source.details.side_effect = lambda candidate: listings[candidate.id]
+        router.classify.return_value = ("a*", 16)
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 3)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Mein Entwurf', 0)",
+                           (draft.id, draft.url, draft.published_at.timestamp()))
+                db.execute("INSERT INTO listing_profiles (id, title, route_tier, photo_urls) VALUES (?, ?, 'a', '[]')",
+                           (draft.id, draft.title))
+                db.execute("INSERT INTO listing_availability (id, reason, policy_version) VALUES (?, NULL, ?)",
+                           (draft.id, AVAILABILITY_POLICY_VERSION - 1))
+                save_secondary_offer(db, secondary.id, secondary.url, secondary.title, secondary.published_at,
+                                     "veröffentlicht", "b", "Ostbahnhof", 38)
+            counts = scanner.scan(db, NOW, {})
+            self.assertEqual([call.args[0] for call in source.details.call_args_list],
+                             [ref(secondary), ref(draft), ref(fresh)])
+            self.assertEqual(counts["Einzug erst ab dem nächsten Kalenderjahr"], 1)
+            self.assertEqual(counts["Zwischenmiete unter vier Monaten"], 1)
+            self.assertEqual(counts["neue Entwürfe"], 1)
+            router.classify.assert_called_once_with(fresh.address, NOW)
+
+    def test_rechecks_cached_drafts_when_inventory_and_one_detail_are_unavailable(self):
+        retry, late, gone = offer(1, 1), replace(offer(2, 2), available_from=date(2027, 1, 15)), offer(3, 3)
+        source, router = Mock(), Mock()
+        source.candidates.side_effect = WGSourceError("inventory unavailable")
+        source.details.side_effect = [WGSourceError("detail temporarily unavailable"), late, WGListingGone("gone")]
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 3)
+        retry_after = {}
+        with tempfile.TemporaryDirectory() as directory:
+            with closing(_database(Path(directory) / "radar.sqlite3")) as db:
+                with db:
+                    for listing in (retry, late, gone):
+                        db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Mein Entwurf', 0)",
+                                   (listing.id, listing.url, listing.published_at.timestamp()))
+                with self.assertRaisesRegex(WGSourceError, "inventory unavailable"):
+                    scanner.scan(db, NOW, retry_after)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM wg_inventory_scan").fetchone(), (0,))
+                reasons = dict(db.execute("SELECT id, reason FROM listing_availability"))
+                self.assertEqual(reasons, {
+                    late.id: "Einzug erst ab dem nächsten Kalenderjahr",
+                    gone.id: "Anzeige nicht mehr verfügbar",
+                })
+        self.assertGreater(retry_after[retry.id], NOW)
+        self.assertEqual([call.args[0] for call in source.details.call_args_list], [ref(retry), ref(late), ref(gone)])
+        router.classify.assert_not_called()
+
+    def test_an_inventory_access_block_pauses_detail_replay(self):
+        listing = offer(1, 1)
+        source, router = Mock(), Mock()
+        source.candidates.side_effect = WGAccessBlocked("inventory restricted")
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 2)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Mein Entwurf', 0)",
+                           (listing.id, listing.url, listing.published_at.timestamp()))
+            with self.assertRaises(WGAccessBlocked):
+                scanner.scan(db, NOW, {})
+        source.details.assert_not_called()
 
     def test_snapshots_cover_all_ids_and_first_observed_matches_remain_manual(self):
         baseline, beyond_budget, new, stale = offer(1, None), offer(2, None), offer(3, None), offer(4, 36)

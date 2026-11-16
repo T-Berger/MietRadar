@@ -226,6 +226,7 @@ def _with_fallback_facts(primary: Listing, fallback: Listing) -> Listing:
     )
     return replace(
         primary, title=primary.title or fallback.title,
+        description="\n".join(dict.fromkeys((*primary.description.splitlines(), *fallback.description.splitlines()))),
         rent_eur=fallback.rent_eur if use_fallback_rent else primary.rent_eur,
         rent_kind=fallback.rent_kind if use_fallback_rent else primary.rent_kind,
         area_sqm=primary.area_sqm if primary.area_sqm is not None else fallback.area_sqm,
