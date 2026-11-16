@@ -30,6 +30,7 @@ _SEND_LABELS = _CONTACT_LABELS | {"senden", "send"}
 _PDF_INPUT = "#messenger_form input#file_input[type='file']"
 _PENDING_ATTACHMENTS = "#messenger_form .message_input_wrapper.pre_attached_file"
 _FORM_ERROR = "#messenger_form #validation-error-placeholder, #attachments_modal_content #validation-error-placeholder"
+_UPLOAD_ERROR = "#attachments_modal_content #validation-error-placeholder"
 _NEW_CONVERSATION = "#start_new_conversation"
 _SENT_NOTICE = "#message_successfully_sent"
 _VERIFICATION = (
@@ -272,6 +273,23 @@ class BrowserSender:
         return label is not None and label.text == filename
 
     @staticmethod
+    def _attachment_error(driver) -> str | None:
+        # The site puts the upload error in its file picker, even when the modal is closed.
+        for element in driver.find_elements(By.CSS_SELECTOR, _UPLOAD_ERROR):
+            value = element.get_property("textContent")
+            if not isinstance(value, str) or not value.strip():
+                continue
+            message = " ".join(value.casefold().split())
+            if "demselben namen" in message or "same name" in message:
+                return "WG-Gesucht meldet einen bereits vorhandenen Dateinamen"
+            if "bibliothek" in message and "voll" in message or "library is full" in message:
+                return "WG-Gesucht meldet eine volle Dateibibliothek"
+            if "ungültiger dateiname" in message or "invalid file name" in message:
+                return "WG-Gesucht lehnt den Dateinamen ab"
+            return "WG-Gesucht meldet einen Fehler beim PDF-Upload"
+        return None
+
+    @staticmethod
     def _new_conversation_sent(driver) -> bool:
         return _visible(driver, _SENT_NOTICE) is not None and _visible(driver, _NEW_CONVERSATION) is None
 
@@ -357,6 +375,10 @@ class BrowserSender:
                 phase = "Anhang im Formular prüfen"
 
                 def ready_after_upload(browser):
+                    nonlocal phase
+                    if reason := self._attachment_error(browser):
+                        phase = reason
+                        return DeliveryOutcome.UNCONFIRMED
                     if self._composer_state(browser, listing) != "ready" or _visible(browser, _FORM_ERROR) is not None:
                         return DeliveryOutcome.UNCONFIRMED
                     if self._attachment_ready(browser, attachment.name):
