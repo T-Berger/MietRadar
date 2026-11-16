@@ -20,7 +20,11 @@ from dashboard_data import (
     BERLIN, RESULT_LIMIT, AddressCheck, DateBasis, DatedListing, ListingProfile, Match,
     SecondaryListing, load_dashboard, weekend_dates,
 )
-from reviewed_applications import ApplicationReviewError, cancel_application_review, review_application
+from reviewed_applications import (
+    MAX_APPLICATION_ATTACHMENT_BYTES, ApplicationAttachmentInfo, ApplicationReviewError,
+    cancel_application_review, load_application_attachment, remove_application_attachment,
+    review_application, save_application_attachment,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -185,7 +189,43 @@ def _listing_card(
     )
 
 
-def _application(row: Match, db_path: Path, hours: int, *, review_available: bool, reviewed_send: bool) -> None:
+def _credit_proof(db_path: Path, attachment: ApplicationAttachmentInfo | None) -> None:
+    with st.expander("Bonitätsnachweis"):
+        if attachment:
+            st.text(f"Gespeichert · {attachment.name}")
+            st.caption("Die Datei wird bei jeder neuen WG-Gesucht-Freigabe angezeigt und mit der Bewerbung verschickt.")
+        version = attachment.digest if attachment else "no-attachment"
+        with st.form(f"application-attachment-{version}", enter_to_submit=False, clear_on_submit=True):
+            upload = st.file_uploader(
+                "Bonitätsnachweis als PDF", type="pdf",
+                max_upload_size=MAX_APPLICATION_ATTACHMENT_BYTES // (1024 * 1024),
+                help="Wähle einen Bonitätsnachweis, der zur Weitergabe an Vermieter gedacht ist.",
+            )
+            save = st.form_submit_button("PDF ersetzen" if attachment else "PDF speichern")
+        remove = bool(attachment and st.button("PDF entfernen", key=f"remove-application-attachment-{version}"))
+        if not (save or remove):
+            return
+        try:
+            if remove:
+                remove_application_attachment(db_path)
+                notice = "Der Bonitätsnachweis wurde entfernt."
+            else:
+                if upload is None:
+                    st.error("Wähle zuerst eine PDF-Datei aus.")
+                    return
+                save_application_attachment(db_path, filename=upload.name, content=upload.getvalue())
+                notice = "Der Bonitätsnachweis wurde gespeichert."
+        except ApplicationReviewError as error:
+            st.error(str(error))
+            return
+        st.session_state[_REVIEW_NOTICE] = notice
+        st.rerun()
+
+
+def _application(
+    row: Match, db_path: Path, hours: int, *, review_available: bool, reviewed_send: bool,
+    attachment: ApplicationAttachmentInfo | None,
+) -> None:
     if row.message is None:
         if row.state == "unconfirmed" and row.platform == "WG-Gesucht":
             st.warning("Der Versand ließ sich nicht bestätigen. Schau im WG-Gesucht-Postfach nach.")
@@ -205,6 +245,11 @@ def _application(row: Match, db_path: Path, hours: int, *, review_available: boo
         try:
             if row.state == "queued":
                 st.code(row.message, language=None, wrap_lines=True)
+                if row.attachment_digest:
+                    if attachment and attachment.digest == row.attachment_digest:
+                        st.text(f"Freigegebener Anhang · {attachment.name}")
+                    else:
+                        st.warning("Der freigegebene Anhang ist gerade nicht verfügbar.")
                 if not st.button("Freigabe zurückziehen", key=f"cancel-application-{row.id}-{version}"):
                     return
                 cancel_application_review(db_path, row.id, row.message, now=datetime.now(timezone.utc))
@@ -212,13 +257,19 @@ def _application(row: Match, db_path: Path, hours: int, *, review_available: boo
             else:
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=min(hours, 24))
                 may_approve = reviewed_send and row.fresh_at >= cutoff.timestamp()
-                with st.form(f"application-{row.id}-{version}", enter_to_submit=False):
+                attachment_version = attachment.digest if attachment else "no-attachment"
+                with st.form(f"application-{row.id}-{version}-{attachment_version}", enter_to_submit=False):
                     message = st.text_area("Deine Nachricht", value=row.message, height=220, max_chars=6000)
                     save = st.form_submit_button("Entwurf speichern")
                     approve = False
                     if may_approve:
-                        approve = st.form_submit_button("Freigeben und senden", type="primary")
-                        st.caption("Mit der Freigabe beauftragst du MietRadar, genau diesen Text an das Inserat zu senden.")
+                        if attachment:
+                            st.text(f"Anhang · {attachment.name}")
+                            approve = st.form_submit_button("Text und PDF freigeben und senden", type="primary")
+                            st.caption("MietRadar verschickt genau diesen Text zusammen mit der angezeigten Datei.")
+                        else:
+                            approve = st.form_submit_button("Freigeben und senden", type="primary")
+                            st.caption("MietRadar verschickt genau diesen Text.")
                     elif reviewed_send:
                         st.caption("Das Zeitfenster für den Versand ist abgelaufen.")
                     else:
@@ -228,8 +279,13 @@ def _application(row: Match, db_path: Path, hours: int, *, review_available: boo
                 result = review_application(
                     db_path, row.id, row.message, message, approve=approve,
                     now=datetime.now(timezone.utc), max_age=timedelta(hours=hours),
+                    attachment_digest=attachment.digest if approve and attachment else None,
                 )
-                notice = "Deine Nachricht wurde zum Versand freigegeben." if result == "queued" else "Entwurf gespeichert."
+                if result == "queued":
+                    notice = ("Deine Bewerbung mit Anhang wurde zum Versand freigegeben." if attachment
+                              else "Deine Nachricht wurde zum Versand freigegeben.")
+                else:
+                    notice = "Entwurf gespeichert."
         except ApplicationReviewError as error:
             st.error(str(error))
             return
@@ -242,7 +298,7 @@ def _application(row: Match, db_path: Path, hours: int, *, review_available: boo
 
 def _matches(
     rows: tuple[Match, ...], hours: int, wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile],
-    db_path: Path, *, review_available: bool, reviewed_send: bool,
+    db_path: Path, *, review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
 ) -> None:
     st.subheader("Neue Mietangebote", anchor=False)
     _scan_status(wg_scan)
@@ -271,7 +327,8 @@ def _matches(
                 route=("Zum Hbf oder Ostbahnhof", "Bis zu 30 Min."),
             )
             _location_link(row.url)
-            _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send)
+            _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
+                         attachment=attachment)
 
 
 def _scan_status(wg_scan: tuple[float, int] | None) -> None:
@@ -436,12 +493,22 @@ def main() -> None:
         ["Angebote", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf"]
     )
     with offers:
+        attachment = None
+        reviewed_send = os.getenv("MUNICH_REVIEWED_SEND", "").strip().lower() == "true"
+        if reviewed_send and data.application_reviews_available:
+            try:
+                attachment = load_application_attachment(db_path)
+            except ApplicationReviewError as error:
+                st.warning(str(error))
+                reviewed_send = False
+            else:
+                _credit_proof(db_path, attachment)
         if date_basis:
             _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan, data.listing_profiles)
         else:
             _matches(data.matches, hours, data.wg_scan, data.listing_profiles, db_path,
                      review_available=data.application_reviews_available,
-                     reviewed_send=os.getenv("MUNICH_REVIEWED_SEND", "").strip().lower() == "true")
+                     reviewed_send=reviewed_send, attachment=attachment)
     with secondary:
         _secondary_offers(data.secondary_offers, hours, data.listing_profiles)
     with address:

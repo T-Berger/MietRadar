@@ -234,7 +234,8 @@ class ScannerTest(unittest.TestCase):
                     ("edited", url, now, plain, 0),
                 ])
                 db.execute("INSERT INTO delivery VALUES ('sending', 'unconfirmed', ?, ?)", (now, now))
-                db.execute("INSERT INTO application_reviews VALUES ('edited', '', 'edited', NULL, ?)", (now,))
+                db.execute("INSERT INTO application_reviews (id, message_hash, state, updated_at) "
+                           "VALUES ('edited', '', 'edited', ?)", (now,))
             self.assertEqual(scanner.add_intro_to_current_drafts(db, NOW), 1)
             self.assertEqual(scanner.add_intro_to_current_drafts(db, NOW), 0)
             messages = dict(db.execute("SELECT id, message FROM drafts"))

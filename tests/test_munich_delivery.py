@@ -10,7 +10,7 @@ from munich_delivery import DeliveryOutcome, DeliveryQueue, FirstMessageReview
 from munich_radar import Scanner, _database
 from munich_tiers import save_secondary_offer
 from outgoing_judge import OutgoingJudgment
-from reviewed_applications import cancel_application_review, review_application
+from reviewed_applications import cancel_application_review, review_application, save_application_attachment
 from test_munich_radar import NOW, offer, ref
 from wg_first_message import viewing_slot_labels
 
@@ -155,13 +155,14 @@ class DeliveryTest(unittest.TestCase):
         sender.send.assert_called_once()
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM delivery").fetchone(), (0,))
 
-    def reviewed_scanner(self, sender, listing):
+    def reviewed_scanner(self, sender, listing, *, attachment_digest=None):
         self.draft(offer(1, 1))
         original = "Hi, ich bin 28."
         message = "Hi zusammen,\n\nich bin Alex und koche gern. Passt euch eine Besichtigung?"
         with self.db:
             self.db.execute("UPDATE drafts SET basis = 'zuerst gesehen' WHERE id = ?", (listing.id,))
-        review_application(self.path, listing.id, original, message, approve=True, now=NOW, max_age=timedelta(days=1))
+        review_application(self.path, listing.id, original, message, approve=True, now=NOW,
+                           max_age=timedelta(days=1), attachment_digest=attachment_digest)
         source = Mock()
         source.details.return_value = listing
         router = Mock()
@@ -179,6 +180,25 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(sender.attempts, [(listing.url, message)])
         self.assertEqual(judge.call_args.args, (message,))
         self.assertTrue(judge.call_args.kwargs["user_reviewed"])
+
+    def test_reviewed_attachment_reaches_sender_with_exactly_the_approved_bytes(self):
+        listing = offer(1, None)
+        attachment_bytes = b"%PDF-1.4\n% fictional test document\n%%EOF\n"
+        document = save_application_attachment(self.path, filename="test.pdf", content=attachment_bytes)
+        sender = Mock()
+        scanner, message = self.reviewed_scanner(sender, listing, attachment_digest=document.digest)
+        sent_paths = []
+
+        def send(url, text, before_submit, *, attachment):
+            self.assertEqual((url, text), (listing.url, message))
+            self.assertEqual((attachment.name, attachment.read_bytes()), (document.name, attachment_bytes))
+            self.assertTrue(before_submit())
+            sent_paths.append(attachment)
+            return DeliveryOutcome.SENT
+
+        sender.send.side_effect = send
+        self.assertEqual(scanner.send_reviewed(self.db, NOW, {})["Bewerbung gesendet"], 1)
+        self.assertFalse(sent_paths[0].exists())
 
     def test_withdrawing_review_during_composition_stops_submission(self):
         listing = offer(1, None)
