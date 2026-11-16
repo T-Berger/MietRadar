@@ -271,7 +271,7 @@ def process_next(relay: Relay, sender: BrowserSender, source: WGSource) -> bool:
 
 
 @contextmanager
-def _profile_lock(profile: Path):
+def _profile_lock(profile: Path, *, wait: bool = False):
     personal_profile = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
     if profile.resolve().is_relative_to(personal_profile.resolve()):
         raise RelayError("Verwende für MietRadar einen eigenen privaten Chrome-Profilordner.")
@@ -286,10 +286,33 @@ def _profile_lock(profile: Path):
         raise RelayError("Der lokale Profilordner ist nicht verfügbar.") from None
     with os.fdopen(descriptor, "wb") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            mode = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
+            fcntl.flock(lock, mode)
         except OSError:
             raise RelayError("Das MietRadar-Profil wird bereits verwendet.") from None
         yield
+
+
+def _native_profile_in_use(profile: Path) -> bool:
+    """Check the owner of Chromium's profile lock without touching the browser."""
+    try:
+        target = os.readlink(profile / "SingletonLock")
+        pid = int(target.rsplit("-", 1)[-1])
+        if pid <= 1:
+            return False
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _await_native_profile_release(profile: Path) -> None:
+    if _native_profile_in_use(profile):
+        LOG.info("Railway ist verbunden. Beende das separate Chrome nach der WG-Gesucht-Anmeldung.")
+        while _native_profile_in_use(profile):
+            time.sleep(2)
 
 
 def _check_browser(sender: BrowserSender, *, manual: bool = False) -> None:
@@ -347,11 +370,13 @@ def main() -> int:
     try:
         relay = None if args.command == "login" else Relay(args.relay_url, read_token(args.token_file.expanduser()))
         profile = args.profile.expanduser()
-        with _profile_lock(profile):
+        with _profile_lock(profile, wait=args.command == "run"):
             sender = BrowserSender(profile, headless=args.command != "login")
             try:
                 if relay:
                     _check_relay(relay, retry=args.command == "run")
+                if args.command == "run":
+                    _await_native_profile_release(profile)
                 _check_browser(sender, manual=args.command == "login")
                 if args.command != "run":
                     print("WG-Gesucht-Anmeldung und Postfach sind erreichbar.")

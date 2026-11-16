@@ -146,6 +146,8 @@ pbcopy < "$sender_dir/relay-token"
 
 Führe im Repo die folgenden Befehle aus. Setze `relay_origin` auf die HTTPS-Adresse deines Dashboards. Der Befehl `login` öffnet Chrome für die Anmeldung bei WG-Gesucht. `check` prüft anschließend Anmeldung und Verbindung zu Railway. Der letzte Befehl installiert den Versanddienst für dein macOS-Konto.
 
+Wenn du das eigene Profil in einem separaten Chrome-Prozess geöffnet hast, wartet der laufende Dienst, bis du dieses Chrome über **Chrome → Google Chrome beenden** vollständig beendet hast.
+
 ```bash
 relay_origin="https://mein-dashboard.up.railway.app"
 python3 -m venv .venv
