@@ -44,7 +44,9 @@ Im öffentlichen Modus erfasst der Radar je Suche standardmäßig zwei Ergebniss
 
 ### Dashboard öffnen
 
-Das Streamlit-Dashboard zeigt neue passende Angebote, Bewerbungsentwürfe, offene Adressprüfungen, Antwortentwürfe und den Verlauf. Du kannst den Text ansehen und kopieren. Das Dashboard liest die SQLite-Datenbank des Workers.
+Das Streamlit-Dashboard zeigt neue passende Angebote, Bewerbungsentwürfe, offene Adressprüfungen, Antwortentwürfe und den Verlauf. Die Angebotskarten zeigen Miete und Fläche aus der Quelle, eine Kurzfassung und die Einschätzung nach deinen Suchkriterien. Bei aktivem Mistral ergänzt der Radar für passende Angebote eine Kurzfassung aus dem Anzeigentext. Du kannst den Bewerbungstext ansehen und kopieren. Das Dashboard liest die SQLite-Datenbank des Workers.
+
+Deine kurze Vorstellung kannst du über `MUNICH_APPLICANT_INTRO` privat in Railway oder in `config/.env` hinterlegen. Mit `{APPLICANT_INTRO}` legst du die Stelle dafür in deiner Vorlage fest. Ohne Platzhalter steht die Vorstellung vor dem Absatz zum Inserat. Aktuelle unversendete Entwürfe werden beim nächsten erreichbaren Inserat mit der neuen Vorlage aktualisiert und erneut geprüft.
 
 Unter **Angebote** kannst du das letzte Wochenende oder eigene Kalendertage in Münchner Zeit auswählen. **Veröffentlicht** zeigt Anzeigen mit einem belegten Veröffentlichungsdatum. **Zuerst gesehen** zeigt dagegen, wann MietRadar Anzeigen ohne belegtes Veröffentlichungsdatum erstmals erfasst hat. Die Datumsansicht zeigt auch erfasste Anzeigen ohne Entwurf. Ein Veröffentlichungsdatum ohne Uhrzeit reicht für die Datumsansicht. Der Radar erstellt Bewerbungsentwürfe und versendet Bewerbungen ausschließlich für Liste A.
 

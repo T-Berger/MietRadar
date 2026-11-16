@@ -28,6 +28,9 @@ class Sender(Protocol):
 
 def install_schema(db: sqlite3.Connection) -> None:
     install_secondary_offers(db)
+    db.execute("""CREATE TABLE IF NOT EXISTS draft_render_signatures (
+        id TEXT PRIMARY KEY REFERENCES drafts(id), signature TEXT NOT NULL
+    )""")
     db.execute("""
         CREATE TABLE IF NOT EXISTS delivery (
             id TEXT PRIMARY KEY REFERENCES drafts(id),
@@ -60,16 +63,24 @@ def review_outgoing(db, item_id, message, *, kind, context="", provider="none", 
 
 def save_application_draft(
     db: sqlite3.Connection, listing_id: str, url: str, fresh_at: float, basis: str, message: str,
-    *, context: str, provider: str, now: datetime,
+    *, context: str, provider: str, now: datetime, signature: str | None = None, previous_message: str | None = None,
 ) -> bool:
     """Review the draft, then save both records in the caller's transaction."""
     verdict = judge_outgoing(message, kind="application", context=context, provider=provider)
-    saved = db.execute(
-        "INSERT OR IGNORE INTO drafts(id, url, fresh_at, basis, message) VALUES (?, ?, ?, ?, ?)",
-        (listing_id, url, fresh_at, basis, message),
-    )
+    if previous_message is None:
+        saved = db.execute(
+            "INSERT OR IGNORE INTO drafts(id, url, fresh_at, basis, message) VALUES (?, ?, ?, ?, ?)",
+            (listing_id, url, fresh_at, basis, message),
+        )
+    else:
+        saved = db.execute("""
+            UPDATE drafts SET message = ? WHERE id = ? AND done = 0 AND message = ?
+              AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = drafts.id)
+        """, (message, listing_id, previous_message))
     if saved.rowcount:
         _record_outgoing(db, listing_id, message, "application", verdict, now)
+        if signature:
+            db.execute("INSERT OR REPLACE INTO draft_render_signatures VALUES (?, ?)", (listing_id, signature))
     return bool(saved.rowcount)
 
 
