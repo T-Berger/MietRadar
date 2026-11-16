@@ -64,10 +64,13 @@ class SenderTest(unittest.TestCase):
         self.area.find_element.side_effect = NoSuchElementException()
         self.submit = element("Senden")
         self.file_input = None
+        self.upload_preview = None
         self.attached_name = None
         self.reported_attachment = False
         self.timestamp = element("Heute, 10:00")
         self.confirmed = False
+        self.receipt = None
+        self.new_conversation = element()
         self.blocked = False
         self.driver.find_elements.side_effect = self.find_elements
         self.wait = Mock()
@@ -94,10 +97,16 @@ class SenderTest(unittest.TestCase):
             return [self.link]
         if selector == "#message_timestamp":
             return [self.timestamp] if self.confirmed else []
+        if selector == "#message_successfully_sent":
+            return [self.receipt] if self.receipt else []
+        if selector == "#start_new_conversation":
+            return [self.new_conversation] if self.new_conversation else []
         if selector == "textarea#message_input":
             return [self.area]
         if selector == "#messenger_form input#file_input[type='file']":
             return [self.file_input] if self.file_input else []
+        if selector == "#messenger_form .message_input_wrapper.pre_attached_file":
+            return [self.upload_preview] if self.upload_preview else []
         if selector.startswith("button[data-ng-click"):
             return [self.submit]
         return []
@@ -167,14 +176,29 @@ class SenderTest(unittest.TestCase):
         path.write_bytes(b"%PDF-1.4\n%%EOF\n")
         self.file_input = element()
         self.file_input.get_attribute.side_effect = lambda name: "application/pdf" if name == "accept" else None
-        self.driver.execute_script.return_value = [[path.name, path.stat().st_size]]
+        self.file_input.send_keys.side_effect = lambda _path: self.show_upload_preview(path.name)
         self.attached_name = path.name
         return path
+
+    def show_upload_preview(self, filename):
+        preview = element()
+        filename_element = element(filename)
+        children = {
+            (By.CSS_SELECTOR, 'input[name="message_type"][value="attached_file"]'): [element()],
+            (By.CSS_SELECTOR, "b"): [filename_element],
+        }
+        preview.find_elements.side_effect = lambda by, selector: children.get((by, selector), [])
+        self.upload_preview = preview
 
     def test_reserves_before_upload_and_checks_file_in_sent_conversation(self):
         attachment = self.prepare_attachment()
         calls = []
-        self.file_input.send_keys.side_effect = lambda path: calls.append(("attach", path))
+
+        def select_file(path):
+            calls.append(("attach", path))
+            self.show_upload_preview(attachment.name)
+
+        self.file_input.send_keys.side_effect = select_file
 
         def reserve():
             calls.append(("reserve", None))
@@ -195,9 +219,21 @@ class SenderTest(unittest.TestCase):
         self.file_input.send_keys.assert_not_called()
         self.submit.click.assert_not_called()
 
-    def test_unverified_selection_prevents_text_only_send(self):
+    def test_native_file_selection_without_upload_preview_does_not_send(self):
         attachment = self.prepare_attachment()
-        self.driver.execute_script.return_value = []
+
+        def select_file(_path):
+            self.driver.execute_script.return_value = [[attachment.name, attachment.stat().st_size]]
+
+        self.file_input.send_keys.side_effect = select_file
+        result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
+        self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+        self.file_input.send_keys.assert_called_once_with(str(attachment.resolve()))
+        self.submit.click.assert_not_called()
+
+    def test_upload_preview_with_a_different_filename_does_not_send(self):
+        attachment = self.prepare_attachment()
+        self.file_input.send_keys.side_effect = lambda _path: self.show_upload_preview("Anderer Nachweis.pdf")
         result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
         self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
         self.submit.click.assert_not_called()
@@ -205,6 +241,26 @@ class SenderTest(unittest.TestCase):
     def test_confirmation_requires_the_attachment_as_well_as_the_message(self):
         attachment = self.prepare_attachment()
         self.submit.click.side_effect = lambda: setattr(self, "confirmed", True)
+        result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
+        self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+        self.submit.click.assert_called_once_with()
+
+    def test_confirms_approved_pdf_with_success_receipt_and_hidden_composer(self):
+        attachment = self.prepare_attachment()
+
+        def click():
+            self.receipt = element("Deine Nachricht wurde erfolgreich gesendet")
+            self.new_conversation.is_displayed.return_value = False
+            self.upload_preview = None
+
+        self.submit.click.side_effect = click
+        result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
+        self.assertIs(result, DeliveryOutcome.SENT)
+        self.submit.click.assert_called_once_with()
+
+    def test_success_receipt_with_visible_composer_is_unconfirmed(self):
+        attachment = self.prepare_attachment()
+        self.submit.click.side_effect = lambda: setattr(self, "receipt", element("Nachricht gesendet"))
         result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
         self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
         self.submit.click.assert_called_once_with()
