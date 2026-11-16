@@ -236,13 +236,44 @@ class MistralProviderTest(unittest.TestCase):
             listing_type="wg", provider="none", first_message=True,
         )
         self.assertIn("Dass ihr zusammen kocht, find ich schön.", message)
-        self.assertNotIn("Balkon", message)
+        self.assertIn("Der Balkon gefällt mir.", message)
         message = llm_personalizer.personalise_message(
             template, "Wir kochen nicht zusammen. Das Zimmer hat einen Balkon.",
             listing_type="wg", provider="none", first_message=True,
         )
         self.assertIn("Der Balkon gefällt mir.", message)
         self.assertNotIn("kocht", message)
+
+    @patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=True)
+    @patch.object(llm_personalizer, "urlopen")
+    def test_wg_ad_details_cover_household_and_room_separately(self, open_url):
+        household = "Wir frühstücken sonntags zusammen."
+        room = "Das Zimmer hat einen großen Balkon."
+        open_url.return_value = response(json.dumps({
+            "household": {"text": "Euer Frühstück am Sonntag klingt gut.", "evidence": household},
+            "room": {"text": "Auch der große Balkon gefällt mir.", "evidence": room},
+            "questions": {},
+        }))
+        ad, _ = llm_personalizer._first_message_details(f"{household}\n{room}", "Zimmer zu vermieten", "wg", "mistral")
+
+        self.assertEqual(ad.household, "Euer Frühstück am Sonntag klingt gut.")
+        self.assertEqual(ad.room, "Auch der große Balkon gefällt mir.")
+        self.assertIsNone(ad.shared_topic)
+
+    @patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=True)
+    @patch.object(llm_personalizer, "urlopen")
+    def test_activity_bridge_rejects_preferences_addressed_to_applicants(self, open_url):
+        ad = "Wir suchen jemanden, der gerne Brettspiele spielt. Das Zimmer hat einen Balkon."
+        open_url.return_value = response(json.dumps({
+            "household": {"text": "Eure Brettspielabende klingen gut.", "evidence": "gerne Brettspiele spielt"},
+            "room": {"text": "Das Zimmer mit Balkon und Garten gefällt mir.", "evidence": "Das Zimmer hat einen Balkon."},
+            "questions": {},
+        }))
+        context, _ = llm_personalizer._first_message_details(ad, "", "wg", "mistral")
+
+        self.assertIsNone(context.shared_topic)
+        self.assertFalse(context.household)
+        self.assertEqual(context.room, "Der Balkon gefällt mir.")
 
     def test_offline_revision_keeps_the_draft_and_adds_only_a_verified_title_fact(self):
         draft = "Hi zusammen,\n\nIch kann ab 1. Dezember einziehen.\n\nLiebe Grüße\nLea"
