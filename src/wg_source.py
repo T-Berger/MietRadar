@@ -105,6 +105,8 @@ class Listing:
     rent_kind: RentKind | None = None
     area_sqm: float | None = None
     photo_urls: tuple[str, ...] = ()
+    available_from: date | None = None
+    available_until: date | None = None
 
 
 def _search_url(url):
@@ -253,6 +255,11 @@ def _machine_quantity(value, ceiling: int) -> float | None:
     return None
 
 
+def _section_value(label) -> str:
+    next_column = label.parent.find_next_sibling()
+    return _text(next_column.select_one(".section_panel_value")) if next_column else ""
+
+
 def _detail_facts(soup, listing_id: str, *, is_wg: bool) -> tuple[float | None, RentKind | None, float | None]:
     rent: dict[RentKind, float] = {}
     area = None
@@ -265,8 +272,7 @@ def _detail_facts(soup, listing_id: str, *, is_wg: bool) -> tuple[float | None, 
         if "key_fact_detail" in label.get("class", []):
             value = _text(label.parent.select_one(".key_fact_value"))
         else:
-            next_column = label.parent.find_next_sibling()
-            value = _text(next_column.select_one(".section_panel_value")) if next_column else ""
+            value = _section_value(label)
         if kind and (amount := parse_rent_eur(value)) is not None:
             rent.setdefault(kind, amount)
         if name in area_labels and area is None:
@@ -290,6 +296,25 @@ def _detail_facts(soup, listing_id: str, *, is_wg: bool) -> tuple[float | None, 
         if kind in rent:
             return rent[kind], kind, area
     return None, None, area
+
+
+def _detail_availability(soup) -> tuple[date | None, date | None]:
+    heading = next((
+        item for item in soup.select("h2.section_panel_title")
+        if _text(item).casefold().rstrip(":") == "verfügbarkeit"
+    ), None)
+    if heading is None:
+        return None, None
+    dates = {}
+    for label in heading.parent.select(".section_panel_detail"):
+        name = _text(label).casefold().rstrip(" :")
+        if name not in {"frei ab", "frei bis"}:
+            continue
+        try:
+            dates.setdefault(name, datetime.strptime(_section_value(label), "%d.%m.%Y").date())
+        except ValueError:
+            continue
+    return dates.get("frei ab"), dates.get("frei bis")
 
 
 def _online_age(text):
@@ -497,6 +522,7 @@ class WGSource:
             None,
         )
         published_at, published_day = _details_publication(soup, ref.id)
+        available_from, available_until = _detail_availability(soup)
         is_wg = bool(residents or wanted or urlsplit(listing_url).path.startswith("/wg-zimmer-"))
         rent_eur, rent_kind, area_sqm = _detail_facts(soup, ref.id, is_wg=is_wg)
         return Listing(
@@ -516,4 +542,6 @@ class WGSource:
             rent_kind=rent_kind,
             area_sqm=area_sqm,
             photo_urls=_detail_photos(soup, ref.id),
+            available_from=available_from,
+            available_until=available_until,
         )

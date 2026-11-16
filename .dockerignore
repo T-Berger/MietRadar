@@ -16,6 +16,7 @@
 !src/wg_delivery.py
 !src/wg_first_message.py
 !src/reviewed_applications.py
+!src/rental_availability.py
 !src/wg_reply_inbox.py
 !src/wg_reply_response.py
 !src/wg_reply_drafts.py

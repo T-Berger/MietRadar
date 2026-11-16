@@ -29,16 +29,17 @@ from llm_personalizer import (
 from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, review_outgoing, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import PRIMARY_TIERS, TransitRouter
+from rental_availability import availability_rejection, record_listing_availability
 from reviewed_applications import (
     ReviewedApplication, fail_application_review, get_application_attachment, pending_application_reviews,
-    set_application_wait_reason,
+    reject_unavailable_approval, set_application_wait_reason,
 )
 from wg_alerts import AlertsError, AlertsInbox
 from wg_first_message import applicant_answers, viewing_availability, viewing_slot_labels
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
 from wg_preferences import rejection_reason
 from wg_reply_drafts import install_wg_reply_drafts, sync_wg_reply_drafts
-from wg_source import DEFAULT_SEARCH_URLS, ListingRef, WGListingGone, WGSource, WGSourceError
+from wg_source import DEFAULT_SEARCH_URLS, Listing, ListingRef, WGListingGone, WGSource, WGSourceError
 
 if TYPE_CHECKING:
     from wg_reply_inbox import WGInboxEntry
@@ -141,23 +142,42 @@ class Scanner:
                 )
         return updated
 
-    def _recheck_text_while_browser_is_blocked(
+    @staticmethod
+    def _check_availability(db: sqlite3.Connection, listing: Listing, now: datetime) -> str | None:
+        reason = availability_rejection(
+            listing.title, listing.description, now.astimezone(BERLIN).date(),
+            available_from=listing.available_from, available_until=listing.available_until,
+        )
+        with db:
+            record_listing_availability(db, listing.id, reason)
+            if reason:
+                remove_secondary_offer(db, listing.id)
+                reject_unavailable_approval(db, listing.id, reason, now)
+        return reason
+
+    def _recheck_while_browser_is_blocked(
         self, db: sqlite3.Connection, item: ReviewedApplication, now: datetime,
-    ) -> None:
-        """Get a verdict on the approved text once per approval even when it cannot send."""
-        if self.outgoing_provider != "mistral" or db.execute("""
+    ) -> str | None:
+        """Check older offers and rejudge the approved text without starting a send."""
+        needs_availability = not db.execute("SELECT 1 FROM listing_availability WHERE id = ?", (item.id,)).fetchone()
+        needs_judgment = self.outgoing_provider == "mistral" and not db.execute("""
             SELECT 1 FROM outgoing_checks
             WHERE id = ? AND kind = 'application' AND message_hash = ? AND checked_at >= ?
-        """, (item.id, item.message_hash, item.updated_at)).fetchone():
-            return
+        """, (item.id, item.message_hash, item.updated_at)).fetchone()
+        if not (needs_availability or needs_judgment):
+            return None
         try:
             listing = self.source.details(ListingRef.from_url(item.url))
         except WGSourceError:
-            return
-        review_outgoing(
-            db, item.id, item.message, kind="application", context=listing.description, provider=self.outgoing_provider,
-            now=now, first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True),
-        )
+            return None
+        if reason := self._check_availability(db, listing, now):
+            return reason
+        if needs_judgment:
+            review_outgoing(
+                db, item.id, item.message, kind="application", context=listing.description, provider=self.outgoing_provider,
+                now=now, first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True),
+            )
+        return None
 
     def send_reviewed(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         counts = Counter()
@@ -183,7 +203,9 @@ class Scanner:
                 retry_after[item.id] = retry_at
                 continue
             if startup_problem:
-                self._recheck_text_while_browser_is_blocked(db, item, now)
+                if reason := self._recheck_while_browser_is_blocked(db, item, now):
+                    counts[reason] += 1
+                    continue
                 set_application_wait_reason(db, item, startup_problem)
                 retry_after[item.id] = retry_at
                 counts["Freigaben warten auf Versandbrowser"] += 1
@@ -200,6 +222,9 @@ class Scanner:
                 )
                 retry_after[item.id] = retry_at
                 counts["Freigaben warten auf WG-Gesucht"] += 1
+                continue
+            if reason := self._check_availability(db, listing, now):
+                counts[reason] += 1
                 continue
             cutoff = now - min(self.max_age, timedelta(hours=24))
             expired = (not cutoff <= listing.published_at <= now if listing.published_at is not None else
@@ -312,26 +337,27 @@ class Scanner:
             refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
 
         metadata_backfill = db.execute("""
-            SELECT f.url, p.photo_urls IS NULL, MAX(f.check_route) AND p.route_tier IS NULL FROM (
+            SELECT f.url, p.photo_urls IS NULL, MAX(f.check_route) AND p.route_tier IS NULL, a.id IS NULL FROM (
                 SELECT id, url, fresh_at,
                        NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id) AS check_route
                 FROM drafts d WHERE done = 0 AND message IS NOT NULL
                 UNION ALL
                 SELECT id, url, fresh_at, 0 FROM munich_secondary_offers
             ) f LEFT JOIN listing_profiles p ON p.id = f.id
+                LEFT JOIN listing_availability a ON a.id = f.id
             WHERE f.id NOT LIKE 'ka-%' AND f.fresh_at BETWEEN ? AND ?
-              AND (p.photo_urls IS NULL OR (f.check_route AND p.route_tier IS NULL))
+              AND (p.photo_urls IS NULL OR (f.check_route AND p.route_tier IS NULL) OR a.id IS NULL)
             GROUP BY f.id ORDER BY p.photo_urls IS NOT NULL, MAX(f.fresh_at) DESC LIMIT ?
         """, (cutoff.timestamp(), now.timestamp(), (self.limit + 1) // 2)).fetchall()
-        metadata_refs = [(ref, photos, route) for url, photos, route in metadata_backfill
+        metadata_refs = [(ref, photos, route, availability) for url, photos, route, availability in metadata_backfill
                          if (ref := ListingRef.from_url(url))]
-        photo_ids = {ref.id for ref, photos, _ in metadata_refs if photos}
-        route_ids = {ref.id for ref, _, route in metadata_refs if route}
-        metadata_ids = photo_ids | route_ids
+        photo_ids = {ref.id for ref, photos, _, _ in metadata_refs if photos}
+        route_ids = {ref.id for ref, _, route, _ in metadata_refs if route}
+        metadata_ids = {ref.id for ref, _, _, _ in metadata_refs}
         original_ids = {ref.id for ref, _ in refs}
         refresh_ids = {ref.id for ref, _ in refresh_refs}
         queued_ids = original_ids.copy()
-        for ref in [ref for ref, _ in refresh_refs] + [ref for ref, _, _ in metadata_refs]:
+        for ref in [ref for ref, _ in refresh_refs] + [ref for ref, _, _, _ in metadata_refs]:
             if ref.id not in queued_ids:
                 refs.append((ref, None))
                 queued_ids.add(ref.id)
@@ -369,6 +395,10 @@ class Scanner:
                 retry_after[ref.id] = now + self.max_age
                 continue
             record_listing_profile(db, listing)
+            if reason := self._check_availability(db, listing, now):
+                counts[reason] += 1
+                retry_after[listing.id] = now + self.max_age
+                continue
             if ref.id in photo_ids and listing.photo_urls:
                 counts["Inserate mit Fotos ergänzt"] += 1
             if ref.id in metadata_ids and (skip_draft or (ref.id not in original_ids and not refresh_draft)):

@@ -194,7 +194,8 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(scanner.send_reviewed(self.db, NOW, retry_after)["Freigaben warten auf Versandbrowser"], 1)
         self.assertFalse(scanner.send_reviewed(self.db, NOW + timedelta(seconds=10), retry_after))
         scanner.reviewed_startup_problem.assert_called_once()
-        scanner.source.details.assert_not_called()
+        scanner.source.details.assert_called_once_with(ref(listing))
+        scanner.router.classify.assert_not_called()
         self.assertEqual(sender.attempts, [])
         self.assertEqual(self.db.execute("SELECT state, reason FROM application_reviews").fetchone(),
                          ("queued", problem))
@@ -215,6 +216,18 @@ class DeliveryTest(unittest.TestCase):
         state, reason = self.db.execute("SELECT state, reason FROM application_reviews").fetchone()
         self.assertEqual(state, "queued")
         self.assertIn("MietRadar versucht es erneut.", reason)
+
+    def test_queued_short_rental_is_removed_even_if_browser_is_blocked(self):
+        listing = replace(offer(1, 1), available_from=NOW.date(), available_until=NOW.date() + timedelta(days=75))
+        sender = Mock()
+        scanner, text = self.reviewed_scanner(sender, listing)
+        scanner.reviewed_startup_problem = lambda: "Chromium startet nicht."
+
+        self.assertEqual(scanner.send_reviewed(self.db, NOW, {})["Zwischenmiete unter vier Monaten"], 1)
+        self.assertEqual(self.db.execute("SELECT state, reason FROM application_reviews").fetchone(),
+                         ("failed", "Zwischenmiete unter vier Monaten"))
+        self.assertEqual(self.db.execute("SELECT message FROM drafts").fetchone(), (text,))
+        sender.send.assert_not_called()
 
     def test_approved_text_is_rechecked_once_with_mistral_when_the_browser_cannot_start(self):
         listing = offer(1, None)

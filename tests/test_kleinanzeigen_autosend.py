@@ -1,7 +1,8 @@
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import timedelta
+from dataclasses import replace
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -58,6 +59,32 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
             radar.scan(db, inbox, NOW, cutoff, 10, {})
             self.assertEqual(sender.attempts, [(listing.url, "Hallo!")])
         self.assertEqual(router.classify.call_count, 3)
+
+    def test_autosend_rechecks_known_availability_before_using_an_existing_draft(self):
+        listing = klein_offer(1)
+        inbox, router = Mock(), Mock()
+        router.classify.return_value = ("a", 25)
+        received = NOW - timedelta(minutes=20)
+        inbox.recent_items.return_value = [(listing, received)]
+        radar = KleinanzeigenRadar(router, "Hallo!", "none")
+        cutoff = NOW - timedelta(days=1)
+        sender = RecordingSender()
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            with db:
+                db.execute("DELETE FROM listing_availability")
+            radar.delivery = DeliveryQueue(sender, clock=lambda: NOW)
+            inbox.recent_items.return_value = []
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            self.assertFalse(sender.attempts)
+
+            late = replace(listing, available_from=date(NOW.year + 1, 1, 1))
+            inbox.recent_items.return_value = [(late, received)]
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            self.assertFalse(sender.attempts)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_origins").fetchone(), (0,))
+            self.assertEqual(db.execute("SELECT message FROM drafts WHERE id = ?", (listing.id,)).fetchone(), ("Hallo!",))
+        router.classify.assert_called_once_with(listing.address, NOW)
 
 
 if __name__ == "__main__":

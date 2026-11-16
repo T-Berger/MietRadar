@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 from email.message import EmailMessage
 
 from kleinanzeigen_source import extract_listings, normalize_munich_address
@@ -73,6 +74,32 @@ Wohnfläche: 75 m²
 """)
         [listing] = extract_listings(email.as_bytes(), SENDER)
         self.assertEqual((listing.rent_eur, listing.rent_kind, listing.area_sqm), (None, None, None))
+
+    def test_move_in_labels_are_card_local_and_keep_month_only_values_as_text(self):
+        email = EmailMessage()
+        email["From"] = SENDER
+        email.set_content(f"{ROOM}\n{FLAT}")
+        email.add_alternative(f"""<body>
+          <article><a href="{ROOM}">WG-Zimmer</a><div>16.11.2026</div>
+            <span>Verfügbar ab</span><span>Januar 2027</span></article>
+          <article><a href="{FLAT}">Wohnung</a><div>16.11.2026</div>
+            <span>Verfügbar ab:</span><span>1.12.2026</span><div>Frei bis 31.03.2027</div></article>
+        </body>""", subtype="html")
+        room, flat = extract_listings(email.as_bytes(), SENDER)
+        self.assertIn("Verfügbar ab Januar 2027", room.description)
+        self.assertEqual((room.available_from, room.available_until), (None, None))
+        self.assertEqual((flat.available_from, flat.available_until), (date(2026, 12, 1), date(2027, 3, 31)))
+        self.assertIsNone(flat.published_at)
+
+    def test_merges_explicit_move_in_dates_from_the_plain_alternate(self):
+        email = EmailMessage()
+        email["From"] = SENDER
+        email.set_content(f"16.11.2026\nMietbeginn: 2026-12-15\n{ROOM}")
+        email.add_alternative(f"""<article><a href="{ROOM}">Zimmer mit Balkon</a>
+          <div>Verfügbar bis: 15.04.2027</div></article>""", subtype="html")
+        [listing] = extract_listings(email.as_bytes(), SENDER)
+        self.assertEqual((listing.available_from, listing.available_until), (date(2026, 12, 15), date(2027, 4, 15)))
+        self.assertIsNone(listing.published_at)
 
     def test_manual_location_must_be_a_complete_munich_address(self):
         self.assertEqual(normalize_munich_address("Maximilianstr. 4 A, 80539 München"),

@@ -98,6 +98,29 @@ class ScannerTest(unittest.TestCase):
         source.candidates.assert_not_called()
         router.classify.assert_called_once()
 
+    def test_new_and_existing_offers_are_filtered_before_routing_by_availability(self):
+        late = replace(offer(1, 1), available_from=date(2027, 1, 1))
+        short = replace(offer(2, 1), available_from=date(2026, 12, 1), available_until=date(2027, 2, 28))
+        long = replace(offer(3, 1), available_from=date(2026, 12, 1), available_until=date(2027, 3, 31))
+        source, router = Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.return_value = [ref(short), ref(long)]
+        by_id = {item.id: item for item in (late, short, long)}
+        source.details.side_effect = lambda candidate: by_id[candidate.id]
+        router.classify.return_value = ("a*", 16)
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 12)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Mein Entwurf', 0)",
+                           (late.id, late.url, late.published_at.timestamp()))
+            counts = scanner.scan(db, NOW, {})
+            self.assertEqual(counts["Einzug erst ab dem nächsten Kalenderjahr"], 1)
+            self.assertEqual(counts["Zwischenmiete unter vier Monaten"], 1)
+            self.assertEqual(counts["neue Entwürfe"], 1)
+            self.assertEqual(db.execute("SELECT message FROM drafts WHERE id = ?", (late.id,)).fetchone(),
+                             ("Mein Entwurf",))
+        router.classify.assert_called_once_with(long.address, NOW)
+
     def test_snapshots_cover_all_ids_and_first_observed_matches_remain_manual(self):
         baseline, beyond_budget, new, stale = offer(1, None), offer(2, None), offer(3, None), offer(4, 36)
         source, router, delivery = Mock(), Mock(), Mock()
