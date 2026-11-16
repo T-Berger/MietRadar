@@ -151,7 +151,7 @@ class MistralProviderTest(unittest.TestCase):
         )
         message = llm_personalizer.personalise_message(template, "", provider="none", first_message=True)
 
-        self.assertIn("Ich könnte zum 1. Dezember einziehen. Wann passt euch eine Besichtigung?", message)
+        self.assertIn("Ich könnte zum 1. Dezember einziehen.\n\nWann könnte ich vorbeikommen und euch kennenlernen?", message)
         self.assertNotIn("17.11.", message)
         self.assertNotIn("18 Uhr", message)
 
@@ -167,6 +167,48 @@ class MistralProviderTest(unittest.TestCase):
             "Die Wohnung ist ab Dezember frei.", provider="mistral", first_message=True, listing_type="wohnung",
         )
         self.assertEqual(message, "Hi,\n\nich bin Lea.\n\nWann wäre eine Besichtigung möglich?\n\nViele Grüße\nLea")
+
+    @patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=True)
+    @patch.object(llm_personalizer, "urlopen")
+    def test_first_message_prefers_household_detail_when_the_model_returns_tram_copy(self, open_url):
+        transit = "Die Tram fährt direkt vor der Tür."
+        model_copy = json.dumps({
+            "detail": {
+                "text": "Ich liebe es, wenn die Tram direkt vor der Tür fährt – so kommt man schnell überall hin.",
+                "evidence": transit,
+            },
+            "questions": {},
+        })
+        open_url.side_effect = [response(model_copy), response(json.dumps({
+            "detail": {"text": "Der Anschluss wäre für mich praktisch.", "evidence": transit},
+            "questions": {},
+        }))]
+        template = "Hi zusammen,\n\nich bin Lea.\n\n{LLM_TEXT}\n\nViele Grüße\nLea"
+        message = llm_personalizer.personalise_message(
+            template, f"{transit} Wir spielen manchmal Brettspiele.", provider="mistral", first_message=True,
+        )
+        self.assertIn("Dass ihr Brettspiele spielt, klingt gut.", message)
+        self.assertNotIn("Tram", message)
+        generic_listing = llm_personalizer.personalise_message(
+            template, transit, provider="mistral", first_message=True,
+        )
+        self.assertNotIn("Tram", generic_listing)
+        self.assertNotIn("Anschluss", generic_listing)
+        self.assertEqual(open_url.call_count, 2)
+
+    @patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=True)
+    @patch.object(llm_personalizer, "urlopen")
+    def test_first_message_does_not_invent_the_applicants_hobbies(self, open_url):
+        ad = "Wir kochen ab und zu gemeinsam."
+        open_url.return_value = response(json.dumps({
+            "detail": {"text": "Ich koche jeden Abend und würde sofort mitmachen.", "evidence": ad},
+            "questions": {},
+        }))
+        message = llm_personalizer.personalise_message(
+            "Hi zusammen,\n\nich bin Lea.\n\n{LLM_TEXT}", ad, provider="mistral", first_message=True,
+        )
+        self.assertIn("Dass ihr zusammen kocht, find ich schön.", message)
+        self.assertNotIn("jeden Abend", message)
 
     def test_first_message_finds_private_intro_and_keeps_other_template_text(self):
         intro = "ich bin Lea und arbeite im Theater.  In meiner Freizeit wandere ich gerne."

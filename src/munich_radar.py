@@ -103,7 +103,7 @@ class Scanner:
     applicant_answers: dict[str, str] = field(default_factory=dict)
 
     def add_intro_to_current_drafts(self, db: sqlite3.Connection, now: datetime) -> int:
-        """Repair introductions when the listing source cannot be rechecked."""
+        """Clean up recent unedited drafts using the cached listing title."""
         drafts = db.execute("""
             SELECT d.id, d.url, d.fresh_at, d.basis, d.message, COALESCE(p.title, '')
             FROM drafts d LEFT JOIN listing_profiles p ON p.id = d.id
@@ -114,18 +114,19 @@ class Scanner:
             ORDER BY d.fresh_at DESC LIMIT ?
         """, ((now - self.max_age).timestamp(), now.timestamp(), self.limit)).fetchall()
         updated = 0
+        viewing_slots = viewing_slot_labels(self.viewing_availability, now)
         for listing_id, url, stamp, basis, previous, title in drafts:
             revised = revise_first_message_draft(
                 previous, self.applicant_intro, listing_title=title,
                 listing_type="wg" if "/wg-zimmer-" in url else "wohnung",
-                viewing_slots=viewing_slot_labels(self.viewing_availability, now),
+                viewing_slots=viewing_slots, template=self.template,
             )
             if revised == previous:
                 continue
             with db:
                 updated += save_application_draft(
                     db, listing_id, url, stamp, basis, revised,
-                    context="", provider=self.outgoing_provider, now=now, previous_message=previous,
+                    context=title, provider=self.outgoing_provider, now=now, previous_message=previous,
                 )
         return updated
 
@@ -701,10 +702,10 @@ def _poll(
             LOG.warning("Scan pausiert: %s", exc)
             failed = True
             delay = min(max(600, delay * 2), 3600)
-            updated = scanner.add_intro_to_current_drafts(db, datetime.now(timezone.utc))
-            if updated:
-                counts["Entwürfe mit persönlicherem Text aktualisiert"] += updated
         now = datetime.now(timezone.utc)
+        updated = scanner.add_intro_to_current_drafts(db, now)
+        if updated:
+            counts["gespeicherte Entwürfe sprachlich überarbeitet"] += updated
         counts.update(scanner.send_reviewed(db, now, review_retry_after))
         klein_paused = scanner.klein_delivery is not None and scanner.klein_delivery.paused
         if reply_inbox:
