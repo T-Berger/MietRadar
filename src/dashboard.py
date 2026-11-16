@@ -20,6 +20,7 @@ from dashboard_data import (
     BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, ListingProfile, MapListing, Match,
     ProviderFilter, Reply, SecondaryListing, filter_listing_providers, load_dashboard, map_listings, weekend_dates,
 )
+from listing_profiles import valid_listing_coordinates
 from munich_transit import HAUPTBAHNHOF, OSTBAHNHOF
 from reviewed_applications import (
     MAX_APPLICATION_ATTACHMENT_BYTES, ApplicationAttachmentInfo, ApplicationReviewError,
@@ -52,6 +53,12 @@ MAP_TIERS = {
     "c": ("C · bis 45 Min.", "#884498", "ab Hauptbahnhof"),
 }
 OSM_COPYRIGHT = '[© OpenStreetMap-Mitwirkende](https://www.openstreetmap.org/copyright)'
+OSM_TILES = {
+    "style": "white-bg",
+    "layers": [{"sourcetype": "raster", "source": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+                "below": "traces", "sourceattribution": "© OpenStreetMap contributors"}],
+}
+MAP_CONFIG = {"displaylogo": False, "modeBarButtonsToRemove": ["toImage"]}
 INTRO = """
 <style>
   [data-testid="stMainBlockContainer"] { max-width: 64rem; padding-top: 2.75rem; }
@@ -212,16 +219,14 @@ def _listing_map(rows: tuple[MapListing, ...]) -> None:
         height=510, margin={"l": 0, "r": 0, "t": 52, "b": 0}, uirevision="munich-map",
         clickmode="event+select", legend={"orientation": "h", "x": 0, "y": 1.02},
         map={
-            "style": "white-bg",
+            **OSM_TILES,
             "center": {"lat": (min(latitudes) + max(latitudes)) / 2, "lon": (min(longitudes) + max(longitudes)) / 2},
             "zoom": min(11.4, log2(360 / extent) - 0.7),
-            "layers": [{"sourcetype": "raster", "source": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-                        "below": "traces", "sourceattribution": "© OpenStreetMap contributors"}],
         },
     )
     event = st.plotly_chart(
         fig, key="mietradar_offers_map", on_select="rerun", selection_mode="points",
-        config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"]},
+        config=MAP_CONFIG,
     )
     st.caption(OSM_COPYRIGHT)
     if not pins:
@@ -238,6 +243,34 @@ def _listing_map(rows: tuple[MapListing, ...]) -> None:
     if chosen:
         st.caption(_map_facts(pins[chosen]))
         _location_link(pins[chosen].url)
+
+
+def _offer_location_map(profile: ListingProfile | None, title: str, *, key: str) -> None:
+    if profile and not profile.map_eligible:
+        return
+    point = valid_listing_coordinates(profile.latitude, profile.longitude) if profile else None
+    if point is None:
+        st.caption("Standort noch nicht bestätigt.")
+        return
+
+    panel = st.expander("Lage auf der Karte", icon=":material/location_on:", key=key, on_change="rerun")
+    if not panel.open:
+        return
+
+    import plotly.graph_objects as go
+
+    latitude, longitude = point
+    figure = go.Figure(go.Scattermap(
+        lat=[latitude], lon=[longitude], mode="markers", marker={"size": 20, "color": "#087660"},
+        text=[escape(title)], hovertemplate="<b>%{text}</b><extra></extra>",
+    ))
+    figure.update_layout(
+        height=320, margin={"l": 0, "r": 0, "t": 0, "b": 0},
+        map={**OSM_TILES, "center": {"lat": latitude, "lon": longitude}, "zoom": 15},
+    )
+    with panel:
+        st.plotly_chart(figure, key=f"{key}_chart", config=MAP_CONFIG)
+        st.caption(OSM_COPYRIGHT)
 
 
 def _listing_photos(photo_urls: tuple[str, ...]) -> str:
@@ -263,7 +296,7 @@ def _listing_photos(photo_urls: tuple[str, ...]) -> str:
 
 def _listing_card(
     profile: ListingProfile | None, *, title: str, platform: str, status: str, date_label: str,
-    route: tuple[str, str] | None = None, note: str | None = None,
+    route: tuple[str, str] | None = None, note: str | None = None, map_key: str | None = None,
 ) -> None:
     if profile and profile.title:
         title = profile.title
@@ -295,6 +328,8 @@ def _listing_card(
         f'<h3>{escape(title)}</h3></header>{photos}<div class="radar-listing__facts">{facts}</div>'
         f'{"".join(sections)}<p class="radar-listing__foot">{escape(date_label)}</p></article>'
     )
+    if map_key is not None:
+        _offer_location_map(profile, title, key=map_key)
 
 
 def _credit_proof(db_path: Path, attachment: ApplicationAttachmentInfo | None) -> None:
@@ -446,6 +481,7 @@ def _matches(
             _listing_card(
                 profile, title=_headline(row.url), platform=row.platform,
                 status=f"{tier} · {status}", date_label=f"{date_label} · {row.id}", route=route,
+                map_key=f"current_map_{row.id}" if row.state != "unavailable" else None,
             )
             _location_link(row.url)
             _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
@@ -513,7 +549,7 @@ def _dated_offers(
                 tier, route = _primary_route(profile)
                 status = f"{tier} · {status}"
             _listing_card(profile, title=_headline(row.url), platform=row.platform,
-                          status=status, date_label=date_label, route=route)
+                          status=status, date_label=date_label, route=route, map_key=f"dated_map_{row.id}")
             _location_link(row.url)
 
 
@@ -545,7 +581,7 @@ def _secondary_offers(rows: tuple[SecondaryListing, ...], hours: int, profiles: 
             with st.container(border=True):
                 _listing_card(profiles.get(row.id), title=row.title or _headline(row.url), platform=row.platform,
                               status="", date_label=f"{row.basis.capitalize()} · {_date(row.fresh_at)}",
-                              route=(f"Ab {station}", f"{row.minutes} Min."))
+                              route=(f"Ab {station}", f"{row.minutes} Min."), map_key=f"secondary_map_{row.id}")
                 _location_link(row.url)
 
 
