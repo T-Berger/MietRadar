@@ -8,6 +8,7 @@ from selenium.webdriver.common.by import By
 
 from kleinanzeigen_delivery import KleinanzeigenBrowserSender
 from munich_delivery import DeliveryOutcome
+from wg_delivery import BrowserStartupError
 
 
 LISTING = "https://www.kleinanzeigen.de/s-anzeige/zimmer-in-muenchen/4212345678-199-6432"
@@ -86,6 +87,13 @@ class KleinanzeigenSenderTest(unittest.TestCase):
         )
         claim = Mock()
         self.assertIs(self.sender.send(LISTING, TEXT, claim), DeliveryOutcome.BLOCKED)
+        claim.assert_not_called()
+        self.submit.click.assert_not_called()
+
+    def test_browser_startup_failure_blocks_before_reserving_application(self):
+        claim = Mock()
+        with patch.object(self.sender, "_browser", side_effect=BrowserStartupError("Chromium startet nicht.")):
+            self.assertIs(self.sender.send(LISTING, TEXT, claim), DeliveryOutcome.BLOCKED)
         claim.assert_not_called()
         self.submit.click.assert_not_called()
 
@@ -177,6 +185,13 @@ class KleinanzeigenReplySenderTest(unittest.TestCase):
         self.assertIs(result, DeliveryOutcome.SENT)
         self.driver.get.assert_called_once_with(CONVERSATION)
         self.submit.click.assert_called_once_with()
+
+    def test_browser_startup_failure_blocks_before_reserving_reply(self):
+        claim = Mock()
+        with patch.object(self.sender, "_browser", side_effect=BrowserStartupError("Chromium startet nicht.")):
+            self.assertIs(self.sender.send_reply(CONVERSATION, LISTING_ID, TEXT, claim), DeliveryOutcome.BLOCKED)
+        claim.assert_not_called()
+        self.submit.click.assert_not_called()
 
     def test_reply_refuses_generic_inbox_unsafe_characters_and_wrong_listing(self):
         claim = Mock()

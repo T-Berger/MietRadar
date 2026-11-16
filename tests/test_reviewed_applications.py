@@ -18,6 +18,7 @@ from reviewed_applications import (
     review_application,
     review_is_pending,
     save_application_attachment,
+    set_application_wait_reason,
 )
 
 
@@ -76,6 +77,31 @@ class ReviewedApplicationsTest(unittest.TestCase):
         self.review(EDITED, now=NOW + timedelta(minutes=2))
         fail_application_review(self.db, old, "Anzeige nicht erreichbar.", NOW + timedelta(minutes=3))
         self.assertEqual(len(self.pending(NOW + timedelta(minutes=3))), 1)
+
+    def test_wait_reason_preserves_approval_and_can_be_cleared(self):
+        self.review()
+        queued, = self.pending()
+        set_application_wait_reason(self.db, queued, "Wartet auf ÖPNV-Prüfung.")
+        self.assertEqual(self.db.execute("SELECT reason FROM application_reviews").fetchone(),
+                         ("Wartet auf ÖPNV-Prüfung.",))
+        self.assertEqual(self.pending(), (queued,))
+        set_application_wait_reason(self.db, queued, None)
+        self.assertEqual(self.db.execute("SELECT reason FROM application_reviews").fetchone(), (None,))
+
+    def test_wait_reason_does_not_overwrite_a_later_approval_or_delivery(self):
+        self.review()
+        old, = self.pending()
+        cancel_application_review(self.path, ID, EDITED, now=NOW + timedelta(minutes=1))
+        renewed_at = NOW + timedelta(minutes=2)
+        self.review(EDITED, now=renewed_at)
+        set_application_wait_reason(self.db, old, "Veralteter Grund")
+        self.assertEqual(self.db.execute("SELECT reason FROM application_reviews").fetchone(), (None,))
+        renewed, = self.pending(renewed_at)
+        with self.db:
+            self.db.execute("INSERT INTO delivery VALUES (?, 'unconfirmed', ?, ?)",
+                            (ID, renewed_at.timestamp(), renewed_at.timestamp()))
+        set_application_wait_reason(self.db, renewed, "Versand reserviert")
+        self.assertEqual(self.db.execute("SELECT reason FROM application_reviews").fetchone(), (None,))
 
     def test_approval_caps_age_at_24_hours_and_expired_message_is_never_pending(self):
         self.review()

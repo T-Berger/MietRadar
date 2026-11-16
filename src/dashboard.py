@@ -226,17 +226,15 @@ def _application(
     row: Match, db_path: Path, hours: int, *, review_available: bool, reviewed_send: bool,
     attachment: ApplicationAttachmentInfo | None,
 ) -> None:
+    if row.state == "unconfirmed" and row.platform == "WG-Gesucht":
+        st.warning("Der Versand ließ sich nicht bestätigen. Schau im WG-Gesucht-Postfach nach.")
+    elif row.review_reason:
+        st.text(row.review_reason)
     if row.message is None:
-        if row.state == "unconfirmed" and row.platform == "WG-Gesucht":
-            st.warning("Der Versand ließ sich nicht bestätigen. Schau im WG-Gesucht-Postfach nach.")
-        elif row.review_reason:
-            st.text(row.review_reason)
         return
 
     editable = review_available and row.platform == "WG-Gesucht" and row.url is not None
     with st.expander("Bewerbung prüfen" if editable else "Bewerbung anzeigen"):
-        if row.review_reason:
-            st.text(row.review_reason)
         if not editable:
             st.code(row.message, language=None, wrap_lines=True)
             return
@@ -321,9 +319,12 @@ def _matches(
                         date_label += " · Versand nur nach Freigabe"
                     else:
                         date_label += " · nur als Entwurf"
+            status = STATES.get(row.state, "Entwurf")
+            if row.state == "queued" and row.review_reason:
+                status = "Freigegeben · Versand verzögert"
             _listing_card(
                 profiles.get(row.id), title=_headline(row.url), platform=row.platform,
-                status=f"A · {STATES.get(row.state, 'Entwurf')}", date_label=f"{date_label} · {row.id}",
+                status=f"A · {status}", date_label=f"{date_label} · {row.id}",
                 route=("Zum Hbf oder Ostbahnhof", "Bis zu 30 Min."),
             )
             _location_link(row.url)

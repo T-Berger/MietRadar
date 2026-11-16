@@ -13,6 +13,7 @@ from outgoing_judge import OutgoingJudgment
 from reviewed_applications import cancel_application_review, review_application, save_application_attachment
 from test_munich_radar import NOW, offer, ref
 from wg_first_message import viewing_slot_labels
+from wg_source import WGSourceError
 
 
 class RecordingSender:
@@ -180,6 +181,39 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(sender.attempts, [(listing.url, message)])
         self.assertEqual(judge.call_args.args, (message,))
         self.assertTrue(judge.call_args.kwargs["user_reviewed"])
+
+    def test_reviewed_browser_failure_waits_without_attempt_and_resumes_after_recovery(self):
+        listing = offer(1, None)
+        sender = RecordingSender()
+        scanner, message = self.reviewed_scanner(sender, listing)
+        problem = "Chromium kann seine Sandbox in dieser Laufzeitumgebung nicht starten."
+        scanner.reviewed_startup_problem = Mock(side_effect=[problem, None])
+        retry_after = {}
+
+        self.assertEqual(scanner.send_reviewed(self.db, NOW, retry_after)["Freigaben warten auf Versandbrowser"], 1)
+        self.assertFalse(scanner.send_reviewed(self.db, NOW + timedelta(seconds=10), retry_after))
+        scanner.reviewed_startup_problem.assert_called_once()
+        scanner.source.details.assert_not_called()
+        self.assertEqual(sender.attempts, [])
+        self.assertEqual(self.db.execute("SELECT state, reason FROM application_reviews").fetchone(),
+                         ("queued", problem))
+
+        with patch("munich_delivery.judge_outgoing", return_value=OutgoingJudgment(True, "ok")):
+            self.assertEqual(scanner.send_reviewed(self.db, NOW + timedelta(minutes=5), retry_after)
+                             ["Bewerbung gesendet"], 1)
+        self.assertEqual(sender.attempts, [(listing.url, message)])
+        self.assertEqual(self.db.execute("SELECT reason FROM application_reviews").fetchone(), (None,))
+
+    def test_reviewed_listing_check_error_keeps_approval_and_explains_delay(self):
+        sender = Mock()
+        scanner, _ = self.reviewed_scanner(sender, offer(1, None))
+        scanner.source.details.side_effect = WGSourceError("Unavailable")
+
+        self.assertEqual(scanner.send_reviewed(self.db, NOW, {})["Freigaben warten auf WG-Gesucht"], 1)
+        sender.send.assert_not_called()
+        state, reason = self.db.execute("SELECT state, reason FROM application_reviews").fetchone()
+        self.assertEqual(state, "queued")
+        self.assertIn("MietRadar versucht es erneut.", reason)
 
     def test_reviewed_attachment_reaches_sender_with_exactly_the_approved_bytes(self):
         listing = offer(1, None)

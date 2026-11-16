@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from shutil import which
+from tempfile import TemporaryDirectory, TemporaryFile
 from urllib.parse import parse_qs, urlsplit
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
+from selenium.common.exceptions import NoSuchElementException, SessionNotCreatedException, TimeoutException, WebDriverException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -31,6 +35,42 @@ _VERIFICATION = (
     "iframe[title*='hCaptcha'], iframe[src*='challenges.cloudflare.com']"
 )
 _BLOCKED_TITLES = ("überprüfung", "access denied", "just a moment", "zugriff verweigert", "captcha")
+_BROWSER_STARTUP = "Chromium startet nicht. Prüfe Browser, ChromeDriver und das Browserprofil."
+_BROWSER_SANDBOX = "Chromium kann seine Sandbox in dieser Laufzeitumgebung nicht starten."
+
+
+class BrowserStartupError(WebDriverException):
+    """A safe operator-facing error without WebDriver's diagnostic output."""
+
+
+def _sandbox_startup_failed(chrome: str) -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        with TemporaryDirectory(prefix="mietradar-browser-check-") as profile, TemporaryFile() as stderr:
+            command = [
+                chrome, "--headless=new", "--disable-dev-shm-usage", "--disable-background-networking",
+                "--no-first-run", f"--user-data-dir={profile}", "--dump-dom", "about:blank",
+            ]
+            with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr, start_new_session=True) as process:
+                try:
+                    if process.wait(timeout=8) == 0:
+                        return False
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return False
+            end = stderr.seek(0, os.SEEK_END)
+            stderr.seek(max(0, end - 16384))
+            output = stderr.read().lower()
+    except OSError:
+        return False
+    return (
+        b"failed to move to new namespace" in output or b"no usable sandbox" in output
+        or (b"sandbox/linux/services/credentials.cc" in output and b"permission denied" in output)
+    )
 
 
 def _wg_page(url: str) -> bool:
@@ -77,22 +117,39 @@ class BrowserSender:
     def _browser(self):
         if self._driver is not None:
             return self._driver
-        self.profile.mkdir(mode=0o700, parents=True, exist_ok=True)
-        options = webdriver.ChromeOptions()
-        options.page_load_strategy = "eager"
-        options.add_argument(f"--user-data-dir={self.profile.resolve()}")
-        options.add_argument("--lang=de-DE")
-        options.add_argument("--window-size=1280,900")
-        if self.headless:
-            options.add_argument("--headless=new")
-            options.add_argument("--disable-dev-shm-usage")
-        if chrome := os.getenv("CHROME_BIN") or which("chromium"):
-            options.binary_location = chrome
-        executable = os.getenv("CHROMEDRIVER") or which("chromedriver")
-        driver = webdriver.Chrome(options=options, service=Service(executable_path=executable))
-        self._driver = driver
-        driver.set_page_load_timeout(25)
-        return driver
+        chrome = os.getenv("CHROME_BIN") or which("chromium")
+        try:
+            self.profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+            options = webdriver.ChromeOptions()
+            options.page_load_strategy = "eager"
+            options.add_argument(f"--user-data-dir={self.profile.resolve()}")
+            options.add_argument("--lang=de-DE")
+            options.add_argument("--window-size=1280,900")
+            if self.headless:
+                options.add_argument("--headless=new")
+                options.add_argument("--disable-dev-shm-usage")
+            if chrome:
+                options.binary_location = chrome
+            executable = os.getenv("CHROMEDRIVER") or which("chromedriver")
+            driver = webdriver.Chrome(options=options, service=Service(executable_path=executable))
+            self._driver = driver
+            driver.set_page_load_timeout(25)
+            return driver
+        except SessionNotCreatedException:
+            if chrome and self.headless and _sandbox_startup_failed(chrome):
+                raise BrowserStartupError(_BROWSER_SANDBOX) from None
+            raise BrowserStartupError(_BROWSER_STARTUP) from None
+        except (OSError, WebDriverException):
+            self.close()
+            raise BrowserStartupError(_BROWSER_STARTUP) from None
+
+    def startup_problem(self) -> str | None:
+        """Check whether the browser starts without opening the WG-Gesucht site."""
+        try:
+            self._browser()
+        except BrowserStartupError as error:
+            return error.msg
+        return None
 
     def close(self):
         if self._driver is not None:

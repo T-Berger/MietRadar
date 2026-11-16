@@ -1,9 +1,9 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, SessionNotCreatedException, TimeoutException
 from selenium.webdriver.common.by import By
 
 from wg_delivery import BrowserSender, DeliveryOutcome
@@ -19,6 +19,37 @@ def element(label="", href=None):
     item.is_enabled.return_value = True
     item.get_attribute.side_effect = lambda attribute: href if attribute == "href" else None
     return item
+
+
+class BrowserStartupTest(unittest.TestCase):
+    def test_sandbox_probe_only_reports_the_known_failure(self):
+        def fail_probe(command, *, stderr, **_kwargs):
+            self.assertEqual(command[-1], "about:blank")
+            self.assertNotIn("--no-sandbox", command)
+            self.assertTrue(any(arg.startswith("--user-data-dir=") for arg in command))
+            stderr.write(b"Failed to move to new namespace: Operation not permitted\nprivate-driver-output")
+            stderr.flush()
+            process = MagicMock()
+            process.__enter__.return_value.wait.return_value = 1
+            return process
+
+        with TemporaryDirectory() as directory, patch("wg_delivery.sys.platform", "linux"), \
+                patch.dict("wg_delivery.os.environ", {"CHROME_BIN": "/usr/bin/chromium"}), \
+                patch("wg_delivery.webdriver.Chrome", side_effect=SessionNotCreatedException("private-exception")), \
+                patch("wg_delivery.subprocess.Popen", side_effect=fail_probe):
+            sender = BrowserSender(Path(directory) / "profile")
+            reason = sender.startup_problem()
+
+        self.assertEqual(reason, "Chromium kann seine Sandbox in dieser Laufzeitumgebung nicht starten.")
+
+    def test_successful_start_does_not_probe_or_visit_a_page(self):
+        with TemporaryDirectory() as directory, patch("wg_delivery.webdriver.Chrome") as chrome, \
+                patch("wg_delivery.subprocess.Popen") as probe:
+            sender = BrowserSender(Path(directory) / "profile")
+            self.assertIsNone(sender.startup_problem())
+            chrome.return_value.get.assert_not_called()
+            probe.assert_not_called()
+            sender.close()
 
 
 class SenderTest(unittest.TestCase):
