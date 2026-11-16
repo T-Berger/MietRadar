@@ -102,6 +102,48 @@ class OutgoingJudgeTest(unittest.TestCase):
         self.assertFalse(result.approved)
         self.assertIn("Besichtigungstermine", result.reason)
 
+    def test_first_message_blocks_ad_voice_and_verbatim_ad_sentences_even_when_reviewed(self):
+        head = "Hallo zusammen,\n\nich bin Mika und arbeite als Gärtner.\n\n"
+        ad_sentence = "Im Sommer treffen sich die Bewohner regelmäßig zum Frühstück im Innenhof."
+        for inserted in (
+            "Du kannst den WG-Alltag hier von Anfang an mitbestimmen.",
+            "Das Zimmer ist frisch gestrichen und verfügt über ein Einzelbett.",
+            ad_sentence,
+            "Wir vermieten ab Mai ein Zimmer.",
+        ):
+            with self.subTest(inserted=inserted), patch("outgoing_judge._generate_via_mistral") as complete:
+                verdict = judge_outgoing(
+                    head + inserted + "\n\nWann kann ich vorbeikommen?",
+                    first_message=True, provider="mistral", context=ad_sentence, user_reviewed=True,
+                )
+                self.assertFalse(verdict.approved)
+                self.assertIn("Anzeigensprache", verdict.reason)
+                complete.assert_not_called()
+
+    def test_first_message_allows_a_personal_reaction_to_a_concrete_detail(self):
+        verdict = judge_outgoing(
+            "Hi, ich bin Mika und arbeite als Gärtner.\n\n"
+            "Beim Frühstück im Innenhof wär ich gern mal dabei. Könnte ich vorbeikommen?",
+            first_message=True,
+            context="Im Sommer treffen sich die Bewohner regelmäßig zum Frühstück im Innenhof.",
+        )
+        self.assertTrue(verdict.approved)
+
+    def test_first_message_model_can_hold_a_listing_paraphrase(self):
+        with patch("outgoing_judge._generate_via_mistral",
+                   return_value='{"approved":false,"reason":"perspektive"}') as complete:
+            verdict = judge_outgoing(
+                "Hallo, ich bin Mika und arbeite als Gärtner.\n\n"
+                "Im Innenhof frühstücken die Bewohner im Sommer gern. Wann kann ich vorbeikommen?",
+                first_message=True, provider="mistral",
+                context="Im Sommer treffen sich die Bewohner regelmäßig zum Frühstück im Innenhof.",
+            )
+        self.assertFalse(verdict.approved)
+        self.assertIn("Anzeigensprache", verdict.reason)
+        system = complete.call_args.args[0]
+        self.assertIn("reine Ausstattungslisten", system)
+        self.assertIn("Nacherzählungen ohne persönliche Reaktion", system)
+
     def test_first_message_model_gets_listing_and_only_confirmed_answers_used(self):
         draft = (
             "Hi, ich bin Alex, 29, und arbeite als Webentwickler.\n\n"
