@@ -10,7 +10,7 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from contextlib import ExitStack, closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -123,6 +123,7 @@ class Scanner:
             SELECT d.id, d.url, d.fresh_at, d.basis, d.message, COALESCE(p.title, '')
             FROM drafts d LEFT JOIN listing_profiles p ON p.id = d.id
             WHERE d.done = 0 AND d.fresh_at BETWEEN ? AND ? AND d.message IS NOT NULL AND d.id NOT LIKE 'ka-%'
+              AND COALESCE(p.is_commercial, 0) = 0
               AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
               AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id)
               AND NOT EXISTS (SELECT 1 FROM application_reviews WHERE id = d.id)
@@ -184,7 +185,8 @@ class Scanner:
         if needs_judgment:
             review_outgoing(
                 db, item.id, item.message, kind="application", context=listing.description, provider=self.outgoing_provider,
-                now=now, first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True),
+                now=now, first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
+                                                         commercial=listing.is_commercial),
             )
         return None
 
@@ -290,7 +292,8 @@ class Scanner:
             set_application_wait_reason(db, item, None)
             result = self.reviewed_delivery.deliver(
                 db, item.id, item.url, item.message, item.fresh_at, self.max_age, context=listing.description,
-                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True), attachment=attachment,
+                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
+                                                commercial=listing.is_commercial), attachment=attachment,
             )
             if result:
                 counts[result] += 1
@@ -314,6 +317,10 @@ class Scanner:
             wg_template, self.provider, first_message=True, viewing_slots=viewing_slots,
             applicant_answers=self.applicant_answers,
         )
+        commercial_signature = self.render_signature and application_render_signature(
+            wg_template, self.provider, first_message=True, viewing_slots=viewing_slots,
+            applicant_answers=self.applicant_answers, commercial=True,
+        )
         first_eligible_day = cutoff.astimezone(BERLIN).date()
         current_day = now.astimezone(BERLIN).date()
         with db:
@@ -333,6 +340,7 @@ class Scanner:
                 self.router, self.template, self.provider, self.age, self.age_gap, self.klein_delivery,
                 outgoing_provider=self.outgoing_provider,
                 render_signature=self.render_signature,
+                applicant_intro=self.applicant_intro, applicant_answers=self.applicant_answers,
             )
             try:
                 counts.update(klein.scan(db, self.klein_alerts, now, cutoff, self.limit, retry_after))
@@ -368,12 +376,14 @@ class Scanner:
             refresh_limit = max(1, self.limit // 3)
             older_drafts = db.execute("""
                 SELECT d.url FROM drafts d LEFT JOIN draft_render_signatures s ON s.id = d.id
+                LEFT JOIN listing_profiles p ON p.id = d.id
                 WHERE d.id NOT LIKE 'ka-%' AND d.done = 0 AND d.message IS NOT NULL
-                  AND d.fresh_at BETWEEN ? AND ? AND COALESCE(s.signature, '') != ?
+                  AND d.fresh_at BETWEEN ? AND ? AND COALESCE(s.signature, '') !=
+                      CASE WHEN p.is_commercial = 1 THEN ? ELSE ? END
                   AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
                   AND NOT EXISTS (SELECT 1 FROM application_reviews WHERE id = d.id)
                 ORDER BY d.fresh_at DESC LIMIT ?
-            """, (cutoff.timestamp(), now.timestamp(), wg_signature, refresh_limit)).fetchall()
+            """, (cutoff.timestamp(), now.timestamp(), commercial_signature, wg_signature, refresh_limit)).fetchall()
             refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
 
         metadata_backfill = db.execute("""
@@ -431,12 +441,14 @@ class Scanner:
             if ref.id in retry_after:
                 continue
             draft = db.execute(
-                """SELECT d.fresh_at, d.message, d.done, s.state, d.basis, r.signature, a.state FROM drafts d
+                """SELECT d.fresh_at, d.message, d.done, s.state, d.basis, r.signature, a.state, p.is_commercial FROM drafts d
                    LEFT JOIN delivery s ON s.id = d.id LEFT JOIN draft_render_signatures r ON r.id = d.id
                    LEFT JOIN application_reviews a ON a.id = d.id
+                   LEFT JOIN listing_profiles p ON p.id = d.id
                    WHERE d.id = ?""", (ref.id,),
             ).fetchone()
-            refresh_draft = bool(draft and not draft[6] and wg_signature and draft[5] != wg_signature)
+            expected_signature = commercial_signature if draft and draft[7] else wg_signature
+            refresh_draft = bool(draft and not draft[6] and expected_signature and draft[5] != expected_signature)
             skip_draft = bool(draft and (not draft[1] or draft[2] or draft[3] or draft[6] or
                                        (not refresh_draft and (not self.delivery or self.delivery.paused))))
             if skip_draft and ref.id not in metadata_ids:
@@ -467,6 +479,13 @@ class Scanner:
                 counts["Inserate derzeit nicht abrufbar"] += 1
                 retry_after[ref.id] = now + timedelta(minutes=5)
                 continue
+            if draft and draft[7] and not listing.is_commercial:
+                listing = replace(listing, is_commercial=True)
+            if draft and not (draft[2] or draft[3] or draft[6]) and draft[1] and self.render_signature:
+                expected_signature = commercial_signature if listing.is_commercial else wg_signature
+                if draft[5] != expected_signature:
+                    refresh_draft = True
+                    skip_draft = False
             record_listing_profile(db, listing)
             if reason := self._check_availability(db, listing, now):
                 counts[reason] += 1
@@ -579,7 +598,7 @@ class Scanner:
                 retry_after[listing.id] = now + (self.max_age if tier == "outside" else timedelta(minutes=10))
                 continue
             first_message = FirstMessageReview(listing.title, self.applicant_intro, self.viewing_availability,
-                                               self.applicant_answers)
+                                               self.applicant_answers, commercial=listing.is_commercial)
             if draft and not refresh_draft:
                 with db:
                     remove_secondary_offer(db, listing.id)
@@ -589,13 +608,14 @@ class Scanner:
                     wg_template, listing.description, listing_url=listing.url, listing_title=listing.title,
                     provider=self.provider, listing_type="wg" if listing.is_wg else "wohnung", first_message=True,
                     viewing_slots=viewing_slots, applicant_answers=self.applicant_answers,
-                    applicant_intro=self.applicant_intro,
+                    applicant_intro=self.applicant_intro, commercial=listing.is_commercial,
                 )
                 with db:
                     saved = save_application_draft(
                         db, listing.id, listing.url, fresh_at.timestamp(), basis, message,
                         context=listing.description, provider=self.outgoing_provider, now=now,
-                        signature=wg_signature, previous_message=draft[1] if draft else None,
+                        signature=commercial_signature if listing.is_commercial else wg_signature,
+                        previous_message=draft[1] if draft else None,
                         first_message=first_message,
                     )
                     remove_secondary_offer(db, listing.id)
@@ -772,6 +792,8 @@ def main() -> int:
                     TransitRouter(os.getenv("MUNICH_TRANSIT_API_URL")), template, provider,
                     outgoing_provider=_outgoing_provider(),
                     render_signature=application_render_signature(template, provider),
+                    applicant_intro=os.getenv("MUNICH_APPLICANT_INTRO", "").strip() or applicant_intro_from_template(template),
+                    applicant_answers=applicant_answers(os.getenv("MUNICH_APPLICANT_ANSWERS", "")),
                 )
                 saved, message = klein.check_address(db, args.id, args.address, now, now - max_age)
                 print(message)

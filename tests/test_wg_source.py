@@ -77,6 +77,25 @@ class PublicPageTests(unittest.TestCase):
         """})
         self.assertEqual(self.source.details(ref).photo_urls, (f"{cdn}/matched.jpg",))
 
+    def test_distinguishes_the_company_contact_from_business_wg_and_unrelated_links(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/wg-zimmer-in-Muenchen.123.html")
+        ad = """
+            <h1 class="detailed-view-title">WG-Zimmer in München</h1>
+            <div id="freitext_0">Business-WG für Berufstätige.
+                <a href="/profile/company/anderes-unternehmen.789.html">Firma aus der Nachbarschaft</a>
+            </div>
+            <div class="rhs_contact_information"><a href="https://example.org/profile/company/fremd.999.html">Verifiziert</a></div>
+        """
+        self.stub_pages({ref.url: ad + '<div class="contact_box_sticky">Private:r Nutzer:in</div>'})
+        self.assertFalse(self.source.details(ref).is_commercial)
+
+        self.stub_pages({ref.url: ad + '''
+            <div class="contact_box_sticky">
+                <a href="/profile/company/vermietung.456.html">Zum Profil</a>
+            </div>
+        '''})
+        self.assertTrue(self.source.details(ref).is_commercial)
+
     def test_visit_order_keeps_update_time_separate_from_publication(self):
         def card(listing_id, age, class_name="", partner=""):
             return f"""

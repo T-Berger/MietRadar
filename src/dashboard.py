@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from dashboard_auth import logout_button, require_authentication
 from dashboard_data import (
     BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, ListingProfile, MapListing, Match,
-    Reply, SecondaryListing, load_dashboard, map_listings, weekend_dates,
+    ProviderFilter, Reply, SecondaryListing, filter_listing_providers, load_dashboard, map_listings, weekend_dates,
 )
 from munich_transit import HAUPTBAHNHOF, OSTBAHNHOF
 from reviewed_applications import (
@@ -39,6 +39,11 @@ SMALL_WORDS = {"am", "an", "auf", "für", "im", "in", "mit", "und", "von", "zu",
 WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
 RENT_LABELS = {"warm": "Warmmiete", "cold": "Kaltmiete", "total": "Gesamtmiete"}
 FIT_LABELS = {"strong": "Passt gut", "possible": "Könnte passen", "unclear": "Noch unklar"}
+PROVIDER_FILTER_LABELS: dict[ProviderFilter, str] = {
+    "all": "Alle Anbieter",
+    "commercial": "Gewerbliche Anbieter",
+    "other": "Privat oder nicht gekennzeichnet",
+}
 MAP_TIERS = {
     "a*": ("A* · bis 20 Min.", "#087660", "ab Hbf oder Ostbahnhof"),
     "a": ("A · bis 30 Min.", "#2557a5", "zum Hbf oder Ostbahnhof"),
@@ -163,7 +168,8 @@ def _map_facts(row: MapListing) -> str:
     if rent and (rent_kind := RENT_LABELS.get(row.rent_kind)):
         rent = f"{rent} {rent_kind}"
     area = _format_value(row.area_sqm, "m²")
-    return " · ".join(filter(None, (row.platform, f"{route} {direction}", rent, area)))
+    provider = "Gewerblich" if row.is_commercial else None
+    return " · ".join(filter(None, (row.platform, provider, f"{route} {direction}", rent, area)))
 
 
 def _listing_map(rows: tuple[MapListing, ...]) -> None:
@@ -276,10 +282,12 @@ def _listing_card(
     if note:
         sections.append(f'<p class="radar-listing__foot">{escape(note)}</p>')
     badge = f'<span class="radar-listing__badge">{escape(status)}</span>' if status else ""
+    provider = '<span class="radar-listing__badge">Gewerblich</span>' if profile and profile.is_commercial else ""
     photos = _listing_photos(profile.photo_urls) if profile else ""
     st.html(
         '<article class="radar-listing"><header>'
-        f'<div class="radar-listing__meta"><span class="radar-listing__source">{escape(platform)}</span>{badge}</div>'
+        f'<div class="radar-listing__meta"><span class="radar-listing__source">{escape(platform)}</span>'
+        f'{provider}{badge}</div>'
         f'<h3>{escape(title)}</h3></header>{photos}<div class="radar-listing__facts">{facts}</div>'
         f'{"".join(sections)}<p class="radar-listing__foot">{escape(date_label)}</p></article>'
     )
@@ -466,7 +474,7 @@ def _date_filter(today: date) -> tuple[DateBasis | None, tuple[date, date] | Non
 
 def _dated_offers(
     rows: tuple[DatedListing, ...], days: tuple[date, date] | None, basis: DateBasis,
-    wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile],
+    wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile], *, provider_filtered: bool = False,
 ) -> None:
     sightings = basis == "first_seen"
     st.subheader("Zuerst erfasste Mietangebote" if sightings else "Veröffentlichte Mietangebote", anchor=False)
@@ -479,8 +487,11 @@ def _dated_offers(
     if sightings:
         st.caption("Die erste Suche erfasst auch Anzeigen, die schon online sind.")
     if not rows:
-        st.info("Für diesen Zeitraum gibt es keine Erstsichtungen ohne Veröffentlichungsdatum." if sightings else
-                "Für diesen Zeitraum wurde kein Veröffentlichungsdatum bestätigt. Unter „Zuerst gesehen“ stehen die Erstsichtungen ohne Datum.")
+        if provider_filtered:
+            st.info("Für diesen Zeitraum gibt es keine Angebote dieses Anbietertyps.")
+        else:
+            st.info("Für diesen Zeitraum gibt es keine Erstsichtungen ohne Veröffentlichungsdatum." if sightings else
+                    "Für diesen Zeitraum wurde kein Veröffentlichungsdatum bestätigt. Unter „Zuerst gesehen“ stehen die Erstsichtungen ohne Datum.")
         return
     if len(rows) == RESULT_LIMIT:
         st.caption(f"Anzeige auf {RESULT_LIMIT} Ergebnisse begrenzt.")
@@ -598,6 +609,7 @@ def main() -> None:
         st.header("MietRadar")
         st.button("Aktualisieren", icon=":material/refresh:")
         date_basis, date_window = _date_filter(now.astimezone(BERLIN).date())
+        provider = st.selectbox("Anbietertyp", tuple(PROVIDER_FILTER_LABELS), format_func=PROVIDER_FILTER_LABELS.__getitem__)
         logout_button()
 
     db_path = directory / "munich_radar.sqlite3"
@@ -609,6 +621,7 @@ def main() -> None:
     if data.status != "ready":
         st.warning("Die MietRadar-Daten konnten gerade nicht gelesen werden. Aktualisiere die Seite in Kürze.")
         return
+    data = filter_listing_providers(data, provider)
     if notice := st.session_state.pop(_REVIEW_NOTICE, None):
         st.success(notice)
 
@@ -636,7 +649,8 @@ def main() -> None:
             else:
                 _credit_proof(db_path, attachment)
         if date_basis:
-            _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan, data.listing_profiles)
+            _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan, data.listing_profiles,
+                          provider_filtered=provider != "all")
         else:
             _matches(data.matches, hours, data.wg_scan, data.listing_profiles, db_path,
                      review_available=data.application_reviews_available,

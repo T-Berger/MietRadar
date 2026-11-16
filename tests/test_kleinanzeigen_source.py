@@ -101,6 +101,29 @@ Wohnfläche: 75 m²
         self.assertEqual((listing.available_from, listing.available_until), (date(2026, 12, 15), date(2027, 4, 15)))
         self.assertIsNone(listing.published_at)
 
+    def test_commercial_status_is_scoped_to_the_ad_with_an_explicit_provider_label(self):
+        email = EmailMessage()
+        email["From"] = SENDER
+        email.set_content(f"{ROOM}\n\nAnbietertyp: Gewerblich\n{FLAT}")
+        email.add_alternative(f'''<body>
+          <article><a href="{ROOM}">Zimmer in einer Business-WG</a></article>
+          <article><a href="{FLAT}">Wohnung</a><div>Wohnfläche: 53 m²</div></article>
+        </body>''', subtype="html")
+        room, flat = extract_listings(email.as_bytes(), SENDER)
+        self.assertFalse(room.is_commercial)
+        self.assertTrue(flat.is_commercial)
+
+        email.clear_content()
+        email.set_content(f"{ROOM}\n{FLAT}")
+        # A shared wrapper or another listing cannot supply a provider type.
+        email.add_alternative(f'''<section><p>Gewerblicher Anbieter</p>
+          <article><a href="{ROOM}">Zimmer</a><span>Anbietertyp</span><span>Gewerblich</span></article>
+          <article><a href="{FLAT}">Wohnung</a></article>
+        </section>''', subtype="html")
+        room, flat = extract_listings(email.as_bytes(), SENDER)
+        self.assertTrue(room.is_commercial)
+        self.assertFalse(flat.is_commercial)
+
     def test_keeps_a_move_in_month_found_only_in_the_plain_alternate(self):
         email = EmailMessage()
         email["From"] = SENDER

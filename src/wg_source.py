@@ -34,6 +34,7 @@ _SEARCH_PATTERN = re.compile(
     r"\.[0-9]+\.[0-9]+(?:\+[0-9]+)*\.1\.[0-9]+\.html)",
     re.IGNORECASE,
 )
+_COMPANY_PROFILE = re.compile(r"/profile/company/[^/]+\.[0-9]+\.html", re.I)
 _BERLIN = ZoneInfo("Europe/Berlin")
 _LAYOUT_LIMIT = 4 * 1024 * 1024
 _NUMBER = r"(?:[0-9]{1,3}(?:[. ][0-9]{3})+(?:,[0-9]{1,2})?|[0-9]{1,7}(?:[,.][0-9]{1,2})?)"
@@ -107,6 +108,7 @@ class Listing:
     photo_urls: tuple[str, ...] = ()
     available_from: date | None = None
     available_until: date | None = None
+    is_commercial: bool = False
 
 
 def _search_url(url):
@@ -375,6 +377,16 @@ def _detail_group(soup, label):
     return []
 
 
+def _commercial_provider(soup) -> bool:
+    # Company profiles in the contact panel identify the poster. A company
+    # mentioned in the listing body or a sponsor elsewhere does not.
+    for link in soup.select(".rhs_contact_information a[href], .contact_box_sticky a[href], .bottom_contact_box a[href]"):
+        parts = _public_parts(link["href"])
+        if parts and _COMPANY_PROFILE.fullmatch(unquote(parts.path)):
+            return True
+    return False
+
+
 def _parse_candidates(soup):
     results = []
     for card in soup.select("a.wgg-list-card.offer_list_item[data-id]"):
@@ -544,4 +556,5 @@ class WGSource:
             photo_urls=_detail_photos(soup, ref.id),
             available_from=available_from,
             available_until=available_until,
+            is_commercial=_commercial_provider(soup),
         )

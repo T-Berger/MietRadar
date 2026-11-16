@@ -180,3 +180,16 @@ class OutgoingJudgeTest(unittest.TestCase):
         self.assertEqual(payload["antwortthemen"], ["haustiere", "rauchen"])
         self.assertEqual(payload["verwendete_antworten"], {"rauchen": "Ich rauche nicht."})
         self.assertNotIn("Hund", raw_payload)
+
+    def test_commercial_message_accepts_sie_and_omits_private_hobbies_from_profile(self):
+        intro = "Ich bin Alex Neumann, 31. Ich arbeite als Architekt. In meiner Freizeit koche ich gern."
+        draft = ("Guten Tag,\n\nmein Name ist Alex Neumann. Ich arbeite als Architekt.\n\n"
+                 "Ich interessiere mich für Ihre Wohnung. Könnten Sie mir einen Besichtigungstermin vorschlagen?")
+        with patch("outgoing_judge._generate_via_mistral",
+                   return_value='{"approved":true,"reason":"ok"}') as complete:
+            verdict = judge_outgoing(draft, commercial=True, applicant_intro=intro, provider="mistral")
+        self.assertTrue(verdict.approved)
+        system, payload, _ = complete.call_args.args
+        self.assertIn("Sie-Anrede", system)
+        self.assertNotIn("Ein gemeinsamer Kochabend klingt gut", system)
+        self.assertEqual(json.loads(payload)["vorstellung"], "Mein Name ist Alex Neumann. Ich arbeite als Architekt.")
