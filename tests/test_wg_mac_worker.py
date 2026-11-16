@@ -7,10 +7,14 @@ import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+from selenium.common.exceptions import TimeoutException
 
 from munich_delivery import DeliveryOutcome
-from wg_mac_worker import Relay, RelayError, RelayTemporaryError, process_next, read_token
+from wg_mac_worker import (
+    Relay, RelayError, RelayTemporaryError, UnconfirmedDelivery, _check_browser, _poll_jobs, process_next, read_token,
+)
 from wg_source import Listing, WGAccessBlocked, WGListingGone
 
 
@@ -95,6 +99,50 @@ class MacWorkerTests(unittest.TestCase):
             process_next(self.relay, self.browser, self.source)
         self.assertEqual([call.args[0] for call in self.relay.post.call_args_list], ["next", "prepare", "claim"])
 
+    def test_unconfirmed_delivery_can_only_continue_after_railway_records_outcome(self):
+        def send(_url, _message, claim, **_kwargs):
+            self.assertTrue(claim())
+            return DeliveryOutcome.UNCONFIRMED
+
+        self.browser.send.side_effect = send
+        self.relay.post.side_effect = [
+            self.next_job, self.prepared, {"claimed": True}, {"recorded": True},
+        ]
+        with self.assertRaises(UnconfirmedDelivery):
+            process_next(self.relay, self.browser, self.source)
+        self.assertEqual(self.relay.post.call_args.args[1], {**JOB, "outcome": "unconfirmed"})
+        self.relay.post.side_effect = [
+            self.next_job, self.prepared, {"claimed": True}, {"recorded": False},
+        ]
+        with self.assertRaises(RelayError) as error:
+            process_next(self.relay, self.browser, self.source)
+        self.assertNotIsInstance(error.exception, UnconfirmedDelivery)
+
+    def test_visible_worker_checks_inbox_in_a_new_tab_before_polling_again(self):
+        driver = self.browser._browser.return_value
+        with (patch("wg_mac_worker.process_next") as process,
+              patch("wg_mac_worker._check_browser") as check,
+              self.assertLogs("wg_mac_worker", level="WARNING")):
+            def next_poll(*_args):
+                if process.call_count == 1:
+                    raise UnconfirmedDelivery("Versand unbestätigt")
+                driver.switch_to.new_window.assert_called_once_with("tab")
+                check.assert_called_once_with(self.browser, manual=True, keep_waiting=True)
+                raise KeyboardInterrupt
+
+            process.side_effect = next_poll
+            with self.assertRaises(KeyboardInterrupt):
+                _poll_jobs(self.relay, self.browser, visible=True)
+        self.assertEqual(process.call_count, 2)
+        driver.close.assert_not_called()
+
+    def test_headless_worker_stops_after_unconfirmed_delivery(self):
+        with patch("wg_mac_worker.process_next", side_effect=UnconfirmedDelivery("Versand unbestätigt")) as process:
+            with self.assertRaises(UnconfirmedDelivery):
+                _poll_jobs(self.relay, self.browser, visible=False)
+        process.assert_called_once()
+        self.browser._browser.assert_not_called()
+
     def test_withdrawn_approval_prevents_submission(self):
         self.relay.post.side_effect = [
             self.next_job, self.prepared, {"claimed": False}, {"recorded": False},
@@ -133,6 +181,18 @@ class MacWorkerTests(unittest.TestCase):
         for url in ("http://mietradar.example", "https://mietradar.example/api", "https://user@mietradar.example"):
             with self.subTest(url=url), self.assertRaises(RelayError):
                 Relay(url, "a" * 43)
+
+    def test_visible_run_keeps_waiting_in_the_same_browser_until_login_completes(self):
+        self.browser.startup_problem.return_value = None
+        driver = self.browser._browser.return_value
+        with (patch("wg_mac_worker._inbox_state", return_value=("login", [])),
+              patch("wg_mac_worker.WebDriverWait") as waiter, patch("builtins.print")):
+            waiter.return_value.until.side_effect = [TimeoutException(), "ready"]
+            _check_browser(self.browser, manual=True, keep_waiting=True)
+        self.assertEqual(waiter.return_value.until.call_count, 2)
+        driver.get.assert_called_once_with("https://www.wg-gesucht.de/nachrichten.html")
+        self.browser._browser.assert_called_once()
+        self.browser.close.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -37,6 +38,7 @@ _VERIFICATION = (
 _BLOCKED_TITLES = ("überprüfung", "access denied", "just a moment", "zugriff verweigert", "captcha")
 _BROWSER_STARTUP = "Chromium startet nicht. Prüfe Browser, ChromeDriver und das Browserprofil."
 _BROWSER_SANDBOX = "Chromium kann seine Sandbox in dieser Laufzeitumgebung nicht starten."
+LOG = logging.getLogger(__name__)
 
 
 class BrowserStartupError(WebDriverException):
@@ -125,6 +127,9 @@ class BrowserSender:
             options.add_argument(f"--user-data-dir={self.profile.resolve()}")
             options.add_argument("--lang=de-DE")
             options.add_argument("--window-size=1280,900")
+            if sys.platform == "darwin":
+                # Reopen the dedicated profile with the same Keychain as native Chrome.
+                options.add_experimental_option("excludeSwitches", ["use-mock-keychain", "password-store"])
             if self.headless:
                 options.add_argument("--headless=new")
                 options.add_argument("--disable-dev-shm-usage")
@@ -286,6 +291,12 @@ class BrowserSender:
         if listing is None or not text.strip():
             return DeliveryOutcome.UNAVAILABLE
         claimed = False
+        phase = "Versand reserviert"
+
+        def unconfirmed() -> DeliveryOutcome:
+            LOG.info("WG-Gesucht: Versand nicht bestätigt. Letzte Stufe: %s.", phase)
+            return DeliveryOutcome.UNCONFIRMED
+
         try:
             if attachment is not None:
                 attachment = attachment.resolve(strict=True)
@@ -324,7 +335,9 @@ class BrowserSender:
             claimed = True
             if attachment is not None:
                 # Selecting the file may start an upload, so the approved send is reserved above.
+                phase = "Anhang auswählen"
                 field.send_keys(str(attachment))
+                phase = "Anhang im Formular prüfen"
 
                 def ready_after_upload(browser):
                     if self._composer_state(browser, listing) != "ready" or _visible(browser, _FORM_ERROR) is not None:
@@ -335,11 +348,13 @@ class BrowserSender:
 
                 submit = wait.until(ready_after_upload)
                 if submit == DeliveryOutcome.UNCONFIRMED or area.get_property("value") != text:
-                    return DeliveryOutcome.UNCONFIRMED
+                    return unconfirmed()
+            phase = "Auf Senden klicken"
             submit.click()
+            phase = "Klick auf Senden abgeschlossen; auf Bestätigung warten"
             attachment_name = attachment.name if attachment is not None else None
             wait.until(lambda browser: self._blocked(browser) or self._confirmed(browser, listing, text, attachment_name))
             return (DeliveryOutcome.SENT if self._confirmed(driver, listing, text, attachment_name)
-                    else DeliveryOutcome.UNCONFIRMED)
+                    else unconfirmed())
         except (TimeoutException, WebDriverException, OSError):
-            return DeliveryOutcome.UNCONFIRMED if claimed else DeliveryOutcome.BLOCKED
+            return unconfirmed() if claimed else DeliveryOutcome.BLOCKED

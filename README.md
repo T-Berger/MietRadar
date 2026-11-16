@@ -160,6 +160,12 @@ scripts/install-wg-mac-relay.sh "$relay_origin" "$sender_dir/relay-token"
 
 Das Protokoll steht im Ordner `~/Library/Application Support/MietRadar WG/worker.log`. Falls WG-Gesucht eine erneute Anmeldung verlangt, führe `login` erneut aus und starte den Dienst mit `launchctl kickstart "gui/$(id -u)/com.mietradar.wg-sender"`.
 
+Falls Chrome für die Anmeldung geöffnet bleiben soll, installiere den Dienst mit sichtbarem Browser. Melde dich im Fenster des Dienstes bei WG-Gesucht an, öffne das Postfach und lass dieses Fenster geöffnet. Der Dienst verwendet diesen Browser direkt für freigegebene Bewerbungen.
+
+```bash
+MUNICH_WG_MAC_VISIBLE=1 scripts/install-wg-mac-relay.sh "$relay_origin" "$sender_dir/relay-token"
+```
+
 Mit [Railway SSH](https://docs.railway.com/cli/ssh) kannst du Entwürfe und Versandstatus lesen:
 
 ```bash

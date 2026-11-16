@@ -25,7 +25,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
 
 from munich_delivery import DeliveryOutcome
@@ -59,6 +59,10 @@ class RelayError(RuntimeError):
 
 class RelayTemporaryError(RelayError):
     """The worker can retry while keeping the approval queued."""
+
+
+class UnconfirmedDelivery(RelayError):
+    """Railway recorded the attempted delivery without a WG-Gesucht receipt."""
 
 
 class NoRedirects(HTTPRedirectHandler):
@@ -264,7 +268,7 @@ def process_next(relay: Relay, sender: BrowserSender, source: WGSource) -> bool:
     if outcome is DeliveryOutcome.BLOCKED:
         raise RelayError("WG-Gesucht braucht eine Anmeldung oder Bestätigung im lokalen Browser.")
     if outcome is DeliveryOutcome.UNCONFIRMED:
-        raise RelayError("WG-Gesucht hat den Versand nicht bestätigt. Prüfe das Postfach.")
+        raise UnconfirmedDelivery("WG-Gesucht hat den Versand nicht bestätigt. Prüfe das Postfach.")
     if outcome is DeliveryOutcome.SENT:
         LOG.info("WG-Gesucht hat eine Bewerbung bestätigt.")
     return True
@@ -315,7 +319,7 @@ def _await_native_profile_release(profile: Path) -> None:
             time.sleep(2)
 
 
-def _check_browser(sender: BrowserSender, *, manual: bool = False) -> None:
+def _check_browser(sender: BrowserSender, *, manual: bool = False, keep_waiting: bool = False) -> None:
     problem = sender.startup_problem()
     if problem:
         raise RelayError(problem)
@@ -323,7 +327,9 @@ def _check_browser(sender: BrowserSender, *, manual: bool = False) -> None:
         driver = sender._browser()
         driver.get(f"{BASE_URL}/nachrichten.html")
         if manual:
-            print("Melde dich im geöffneten Chrome-Fenster bei WG-Gesucht an.", flush=True)
+            if (state := _inbox_state(sender, driver)) and state[0] == "ready":
+                return
+            print("Melde dich im geöffneten Chrome-Fenster bei WG-Gesucht an und öffne das Postfach.", flush=True)
 
         def inbox_ready(browser):
             state = _inbox_state(sender, browser)
@@ -331,7 +337,14 @@ def _check_browser(sender: BrowserSender, *, manual: bool = False) -> None:
                 return state[0]
             return None
 
-        state = WebDriverWait(driver, 300 if manual else 12).until(inbox_ready)
+        wait = WebDriverWait(driver, 300 if manual else 12)
+        while True:
+            try:
+                state = wait.until(inbox_ready)
+                break
+            except TimeoutException:
+                if not keep_waiting:
+                    raise
         if state == "ready":
             return
     except (OSError, WebDriverException):
@@ -352,15 +365,38 @@ def _check_relay(relay: Relay, *, retry: bool) -> None:
             time.sleep(_RETRY_SECONDS)
 
 
+def _poll_jobs(relay: Relay, sender: BrowserSender, *, visible: bool) -> None:
+    source = WGSource(DEFAULT_SEARCH_URLS)
+    while True:
+        try:
+            more = process_next(relay, sender, source)
+            time.sleep(2 if more else _POLL_SECONDS)
+        except UnconfirmedDelivery as error:
+            if not visible:
+                raise
+            LOG.warning("%s Der bisherige Tab bleibt zur Prüfung offen.", error)
+            try:
+                sender._browser().switch_to.new_window("tab")
+            except (OSError, WebDriverException):
+                raise RelayError("Chrome konnte keinen neuen Tab für den weiteren Versand öffnen.") from None
+            _check_browser(sender, manual=True, keep_waiting=True)
+        except RelayTemporaryError as error:
+            LOG.warning("%s", error)
+            time.sleep(_RETRY_SECONDS)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("login", "check", "run"))
     parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
     parser.add_argument("--relay-url")
     parser.add_argument("--token-file", type=Path, default=DEFAULT_TOKEN_FILE)
+    parser.add_argument("--visible", action="store_true", help="Chrome beim Versand sichtbar geöffnet halten")
     args = parser.parse_args()
     if args.command != "login" and not args.relay_url:
         parser.error("--relay-url ist für check und run erforderlich")
+    if args.visible and args.command != "run":
+        parser.error("--visible ist für run vorgesehen")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     def stop(_signum, _frame):
@@ -371,27 +407,20 @@ def main() -> int:
         relay = None if args.command == "login" else Relay(args.relay_url, read_token(args.token_file.expanduser()))
         profile = args.profile.expanduser()
         with _profile_lock(profile, wait=args.command == "run"):
-            sender = BrowserSender(profile, headless=args.command != "login")
+            sender = BrowserSender(profile, headless=args.command != "login" and not args.visible)
             try:
                 if relay:
                     _check_relay(relay, retry=args.command == "run")
                 if args.command == "run":
                     _await_native_profile_release(profile)
-                _check_browser(sender, manual=args.command == "login")
+                _check_browser(sender, manual=args.command == "login" or args.visible, keep_waiting=args.visible)
                 if args.command != "run":
                     print("WG-Gesucht-Anmeldung und Postfach sind erreichbar.")
                     if relay:
                         print("Railway-Verbindung erfolgreich geprüft.")
                     return 0
                 LOG.info("Mit Railway verbunden. Der lokale WG-Gesucht-Browser ist angemeldet.")
-                source = WGSource(DEFAULT_SEARCH_URLS)
-                while True:
-                    try:
-                        more = process_next(relay, sender, source)
-                        time.sleep(2 if more else _POLL_SECONDS)
-                    except RelayTemporaryError as error:
-                        LOG.warning("%s", error)
-                        time.sleep(_RETRY_SECONDS)
+                _poll_jobs(relay, sender, visible=args.visible)
             finally:
                 sender.close()
     except KeyboardInterrupt:

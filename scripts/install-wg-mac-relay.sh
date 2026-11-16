@@ -10,6 +10,11 @@ if [[ "$(uname -s)" != Darwin || "$(id -u)" == 0 ]]; then
     echo "Run this from your macOS desktop account." >&2
     exit 2
 fi
+visible="${MUNICH_WG_MAC_VISIBLE:-0}"
+if [[ "$visible" != 0 && "$visible" != 1 ]]; then
+    echo "Set MUNICH_WG_MAC_VISIBLE to 0 or 1." >&2
+    exit 2
+fi
 
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
 state_dir="$HOME/Library/Application Support/MietRadar WG"
@@ -91,12 +96,12 @@ fi
 touch "$log_file"
 chmod 600 "$log_file"
 
-"$python" - "$stage_dir/agent.plist" "$label" "$python" "$worker_dir" "$profile" "$1" "$token_file" "$log_file" <<'PY'
+"$python" - "$stage_dir/agent.plist" "$label" "$python" "$worker_dir" "$profile" "$1" "$token_file" "$log_file" "$visible" <<'PY'
 import plistlib
 import sys
 from pathlib import Path
 
-plist, label, python, worker_dir, profile, relay_url, token_file, log_file = sys.argv[1:]
+plist, label, python, worker_dir, profile, relay_url, token_file, log_file, visible = sys.argv[1:]
 job = {
     "Label": label,
     "ProgramArguments": [
@@ -108,6 +113,8 @@ job = {
     "StandardOutPath": log_file,
     "StandardErrorPath": log_file,
 }
+if visible == "1":
+    job["ProgramArguments"].append("--visible")
 with open(plist, "wb") as stream:
     plistlib.dump(job, stream)
 PY
