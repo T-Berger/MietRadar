@@ -136,6 +136,16 @@ def _fact(label: str, value: str | None) -> str:
     )
 
 
+def _primary_route(profile: ListingProfile | None) -> tuple[str, tuple[str, str]]:
+    if profile and profile.route_tier == "a*":
+        category, direction, limit = "A*", "Ab Hbf oder Ostbahnhof", 20
+    else:
+        category, direction, limit = "A", "Zum Hbf oder Ostbahnhof", 30
+    minutes = profile.route_minutes if profile else None
+    duration = f"{minutes} Min." if isinstance(minutes, int) and 0 <= minutes <= limit else f"Bis zu {limit} Min."
+    return category, (direction, duration)
+
+
 def _listing_photos(photo_urls: tuple[str, ...]) -> str:
     if not photo_urls:
         return ""
@@ -305,9 +315,16 @@ def _matches(
         st.info(f"Keine passenden Angebote in den letzten {hours} Stunden.")
         return
     platform = st.selectbox("Plattform", ["Alle", *platforms]) if len(platforms) > 1 else "Alle"
+    category = st.selectbox("ÖPNV-Kategorie", ["A* und A", "A*", "A"])
+    shown = False
     for row in rows:
         if platform != "Alle" and row.platform != platform:
             continue
+        profile = profiles.get(row.id)
+        tier, route = _primary_route(profile)
+        if category not in ("A* und A", tier):
+            continue
+        shown = True
         with st.container(border=True):
             date_label = f"{row.basis.capitalize()} · {_date(row.fresh_at)}"
             if row.basis == "zuerst gesehen":
@@ -323,13 +340,14 @@ def _matches(
             if row.state == "queued" and row.review_reason:
                 status = "Freigegeben · Versand verzögert"
             _listing_card(
-                profiles.get(row.id), title=_headline(row.url), platform=row.platform,
-                status=f"A · {status}", date_label=f"{date_label} · {row.id}",
-                route=("Zum Hbf oder Ostbahnhof", "Bis zu 30 Min."),
+                profile, title=_headline(row.url), platform=row.platform,
+                status=f"{tier} · {status}", date_label=f"{date_label} · {row.id}", route=route,
             )
             _location_link(row.url)
             _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
                          attachment=attachment)
+    if not shown:
+        st.info("Keine Angebote mit diesen Filtern.")
 
 
 def _scan_status(wg_scan: tuple[float, int] | None) -> None:
@@ -381,8 +399,14 @@ def _dated_offers(
                               " · Veröffentlichungsdatum unbekannt")
             else:
                 date_label = _posting_day(row.day)
-            _listing_card(profiles.get(row.id), title=_headline(row.url), platform=row.platform,
-                          status="Filter erfüllt" if row.matched else "Erfasst", date_label=date_label)
+            profile = profiles.get(row.id)
+            status = "Filter erfüllt" if row.matched else "Erfasst"
+            route = None
+            if row.matched and profile and profile.route_tier in {"a*", "a"}:
+                tier, route = _primary_route(profile)
+                status = f"{tier} · {status}"
+            _listing_card(profile, title=_headline(row.url), platform=row.platform,
+                          status=status, date_label=date_label, route=route)
             _location_link(row.url)
 
 

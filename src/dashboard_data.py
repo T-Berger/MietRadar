@@ -47,6 +47,8 @@ class ListingProfile:
     fit: str | None
     fit_reason: str | None
     photo_urls: tuple[str, ...] = ()
+    route_tier: str | None = None
+    route_minutes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -307,20 +309,24 @@ def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[s
     if "listing_profiles" not in tables or not ids:
         return {}
     placeholders = ", ".join("?" for _ in ids)
-    photo_column = "photo_urls" if "photo_urls" in _columns(db, "listing_profiles") else "NULL"
+    columns = _columns(db, "listing_profiles")
+    photo_column = "photo_urls" if "photo_urls" in columns else "NULL"
+    route_columns = "route_tier, route_minutes" if {"route_tier", "route_minutes"} <= columns else "NULL, NULL"
     rows = db.execute(f"""
-        SELECT id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, {photo_column}
+        SELECT id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, {photo_column}, {route_columns}
         FROM listing_profiles WHERE id IN ({placeholders})
     """, tuple(ids))
     profiles = {}
-    for listing_id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photos_json in rows:
+    for listing_id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photos_json, tier, minutes in rows:
         try:
             photos = json.loads(photos_json) if photos_json else []
         except (ValueError, TypeError):
             photos = []
         platform = "ka" if listing_id.startswith("ka-") else "wg"
         photo_urls = listing_photo_urls(photos, platform=platform) if isinstance(photos, list) else ()
-        profiles[listing_id] = ListingProfile(title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photo_urls)
+        profiles[listing_id] = ListingProfile(
+            title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photo_urls, tier, minutes,
+        )
     return profiles
 
 

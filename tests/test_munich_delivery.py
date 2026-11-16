@@ -175,6 +175,7 @@ class DeliveryTest(unittest.TestCase):
         listing = offer(1, None)
         sender = RecordingSender()
         scanner, message = self.reviewed_scanner(sender, listing)
+        scanner.router.classify.return_value = ("a*", 20)
         with patch("munich_delivery.judge_outgoing", return_value=OutgoingJudgment(True, "ok")) as judge:
             self.assertEqual(scanner.send_reviewed(self.db, NOW, {})["Bewerbung gesendet"], 1)
             self.assertFalse(scanner.send_reviewed(self.db, NOW, {}))

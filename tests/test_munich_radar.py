@@ -65,7 +65,8 @@ class ScannerTest(unittest.TestCase):
         source.candidates.return_value = [ref(item) for item in listing_by_id.values()]
         source.details.side_effect = lambda candidate: listing_by_id[candidate.id]
         router = Mock()
-        router.classify.side_effect = lambda address, now: (None, None) if address == no_route.address else ("a", None)
+        ratings = {fresh.address: ("a*", 19), older.address: ("a", None), no_route.address: (None, None)}
+        router.classify.side_effect = lambda address, now: ratings[address]
         scanner = Scanner(source, router, "Hi {name},\n\nich bin 28.\n\n{LLM_TEXT}\n\nViele Grüße", "none", timedelta(days=1), 12)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "radar.sqlite3"
@@ -77,6 +78,8 @@ class ScannerTest(unittest.TestCase):
                 queued = db.execute("SELECT id, message FROM drafts ORDER BY fresh_at DESC").fetchall()
                 self.assertEqual([row[0] for row in queued], [fresh.id, older.id])
                 self.assertNotIn("{LLM_TEXT}", queued[0][1])
+                self.assertEqual(db.execute("SELECT route_tier, route_minutes FROM listing_profiles WHERE id = ?",
+                                            (fresh.id,)).fetchone(), ("a*", 19))
             with closing(_database(path)) as db:
                 self.assertEqual(scanner.scan(db, NOW, {})["neue Entwürfe"], 0)
                 scanner.scan(db, NOW + timedelta(days=2), {})
@@ -128,6 +131,25 @@ class ScannerTest(unittest.TestCase):
                                  (NOW.timestamp(), (later + timedelta(hours=1)).timestamp(), None))
                 self.assertEqual(db.execute("SELECT published_at FROM wg_observations WHERE id = ?", (stale.id,)).fetchone(),
                                  (stale.published_at.timestamp(),))
+        delivery.deliver.assert_not_called()
+
+    def test_backfills_current_wg_draft_priority_without_editing_text(self):
+        listing = offer(1, 1)
+        source, router, delivery = Mock(), Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.return_value = []
+        source.details.return_value = listing
+        router.classify.return_value = ("a*", 20)
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 12, delivery=delivery)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Mein Entwurf', 0)",
+                           (listing.id, listing.url, listing.published_at.timestamp()))
+                db.execute("INSERT INTO listing_profiles(id, title, photo_urls) VALUES (?, ?, '[]')",
+                           (listing.id, listing.title))
+            scanner.scan(db, NOW, {})
+            self.assertEqual(db.execute("SELECT route_tier, route_minutes FROM listing_profiles").fetchone(), ("a*", 20))
+            self.assertEqual(db.execute("SELECT message FROM drafts").fetchone(), ("Mein Entwurf",))
         delivery.deliver.assert_not_called()
 
     def test_failed_inventory_does_not_advance_the_baseline_and_a_long_gap_resets_it(self):
@@ -256,7 +278,8 @@ class ScannerTest(unittest.TestCase):
             with db:
                 db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Vorhandener Entwurf', 0)",
                            (listing.id, listing.url, listing.published_at.timestamp()))
-                db.execute("INSERT INTO listing_profiles(id, title) VALUES (?, ?)", (listing.id, listing.title))
+                db.execute("INSERT INTO listing_profiles(id, title, route_tier) VALUES (?, ?, 'a')",
+                           (listing.id, listing.title))
             self.assertEqual(scanner.scan(db, NOW, {})["Inserate mit Fotos ergänzt"], 1)
             self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Inserate mit Fotos ergänzt"], 0)
             self.assertEqual(db.execute("SELECT photo_urls FROM listing_profiles").fetchone(), (f'["{photo}"]',))

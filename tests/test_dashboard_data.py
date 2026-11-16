@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from dashboard_data import load_dashboard, weekend_dates
+from listing_profiles import record_listing_route
 from munich_radar import _database
 
 
@@ -83,6 +84,8 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.secondary_offers, ())
         self.assertEqual(data.listing_profiles["12"].title, "Zimmer am Park")
         self.assertEqual(data.listing_profiles["12"].photo_urls, ())
+        self.assertIsNone(data.listing_profiles["12"].route_tier)
+        self.assertIsNone(data.listing_profiles["12"].route_minutes)
         self.assertIsNone(data.wg_scan)
 
     def test_wg_reply_drafts_merge_with_kleinanzeigen_and_keep_only_safe_conversation_links(self):
@@ -173,6 +176,7 @@ class DashboardDataTest(unittest.TestCase):
             photos = json.dumps([photo_url, unrelated_photo, "javascript:alert(1)", photo_url])
             db.execute("UPDATE listing_profiles SET photo_urls = ? WHERE id = '12'", (photos,))
             db.execute("UPDATE listing_profiles SET photo_urls = '[invalid' WHERE id = 'ka-77'")
+            record_listing_route(db, "12", "a*", 20)
 
         data = load_dashboard(self.path, now=NOW)
         self.assertEqual(set(data.listing_profiles), {"12", "ka-77"})
@@ -182,6 +186,7 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual((profile.summary, profile.fit, profile.fit_reason),
                          ("Das Zimmer ist möbliert.", "strong", "Nah am Ostbahnhof."))
         self.assertEqual(profile.photo_urls, (photo_url,))
+        self.assertEqual((profile.route_tier, profile.route_minutes), ("a*", 20))
         self.assertIsNone(data.listing_profiles["ka-77"].rent_eur)
         self.assertEqual(data.listing_profiles["ka-77"].photo_urls, ())
 

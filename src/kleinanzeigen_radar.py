@@ -9,11 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from kleinanzeigen_source import extract_listings, normalize_munich_address
-from listing_profiles import ROUTE_FIT, record_listing_profile
+from listing_profiles import ROUTE_FIT, record_listing_profile, record_listing_route
 from llm_personalizer import personalise_message
 from munich_delivery import DeliveryQueue, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer
-from munich_transit import TransitRouter
+from munich_transit import PRIMARY_TIERS, TransitRouter
 from wg_alerts import AlertsInbox
 from wg_preferences import rejection_reason
 
@@ -73,12 +73,15 @@ class KleinanzeigenRadar:
             record_listing_profile(db, listing)
             if listing.id in retry_after:
                 continue
-            draft = db.execute("""SELECT d.fresh_at, d.done, s.state, o.address, d.basis, d.message, r.signature
+            draft = db.execute("""SELECT d.fresh_at, d.done, s.state, o.address, d.basis, d.message, r.signature,
+                p.route_tier
                 FROM drafts d LEFT JOIN delivery s ON s.id = d.id LEFT JOIN klein_origins o ON o.id = d.id
-                LEFT JOIN draft_render_signatures r ON r.id = d.id WHERE d.id = ?
+                LEFT JOIN draft_render_signatures r ON r.id = d.id
+                LEFT JOIN listing_profiles p ON p.id = d.id WHERE d.id = ?
             """, (listing.id,)).fetchone()
             refresh = bool(draft and self.render_signature and draft[5] and draft[6] != self.render_signature)
-            if draft and (draft[1] or draft[2] or (not refresh and (not self.delivery or self.delivery.paused))):
+            if draft and (draft[1] or draft[2] or
+                          (draft[7] is not None and not refresh and (not self.delivery or self.delivery.paused))):
                 continue
             stamp = listing.published_at or received_at
             basis = "veröffentlicht" if listing.published_at else "Suchalarm erhalten"
@@ -121,8 +124,9 @@ class KleinanzeigenRadar:
             fit, fit_reason = ROUTE_FIT.get(tier, ("unclear", "Die ÖPNV-Verbindung konnte nicht geprüft werden."
                                                   if address else "Die genaue Adresse fehlt."))
             record_listing_profile(db, listing, fit=fit, reason=fit_reason,
-                                   provider=self.provider if tier != "outside" else "none")
-            if tier == "a":
+                                   provider=self.provider if tier != "outside" else "none",
+                                   route_tier=tier, route_minutes=minutes)
+            if tier in PRIMARY_TIERS:
                 checked_routes.add(listing.id)
                 if refresh:
                     if self._save(db, listing.id, listing.url, listing.description, listing.is_wg,
@@ -187,8 +191,12 @@ class KleinanzeigenRadar:
                 break
             if listing_id in retry_after:
                 continue
-            if listing_id not in checked_routes and self.router.qualifies(address, now) is not True:
-                continue
+            if listing_id not in checked_routes:
+                tier, minutes = self.router.classify(address, now)
+                with db:
+                    record_listing_route(db, listing_id, tier, minutes)
+                if tier not in PRIMARY_TIERS:
+                    continue
             result = self.delivery.deliver(db, listing_id, url, message, datetime.fromtimestamp(fresh_at, timezone.utc), send_window)
             if result:
                 counts[f"Kleinanzeigen: {result}"] += 1
@@ -223,11 +231,12 @@ class KleinanzeigenRadar:
         fit, reason = ROUTE_FIT.get(tier, ("unclear", "Die ÖPNV-Verbindung konnte nicht geprüft werden."))
         with db:
             db.execute("UPDATE listing_profiles SET fit = ?, fit_reason = ? WHERE id = ?", (fit, reason, listing_id))
+            record_listing_route(db, listing_id, tier, minutes)
         if tier in _SECONDARY_STATIONS and minutes is not None:
             self._save_secondary_offer(db, listing_id, url, title, datetime.fromtimestamp(fresh_at, timezone.utc),
                                        basis, tier, minutes)
             return True, f"In Liste {tier.upper()} gespeichert. Ab {_SECONDARY_STATIONS[tier]} dauert es {minutes} Minuten mit dem ÖPNV."
-        if tier != "a":
+        if tier not in PRIMARY_TIERS:
             return False, "Die ÖPNV-Fahrt konnte nicht geprüft werden." if tier is None else "Keine passende ÖPNV-Verbindung gefunden."
         saved = self._save(db, listing_id, url, excerpt, bool(is_wg), fresh_at, basis, origin, now, title=title)
         return saved, "Entwurf gespeichert. Der Versandstatus steht unter delivery." if saved else "Der Treffer wurde bereits verarbeitet."
