@@ -96,6 +96,8 @@ def recent_wg_messages(sender: BrowserSender, *, limit: int = 10) -> tuple[WGInb
     from selenium.common.exceptions import TimeoutException, WebDriverException
     from selenium.webdriver.support.ui import WebDriverWait
 
+    from wg_delivery import BrowserStartupError
+
     if limit <= 0:
         return ()
     try:
@@ -103,7 +105,9 @@ def recent_wg_messages(sender: BrowserSender, *, limit: int = 10) -> tuple[WGInb
         wait = WebDriverWait(driver, 8)
         driver.get(f"{_ORIGIN}{_INBOX_PATH}")
         state, links = wait.until(lambda browser: _inbox_state(sender, browser))
-        if state == "login" and sender._login(driver, wait):
+        if state == "login":
+            if not sender._login(driver, wait):
+                raise WGInboxError("Für das Postfach fehlt eine WG-Gesucht-Anmeldung. Prüfe WG_EMAIL und WG_PASSWORD.")
             driver.get(f"{_ORIGIN}{_INBOX_PATH}")
             state, links = wait.until(lambda browser: _inbox_state(sender, browser))
         if state != "ready":
@@ -119,5 +123,7 @@ def recent_wg_messages(sender: BrowserSender, *, limit: int = 10) -> tuple[WGInb
             except TimeoutException:
                 continue  # A thread can be unavailable while the rest of the inbox still works.
         return tuple(entries)
+    except BrowserStartupError as error:
+        raise WGInboxError(error.msg) from None
     except (OSError, WebDriverException):
         raise WGInboxError("Das WG-Gesucht-Postfach konnte gerade nicht gelesen werden.") from None

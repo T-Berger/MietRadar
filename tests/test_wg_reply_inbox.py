@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 
 from selenium.common.exceptions import TimeoutException
 
+from wg_delivery import BrowserStartupError
 from wg_reply_inbox import WGInboxEntry, WGInboxError, recent_wg_messages
 
 
@@ -106,3 +107,14 @@ class WGReplyInboxTests(unittest.TestCase):
         with self.assertRaisesRegex(WGInboxError, "Anmeldung oder Bestätigung"):
             recent_wg_messages(self.sender)
         self.sender._login.assert_not_called()
+
+    def test_missing_login_and_browser_startup_are_distinguished(self):
+        self.needs_login = True
+        self.sender._login.return_value = False
+        with self.assertRaisesRegex(WGInboxError, "WG_EMAIL und WG_PASSWORD"):
+            recent_wg_messages(self.sender)
+
+        reason = "Chromium kann seine Sandbox in dieser Laufzeitumgebung nicht starten."
+        self.sender._browser.side_effect = BrowserStartupError(reason)
+        with self.assertRaisesRegex(WGInboxError, "Chromium kann seine Sandbox"):
+            recent_wg_messages(self.sender)

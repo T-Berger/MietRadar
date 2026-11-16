@@ -29,7 +29,9 @@ from llm_personalizer import (
 from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import TransitRouter
-from reviewed_applications import fail_application_review, get_application_attachment, pending_application_reviews
+from reviewed_applications import (
+    fail_application_review, get_application_attachment, pending_application_reviews, set_application_wait_reason,
+)
 from wg_alerts import AlertsError, AlertsInbox
 from wg_first_message import applicant_answers, viewing_availability, viewing_slot_labels
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
@@ -108,6 +110,7 @@ class Scanner:
     applicant_intro: str = ""
     viewing_availability: tuple[datetime, ...] = ()
     applicant_answers: dict[str, str] = field(default_factory=dict)
+    reviewed_startup_problem: Callable[[], str | None] | None = None
 
     def add_intro_to_current_drafts(self, db: sqlite3.Connection, now: datetime) -> int:
         """Clean up recent unedited drafts using the cached listing title."""
@@ -139,12 +142,31 @@ class Scanner:
 
     def send_reviewed(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         counts = Counter()
-        if self.reviewed_delivery is None or self.reviewed_delivery.paused:
+        if self.reviewed_delivery is None:
             return counts
         for listing_id in [key for key, deadline in retry_after.items() if deadline <= now]:
             del retry_after[listing_id]
-        for item in pending_application_reviews(db, now, self.max_age):
-            if retry_after.get(item.id, now) > now or self.reviewed_delivery.paused:
+        ready = [item for item in pending_application_reviews(db, now, self.max_age)
+                 if item.id not in retry_after]
+        if not ready:
+            return counts
+        retry_at = now + timedelta(minutes=5)
+        startup_problem = (
+            self.reviewed_startup_problem()
+            if self.reviewed_startup_problem is not None and not self.reviewed_delivery.paused
+            else None
+        )
+        for item in ready:
+            if self.reviewed_delivery.paused:
+                set_application_wait_reason(
+                    db, item, "Versand ist pausiert. Prüfe den letzten Versandversuch im WG-Gesucht-Postfach.",
+                )
+                retry_after[item.id] = retry_at
+                continue
+            if startup_problem:
+                set_application_wait_reason(db, item, startup_problem)
+                retry_after[item.id] = retry_at
+                counts["Freigaben warten auf Versandbrowser"] += 1
                 continue
             ref = ListingRef.from_url(item.url)
             try:
@@ -153,7 +175,10 @@ class Scanner:
                 fail_application_review(db, item, "Die Anzeige ist nicht mehr verfügbar.", now)
                 continue
             except WGSourceError:
-                retry_after[item.id] = now + timedelta(minutes=5)
+                set_application_wait_reason(
+                    db, item, "Die Anzeige konnte bei WG-Gesucht gerade nicht geprüft werden. MietRadar versucht es erneut.",
+                )
+                retry_after[item.id] = retry_at
                 counts["Freigaben warten auf WG-Gesucht"] += 1
                 continue
             cutoff = now - min(self.max_age, timedelta(hours=24))
@@ -172,7 +197,10 @@ class Scanner:
                 continue
             tier, _ = self.router.classify(listing.address, now) if listing.address else (None, None)
             if tier is None:
-                retry_after[item.id] = now + timedelta(minutes=5)
+                set_application_wait_reason(
+                    db, item, "Die ÖPNV-Fahrzeit konnte gerade nicht bestätigt werden. MietRadar prüft sie erneut.",
+                )
+                retry_after[item.id] = retry_at
                 counts["Freigaben warten auf ÖPNV-Prüfung"] += 1
                 continue
             if tier != "a":
@@ -182,6 +210,7 @@ class Scanner:
             if item.attachment_digest and attachment is None:
                 fail_application_review(db, item, "Der freigegebene Anhang steht nicht mehr zur Verfügung.", now)
                 continue
+            set_application_wait_reason(db, item, None)
             result = self.reviewed_delivery.deliver(
                 db, item.id, item.url, item.message, item.fresh_at, self.max_age, context=listing.description,
                 first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True), attachment=attachment,
@@ -662,6 +691,7 @@ def main() -> int:
                     queue = DeliveryQueue(sender, limit, judge_provider=outgoing_provider)
                     if reviewed_send:
                         scanner.reviewed_delivery = queue
+                        scanner.reviewed_startup_problem = sender.startup_problem
                     elif auto_send:
                         scanner.delivery = queue
                     if wg_reply_drafts:

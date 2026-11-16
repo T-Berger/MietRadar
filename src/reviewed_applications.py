@@ -53,6 +53,10 @@ _PENDING = """
       AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
       AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id)
 """
+_EXACT_APPROVAL = """
+    WHERE id = ? AND state = 'queued' AND message_hash = ? AND updated_at = ? AND attachment_digest IS ?
+      AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = application_reviews.id)
+"""
 
 
 def install_application_reviews(db: sqlite3.Connection) -> None:
@@ -278,11 +282,15 @@ def review_is_pending(
     return bool(row and _wg_listing(listing_id, row[1]) and row[4] == _hash(message))
 
 
+def set_application_wait_reason(db: sqlite3.Connection, row: ReviewedApplication, reason: str | None) -> None:
+    """Show why the exact approval is waiting without changing its identity."""
+    with db:
+        db.execute("UPDATE application_reviews SET reason = ?" + _EXACT_APPROVAL + " AND reason IS NOT ?",
+                   (reason, row.id, row.message_hash, row.updated_at, row.attachment_digest, reason))
+
+
 def fail_application_review(db: sqlite3.Connection, row: ReviewedApplication, reason: str, now: datetime) -> None:
     """Record a worker failure only for the approval it actually checked."""
     with db:
-        db.execute("""
-            UPDATE application_reviews SET state = 'failed', reason = ?, updated_at = ?
-            WHERE id = ? AND state = 'queued' AND message_hash = ? AND updated_at = ? AND attachment_digest IS ?
-              AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = application_reviews.id)
-        """, (reason, now.timestamp(), row.id, row.message_hash, row.updated_at, row.attachment_digest))
+        db.execute("UPDATE application_reviews SET state = 'failed', reason = ?, updated_at = ?" + _EXACT_APPROVAL,
+                   (reason, now.timestamp(), row.id, row.message_hash, row.updated_at, row.attachment_digest))
