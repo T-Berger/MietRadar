@@ -45,6 +45,38 @@ class PublicPageTests(unittest.TestCase):
         ):
             self.assertIsNone(ListingRef.from_url(url), url)
 
+    def test_extracts_only_public_offer_gallery_photos(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/wohnungen-in-Muenchen.123.html")
+        cdn = "https://img.wg-gesucht.de/media/up/2026/45"
+        self.stub_pages({ref.url: f"""
+            <meta property="og:image" content="{cdn}/outside.large.JPEG">
+            <h1 class="detailed-view-title">Wohnung in München</h1>
+            <div id="WG-Pictures"><div id="gallery_slides">
+                <div class="sp-slide"><img class="sp-image" src="img/d.gif"
+                    data-src="{cdn}/room.large.JPEG" data-medium="https://img.wg-gesucht.de/./media/up/2026/45/room.sized.JPEG?track=secret#display"></div>
+                <div class="sp-slide"><img class="sp-image" src="{cdn}/room.large.JPEG"></div>
+                <div class="sp-slide"><img class="sp-image" src="https://img.wg-gesucht.de.evil.example/media/up/evil.jpg"></div>
+                <div class="sp-slide"><img class="sp-image" src="https://img.wg-gesucht.de:443/media/up/blocked.jpg"></div>
+                <div class="sp-slide"><img class="sp-image" src="https://img.wg-gesucht.de/media/up/%2e%2e/profile.jpg"></div>
+                <div class="sp-slide"><img class="sp-image" src="{cdn}/kitchen.large.JPEG"></div>
+            </div></div>
+        """})
+        listing = self.source.details(ref)
+        self.assertEqual(listing.photo_urls, (f"{cdn}/room.sized.JPEG", f"{cdn}/kitchen.large.JPEG"))
+
+    def test_photo_metadata_is_scoped_to_the_current_ad(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/wohnungen-in-Muenchen.123.html")
+        cdn = "https://img.wg-gesucht.de/media/up/2026/45"
+        metadata = json.dumps([
+            {"@type": "RealEstateListing", "url": f"{BASE_URL}/456.html", "image": f"{cdn}/unrelated.jpg"},
+            {"@type": "RealEstateListing", "url": ref.url, "image": [{"contentUrl": f"{cdn}/matched.jpg"}]},
+        ])
+        self.stub_pages({ref.url: f"""
+            <h1 class="detailed-view-title">Wohnung in München</h1>
+            <script type="application/ld+json">{metadata}</script>
+        """})
+        self.assertEqual(self.source.details(ref).photo_urls, (f"{cdn}/matched.jpg",))
+
     def test_visit_order_keeps_update_time_separate_from_publication(self):
         def card(listing_id, age, class_name="", partner=""):
             return f"""

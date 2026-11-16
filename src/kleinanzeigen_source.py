@@ -11,6 +11,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 from bs4 import BeautifulSoup, Tag
 
+from listing_photos import listing_photo_urls
 from wg_source import Listing, RentKind, parse_area_sqm, parse_rent_eur, rent_kind_for_label
 
 _HOSTS = {"www.kleinanzeigen.de", "kleinanzeigen.de"}
@@ -82,28 +83,36 @@ def _line_address(lines: list[str]) -> tuple[str | None, range]:
     return None, range(0)
 
 
-def _html_lines(link: Tag, ref: _Reference) -> list[str]:
+def _html_card(link: Tag, ref: _Reference) -> tuple[list[str], tuple[str, ...]]:
     # Ascend inside one listing card only. A wrapper shared with another
     # listing cannot provide an address or preferences for this one.
     lines: list[str] = []
+    photo_nodes = list(link.select("img"))
     for node in link.parents:
         if not isinstance(node, Tag) or node.name in {"body", "html", "[document]"}:
             break
-        other_listing = any(
-            href_ref.id != ref.id
-            for anchor in node.select("a[href]")
-            if (href_ref := _reference(anchor["href"], rentals_only=False)) is not None
-        )
-        if other_listing:
+        links = [_reference(anchor["href"], rentals_only=False) for anchor in node.select("a[href]")]
+        if any(linked.id != ref.id for linked in links if linked is not None):
             break
         candidates = [_clean(text) for text in node.get_text("\n", strip=True).splitlines()]
         candidates = [text for text in candidates if text]
         if sum(map(len, candidates)) > 1500 or len(candidates) > 24:
             break
         lines = candidates
+        # Email newsletters also use table cells as cards. An unlinked photo can
+        # belong to that cell when every link there points to this same listing.
+        image_is_scoped = node.name in {"article", "li", "td", "tr", "table"} and all(links)
+        for image in node.select("img"):
+            anchor = image.find_parent("a", href=True)
+            linked = _reference(anchor["href"], rentals_only=False) if anchor else None
+            if (linked and linked.id == ref.id) or (not anchor and image_is_scoped):
+                photo_nodes.append(image)
         if node.name in {"article", "li"}:
             break
-    return lines
+    photos = listing_photo_urls((value for image in photo_nodes
+                                 if not any(image.get(key) == "1" for key in ("width", "height"))
+                                 for value in (image.get("src"), image.get("data-src"))), platform="ka")
+    return lines, photos
 
 
 def _alert_facts(lines: list[str], *, is_wg: bool) -> tuple[float | None, RentKind | None, float | None]:
@@ -143,7 +152,7 @@ def _alert_facts(lines: list[str], *, is_wg: bool) -> tuple[float | None, RentKi
     return None, None, area
 
 
-def _listing(ref: _Reference, title: str, lines: list[str]) -> Listing:
+def _listing(ref: _Reference, title: str, lines: list[str], photo_urls: tuple[str, ...] = ()) -> Listing:
     address, address_lines = _line_address(lines)
     rent_eur, rent_kind, area_sqm = _alert_facts(lines, is_wg=ref.is_wg)
     area = None
@@ -157,7 +166,7 @@ def _listing(ref: _Reference, title: str, lines: list[str]) -> Listing:
     return Listing(
         id=ref.id, url=ref.url, title=title, description="\n".join(dict.fromkeys(text)),
         published_at=None, address=address, district=area, is_wg=ref.is_wg,
-        rent_eur=rent_eur, rent_kind=rent_kind, area_sqm=area_sqm,
+        rent_eur=rent_eur, rent_kind=rent_kind, area_sqm=area_sqm, photo_urls=photo_urls,
     )
 
 
@@ -170,6 +179,7 @@ def _with_fallback_facts(primary: Listing, fallback: Listing) -> Listing:
         rent_eur=fallback.rent_eur if use_fallback_rent else primary.rent_eur,
         rent_kind=fallback.rent_kind if use_fallback_rent else primary.rent_kind,
         area_sqm=primary.area_sqm if primary.area_sqm is not None else fallback.area_sqm,
+        photo_urls=listing_photo_urls((*primary.photo_urls, *fallback.photo_urls), platform="ka"),
     )
 
 
@@ -202,7 +212,8 @@ def extract_listings(raw: bytes, sender: str) -> list[Listing]:
         title = _clean(link.get_text(" "))
         if title.casefold() in _GENERIC_LINK:
             title = ""
-        listing = _listing(ref, title, _html_lines(link, ref))
+        lines, photo_urls = _html_card(link, ref)
+        listing = _listing(ref, title, lines, photo_urls)
         existing = results.get(ref.id)
         if not existing:
             results[ref.id] = listing

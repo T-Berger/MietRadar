@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
+
+from listing_photos import listing_photo_urls
 
 
 _TABLE_COLUMNS = {
@@ -39,6 +42,7 @@ class ListingProfile:
     summary: str | None
     fit: str | None
     fit_reason: str | None
+    photo_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -249,11 +253,21 @@ def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[s
     if "listing_profiles" not in tables or not ids:
         return {}
     placeholders = ", ".join("?" for _ in ids)
+    photo_column = "photo_urls" if "photo_urls" in _columns(db, "listing_profiles") else "NULL"
     rows = db.execute(f"""
-        SELECT id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason
+        SELECT id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, {photo_column}
         FROM listing_profiles WHERE id IN ({placeholders})
     """, tuple(ids))
-    return {listing_id: ListingProfile(*profile) for listing_id, *profile in rows}
+    profiles = {}
+    for listing_id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photos_json in rows:
+        try:
+            photos = json.loads(photos_json) if photos_json else []
+        except (ValueError, TypeError):
+            photos = []
+        platform = "ka" if listing_id.startswith("ka-") else "wg"
+        photo_urls = listing_photo_urls(photos, platform=platform) if isinstance(photos, list) else ()
+        profiles[listing_id] = ListingProfile(title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photo_urls)
+    return profiles
 
 
 def _dated_listings(

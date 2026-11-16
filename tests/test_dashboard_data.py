@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -68,6 +69,11 @@ class DashboardDataTest(unittest.TestCase):
             db.execute("CREATE TABLE delivery (id TEXT)")
             db.execute("INSERT INTO drafts VALUES (?, ?, ?, ?, ?, ?)",
                        ("12", "https://www.wg-gesucht.de/12.html?sample=1", NOW.timestamp(), "Suchalarm", "Hallo", 0))
+            db.execute("""CREATE TABLE listing_profiles (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, rent_eur REAL, rent_kind TEXT,
+                area_sqm REAL, summary TEXT, fit TEXT, fit_reason TEXT
+            )""")
+            db.execute("INSERT INTO listing_profiles (id, title) VALUES ('12', 'Zimmer am Park')")
 
         data = load_dashboard(self.path, now=NOW)
         self.assertEqual(data.status, "ready")
@@ -75,7 +81,8 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.matches[0].url, "https://www.wg-gesucht.de/12.html")
         self.assertEqual(data.address_checks, ())
         self.assertEqual(data.secondary_offers, ())
-        self.assertEqual(data.listing_profiles, {})
+        self.assertEqual(data.listing_profiles["12"].title, "Zimmer am Park")
+        self.assertEqual(data.listing_profiles["12"].photo_urls, ())
         self.assertIsNone(data.wg_scan)
 
     def test_current_secondary_offers_are_separate_from_primary_matches(self):
@@ -115,6 +122,8 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.secondary_offers[0].url, "https://www.wg-gesucht.de/12.html")
 
     def test_loads_listing_profiles_for_visible_cards_only(self):
+        photo_url = "https://img.wg-gesucht.de/media/up/2026/43/" + "a" * 64 + "_179317855502694671775502672029.sized.JPEG"
+        unrelated_photo = "https://img.kleinanzeigen.de/api/v1/prod-ads/images/16/00000000-0000-4000-8000-000000000000?rule=%24_59.AUTO"
         with closing(_database(self.path)) as db, db:
             db.execute("""CREATE TABLE IF NOT EXISTS listing_profiles (
                 id TEXT PRIMARY KEY, title TEXT NOT NULL, rent_eur REAL, rent_kind TEXT,
@@ -131,6 +140,9 @@ class DashboardDataTest(unittest.TestCase):
                 ("ka-77", "Zwei Zimmer", None, None, 44, None, "unclear", "Miete offen."),
                 ("999", "Unbekannte Anzeige", None, None, None, None, None, None),
             ])
+            photos = json.dumps([photo_url, unrelated_photo, "javascript:alert(1)", photo_url])
+            db.execute("UPDATE listing_profiles SET photo_urls = ? WHERE id = '12'", (photos,))
+            db.execute("UPDATE listing_profiles SET photo_urls = '[invalid' WHERE id = 'ka-77'")
 
         data = load_dashboard(self.path, now=NOW)
         self.assertEqual(set(data.listing_profiles), {"12", "ka-77"})
@@ -139,7 +151,9 @@ class DashboardDataTest(unittest.TestCase):
                          ("Zimmer am Park", 780.5, "warm", 18.5))
         self.assertEqual((profile.summary, profile.fit, profile.fit_reason),
                          ("Das Zimmer ist möbliert.", "strong", "Nah am Ostbahnhof."))
+        self.assertEqual(profile.photo_urls, (photo_url,))
         self.assertIsNone(data.listing_profiles["ka-77"].rent_eur)
+        self.assertEqual(data.listing_profiles["ka-77"].photo_urls, ())
 
     def test_shows_latest_public_inventory_count_even_without_matches(self):
         current = NOW.timestamp()

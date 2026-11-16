@@ -154,6 +154,7 @@ class Scanner:
             )
             refs = [(ref, None) for ref in candidates]
 
+        refresh_refs = []
         if self.render_signature:
             older_drafts = db.execute("""
                 SELECT d.url FROM drafts d LEFT JOIN draft_render_signatures s ON s.id = d.id
@@ -163,10 +164,26 @@ class Scanner:
                 ORDER BY d.fresh_at DESC LIMIT ?
             """, (cutoff.timestamp(), now.timestamp(), self.render_signature, self.limit)).fetchall()
             refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
-            seen = {ref.id for ref, _ in refs}
-            refs.extend((ref, stamp) for ref, stamp in refresh_refs if ref.id not in seen)
-            prioritized = {ref.id for ref, _ in refresh_refs}
-            refs.sort(key=lambda row: row[0].id not in prioritized)
+
+        photo_backfill = db.execute("""
+            SELECT f.url FROM (
+                SELECT id, url, fresh_at FROM drafts WHERE done = 0 AND message IS NOT NULL
+                UNION ALL
+                SELECT id, url, fresh_at FROM munich_secondary_offers
+            ) f LEFT JOIN listing_profiles p ON p.id = f.id
+            WHERE f.id NOT LIKE 'ka-%' AND p.photo_urls IS NULL AND f.fresh_at BETWEEN ? AND ?
+            GROUP BY f.id ORDER BY MAX(f.fresh_at) DESC LIMIT ?
+        """, (cutoff.timestamp(), now.timestamp(), (self.limit + 1) // 2)).fetchall()
+        photo_refs = [ref for url, in photo_backfill if (ref := ListingRef.from_url(url))]
+        photo_ids = {ref.id for ref in photo_refs}
+        original_ids = {ref.id for ref, _ in refs}
+        refresh_ids = {ref.id for ref, _ in refresh_refs}
+        queued_ids = original_ids.copy()
+        for ref in [ref for ref, _ in refresh_refs] + photo_refs:
+            if ref.id not in queued_ids:
+                refs.append((ref, None))
+                queued_ids.add(ref.id)
+        refs.sort(key=lambda row: (row[0].id not in refresh_ids, row[0].id not in photo_ids))
 
         eligible = []
         detail_reads = 0
@@ -179,8 +196,9 @@ class Scanner:
                    WHERE d.id = ?""", (ref.id,),
             ).fetchone()
             refresh_draft = bool(draft and self.render_signature and draft[5] != self.render_signature)
-            if draft and (not draft[1] or draft[2] or draft[3] or
-                          (not refresh_draft and (not self.delivery or self.delivery.paused))):
+            skip_draft = bool(draft and (not draft[1] or draft[2] or draft[3] or
+                                       (not refresh_draft and (not self.delivery or self.delivery.paused))))
+            if skip_draft and ref.id not in photo_ids:
                 continue
             if detail_reads >= self.limit:
                 break
@@ -190,10 +208,18 @@ class Scanner:
             except WGListingGone:
                 with db:
                     remove_secondary_offer(db, ref.id)
+                    if ref.id in photo_ids:
+                        db.execute("""INSERT INTO listing_profiles(id, title, photo_urls) VALUES (?, '', '[]')
+                                      ON CONFLICT(id) DO UPDATE SET photo_urls = excluded.photo_urls""", (ref.id,))
                 counts["nicht mehr verfügbar"] += 1
                 retry_after[ref.id] = now + self.max_age
                 continue
             record_listing_profile(db, listing)
+            if ref.id in photo_ids:
+                if listing.photo_urls:
+                    counts["Inserate mit Fotos ergänzt"] += 1
+                if skip_draft or (ref.id not in original_ids and not refresh_draft):
+                    continue
 
             published_at = listing.published_at
             published_day = listing.published_day

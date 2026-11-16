@@ -9,6 +9,7 @@ import sqlite3
 from http.client import HTTPException
 
 from kleinanzeigen_judge import _redact
+from listing_photos import listing_photo_urls
 from llm_personalizer import _generate_via_mistral
 
 
@@ -35,9 +36,14 @@ def install_listing_profiles(db: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY, title TEXT NOT NULL,
             rent_eur REAL, rent_kind TEXT, area_sqm REAL,
             summary TEXT, fit TEXT, fit_reason TEXT,
-            summary_hash TEXT, summary_check TEXT
+            summary_hash TEXT, summary_check TEXT, photo_urls TEXT
         )
     """)
+    if not any(column[1] == "photo_urls" for column in db.execute("PRAGMA table_info(listing_profiles)")):
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            if not any(column[1] == "photo_urls" for column in db.execute("PRAGMA table_info(listing_profiles)")):
+                db.execute("ALTER TABLE listing_profiles ADD COLUMN photo_urls TEXT")
 
 
 def _plain(text: str, limit: int) -> str:
@@ -63,6 +69,8 @@ def record_listing_profile(
 ) -> None:
     title = _plain(listing.title, 240)
     description = _plain(listing.description, 1600)
+    photos = json.dumps(listing_photo_urls(listing.photo_urls,
+                                         platform="ka" if listing.id.startswith("ka-") else "wg"))
     source_hash = hashlib.sha256(f"{title}\n{description}".encode()).hexdigest()
     previous = db.execute("SELECT summary, summary_hash, summary_check FROM listing_profiles WHERE id = ?",
                           (listing.id,)).fetchone()
@@ -84,8 +92,8 @@ def record_listing_profile(
     with db:
         db.execute("""
             INSERT INTO listing_profiles
-                (id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, summary_hash, summary_check)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, summary_hash, summary_check, photo_urls)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = COALESCE(NULLIF(excluded.title, ''), listing_profiles.title),
                 rent_eur = COALESCE(excluded.rent_eur, listing_profiles.rent_eur),
@@ -96,6 +104,9 @@ def record_listing_profile(
                 fit = COALESCE(excluded.fit, listing_profiles.fit),
                 fit_reason = COALESCE(excluded.fit_reason, listing_profiles.fit_reason),
                 summary_hash = COALESCE(excluded.summary_hash, listing_profiles.summary_hash),
-                summary_check = COALESCE(excluded.summary_check, listing_profiles.summary_check)
+                summary_check = COALESCE(excluded.summary_check, listing_profiles.summary_check),
+                photo_urls = CASE WHEN excluded.photo_urls = '[]' AND excluded.id LIKE 'ka-%'
+                                  THEN COALESCE(listing_profiles.photo_urls, '[]')
+                                  ELSE excluded.photo_urls END
         """, (listing.id, title, listing.rent_eur, listing.rent_kind, listing.area_sqm, summary,
-              fit, reason, cached_hash, check))
+              fit, reason, cached_hash, check, photos))

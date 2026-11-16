@@ -45,6 +45,18 @@ INTRO = """
   .radar-listing__source { font-weight: 650; }
   .radar-listing__badge { padding: .15rem .55rem; border-radius: .45rem; font-size: .76rem; font-weight: 650;
     background: #e1efed; color: #224a44; }
+  .radar-listing__photos { display: grid; gap: .55rem; }
+  .radar-listing__photo { position: relative; display: block; overflow: hidden; border-radius: .7rem;
+    background: rgba(78, 133, 123, .12); }
+  .radar-listing__photo::before { content: 'Inseratsfoto'; position: absolute; inset: 0; display: grid;
+    place-items: center; color: var(--text-color); opacity: .75; font-size: .85rem; }
+  .radar-listing__photo img { position: relative; display: block; width: 100%; aspect-ratio: 16 / 9;
+    object-fit: cover; font-size: 0; }
+  .radar-listing__cover img { aspect-ratio: 2 / 1; max-height: 15rem; }
+  .radar-listing__gallery summary { cursor: pointer; font-size: .88rem; font-weight: 650; }
+  .radar-listing__gallery[open] summary { margin-bottom: .6rem; }
+  .radar-listing__thumbnails { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(9rem, 100%), 1fr)); gap: .55rem; }
+  @media (max-width: 600px) { .radar-listing__cover img { aspect-ratio: 4 / 3; } }
   .radar-listing__facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(9rem, 100%), 1fr)); gap: .6rem; }
   .radar-listing__fact { background: rgba(78, 133, 123, .12); border-radius: .6rem; padding: .55rem .75rem; }
   .radar-listing__label { display: block; font-size: .78rem; opacity: .84; }
@@ -115,6 +127,27 @@ def _fact(label: str, value: str | None) -> str:
     )
 
 
+def _listing_photos(photo_urls: tuple[str, ...]) -> str:
+    if not photo_urls:
+        return ""
+
+    links = []
+    for position, url in enumerate(photo_urls, start=1):
+        source = escape(url, quote=True)
+        decoration = " radar-listing__cover" if position == 1 else ""
+        links.append(
+            f'<a class="radar-listing__photo{decoration}" href="{source}" target="_blank" '
+            f'rel="noopener noreferrer" aria-label="Inseratsfoto {position} in voller Größe öffnen">'
+            f'<img src="{source}" alt="Inseratsfoto {position}" loading="lazy" decoding="async" '
+            'referrerpolicy="no-referrer"></a>'
+        )
+    gallery = ""
+    if len(links) > 1:
+        gallery = ('<details class="radar-listing__gallery"><summary>Weitere Fotos</summary>'
+                   f'<div class="radar-listing__thumbnails">{"".join(links[1:])}</div></details>')
+    return f'<div class="radar-listing__photos">{links[0]}{gallery}</div>'
+
+
 def _listing_card(
     profile: ListingProfile | None, *, title: str, platform: str, status: str, date_label: str,
     route: tuple[str, str] | None = None, note: str | None = None,
@@ -138,10 +171,11 @@ def _listing_card(
     if note:
         sections.append(f'<p class="radar-listing__foot">{escape(note)}</p>')
     badge = f'<span class="radar-listing__badge">{escape(status)}</span>' if status else ""
+    photos = _listing_photos(profile.photo_urls) if profile else ""
     st.html(
         '<article class="radar-listing"><header>'
         f'<div class="radar-listing__meta"><span class="radar-listing__source">{escape(platform)}</span>{badge}</div>'
-        f'<h3>{escape(title)}</h3></header><div class="radar-listing__facts">{facts}</div>'
+        f'<h3>{escape(title)}</h3></header>{photos}<div class="radar-listing__facts">{facts}</div>'
         f'{"".join(sections)}<p class="radar-listing__foot">{escape(date_label)}</p></article>'
     )
 
