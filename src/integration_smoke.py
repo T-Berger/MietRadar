@@ -1,4 +1,4 @@
-"""Verify the configured IMAP or Resend integration from the deployed service."""
+"""Verify the configured IMAP or email integration from the deployed service."""
 
 from __future__ import annotations
 
@@ -15,13 +15,13 @@ from dotenv import load_dotenv
 from kleinanzeigen_activity import Activity, EmailNotifier, install_activity
 from kleinanzeigen_replies import extract_replies
 from kleinanzeigen_source import extract_listings
+from munich_radar import _email_notifier
 from wg_alerts import AlertsError, AlertsInbox
 
 
 _MAILBOX = ("MUNICH_IMAP_HOST", "MUNICH_IMAP_USER", "MUNICH_IMAP_PASSWORD")
 _ALERTS = (*_MAILBOX, "KLEINANZEIGEN_IMAP_FOLDER", "KLEINANZEIGEN_ALERT_SENDER")
 _REPLIES = (*_MAILBOX, "KLEINANZEIGEN_REPLIES_IMAP_FOLDER", "KLEINANZEIGEN_REPLY_SENDER")
-_EMAIL = ("RESEND_API_KEY", "MUNICH_NOTIFY_EMAIL_FROM", "MUNICH_NOTIFY_EMAIL_TO")
 
 
 def _check_inbox(values: list[str], now: datetime, *, replies: bool) -> int:
@@ -45,8 +45,7 @@ def _check_inbox(values: list[str], now: datetime, *, replies: bool) -> int:
     return 0
 
 
-def _check_email(values: list[str], now: datetime) -> int:
-    notifier = EmailNotifier(*values)
+def _check_email(notifier: EmailNotifier, now: datetime) -> int:
     with closing(sqlite3.connect(":memory:")) as db:
         install_activity(db)
         Activity(
@@ -55,9 +54,9 @@ def _check_email(values: list[str], now: datetime) -> int:
         ).save(db)
         sent, accepted = notifier.flush(db, now)
     if accepted and sent == 1:
-        print("Resend accepted the test notification. Check the configured inbox to verify delivery.")
+        print(f"{notifier.provider.title()} accepted the test notification. Check the configured inbox to verify delivery.")
         return 0
-    print("Resend did not accept the test notification. Verify the API key, sender, and recipient.")
+    print(f"{notifier.provider.title()} did not accept the test notification. Verify the API key, sender, and recipient.")
     return 1
 
 
@@ -70,15 +69,24 @@ def main() -> int:
     args = parser.parse_args()
     load_dotenv(Path(__file__).resolve().parent.parent / "config" / ".env")
 
-    variables = {"kleinanzeigen": _ALERTS, "kleinanzeigen-replies": _REPLIES, "email": _EMAIL}[args.check]
+    now = datetime.now(timezone.utc)
+    if args.check == "email":
+        try:
+            notifier = _email_notifier()
+        except ValueError as error:
+            print(error)
+            return 2
+        if notifier is None:
+            print("Missing configuration: MUNICH_NOTIFY_EMAIL_FROM, MUNICH_NOTIFY_EMAIL_TO")
+            return 2
+        return _check_email(notifier, now)
+
+    variables = {"kleinanzeigen": _ALERTS, "kleinanzeigen-replies": _REPLIES}[args.check]
     values = [os.getenv(variable, "").strip() for variable in variables]
     missing = [variable for variable, value in zip(variables, values) if not value]
     if missing:
         print("Missing configuration: " + ", ".join(missing))
         return 2
-    now = datetime.now(timezone.utc)
-    if args.check == "email":
-        return _check_email(values, now)
     return _check_inbox(values, now, replies=args.check == "kleinanzeigen-replies")
 
 

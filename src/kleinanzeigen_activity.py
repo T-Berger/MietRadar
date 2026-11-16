@@ -4,17 +4,41 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from http.client import HTTPException
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import NAMESPACE_URL, uuid5
 
 from kleinanzeigen_judge import judge_reply
 from kleinanzeigen_reply_queue import save_reply_draft
 from kleinanzeigen_replies import extract_replies
 from wg_alerts import AlertsInbox
+
+
+LOG = logging.getLogger(__name__)
+
+
+def _rejection_hint(provider: str, status: int, code: object, message: str) -> str:
+    if provider == "brevo":
+        if "unrecognised ip address" in message or "unrecognized ip address" in message:
+            return "Ausgehende IP-Adresse in Brevo nicht zugelassen"
+        if code == "permission_denied" or "access denied for resource" in message:
+            return "API-Schlüssel braucht Rechte für transaktionale E-Mails"
+        if any(phrase in message for phrase in ("invalid sender", "sender is not valid", "sender is not verified",
+                                                 "sender is not authorized", "verify your sender")):
+            return "Bestätigte Absenderadresse in Brevo prüfen"
+    if provider == "resend":
+        if code == "invalid_permission":
+            return "Versandrechte des API-Schlüssels prüfen"
+        if "can only send testing emails" in message or "domain is not verified" in message:
+            return "Verifizierten Absender und Einschränkungen für Test-E-Mails prüfen"
+    if status == 401 or any(phrase in message for phrase in ("api key is invalid", "invalid api key", "key not found")):
+        return "API-Schlüssel und Zugriff beim Anbieter prüfen"
+    return "Absender, Empfänger und Einstellungen beim Anbieter prüfen"
 
 
 def install_activity(db: sqlite3.Connection) -> None:
@@ -123,9 +147,10 @@ class EmailNotifier:
     api_key: str
     sender: str
     recipient: str
+    provider: str = "resend"
 
     def flush(self, db: sqlite3.Connection, now: datetime) -> tuple[int, bool]:
-        # Resend honors the same idempotency key for 24h. Older items stay in the local log.
+        # Older items stay in the local log. Brevo's duplicate protection is shorter than Resend's 24h.
         pending = db.execute("""SELECT id, subject, summary, url FROM klein_activity
             WHERE emailed_at IS NULL AND occurred_at BETWEEN ? AND ? ORDER BY occurred_at DESC LIMIT 15
         """, ((now - timedelta(hours=23)).timestamp(), now.timestamp())).fetchall()
@@ -139,14 +164,45 @@ class EmailNotifier:
         return sent, True
 
     def _send(self, event_id: str, subject: str, summary: str, url: str) -> bool:
-        payload = {"from": self.sender, "to": [self.recipient], "subject": f"MietRadar · {subject}",
-                   "text": f"{summary}\n\n{url}".strip()}
-        request = Request("https://api.resend.com/emails", method="POST", data=json.dumps(payload).encode("utf-8"),
-                          headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json",
-                                   "User-Agent": "MietRadar/1.0",
-                                   "Idempotency-Key": "mietradar/" + hashlib.sha256(event_id.encode()).hexdigest()})
+        subject = f"MietRadar · {subject}"
+        body = f"{summary}\n\n{url}".strip()
+        headers = {"Content-Type": "application/json", "User-Agent": "MietRadar/1.0"}
+        if self.provider == "brevo":
+            endpoint = "https://api.brevo.com/v3/smtp/email"
+            headers["api-key"] = self.api_key
+            payload = {"sender": {"name": "MietRadar", "email": self.sender}, "to": [{"email": self.recipient}],
+                       "subject": subject, "textContent": body,
+                       "headers": {"idempotencyKey": str(uuid5(NAMESPACE_URL, f"mietradar/email/{event_id}"))}}
+            response_id = "messageId"
+        elif self.provider == "resend":
+            endpoint = "https://api.resend.com/emails"
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["Idempotency-Key"] = "mietradar/" + hashlib.sha256(event_id.encode()).hexdigest()
+            payload = {"from": self.sender, "to": [self.recipient], "subject": subject, "text": body}
+            response_id = "id"
+        else:
+            raise ValueError(f"Unbekannter E-Mail-Anbieter: {self.provider}")
+
+        request = Request(endpoint, method="POST", data=json.dumps(payload).encode("utf-8"), headers=headers)
         try:
             with urlopen(request, timeout=10) as response:
-                return bool(json.load(response).get("id"))
+                return bool(json.load(response).get(response_id))
+        except HTTPError as error:
+            with error:
+                try:
+                    details = json.loads(error.read(4096))
+                except (OSError, ValueError):
+                    details = {}
+            if not isinstance(details, dict):
+                details = {}
+            code = details.get("code") if self.provider == "brevo" else details.get("name")
+            message = details.get("message")
+            message = message.lower() if isinstance(message, str) else ""
+            if (self.provider == "brevo" and error.code == 400 and code == "duplicate_parameter"
+                    and "idempotency" in message):
+                return True
+            LOG.warning("%s hat die E-Mail abgelehnt (HTTP %d). %s.", self.provider.title(), error.code,
+                        _rejection_hint(self.provider, error.code, code, message))
+            return False
         except (URLError, OSError, HTTPException, ValueError, AttributeError):
             return False
