@@ -63,6 +63,8 @@ Mit `MUNICH_APPLICANT_ANSWERS` kannst du kurze eigene Antworten auf häufige Fra
 
 Unter **Angebote** kannst du das letzte Wochenende oder eigene Kalendertage in Münchner Zeit auswählen. **Veröffentlicht** zeigt Anzeigen mit einem belegten Veröffentlichungsdatum. **Zuerst gesehen** zeigt dagegen, wann MietRadar Anzeigen ohne belegtes Veröffentlichungsdatum erstmals erfasst hat. Die Datumsansicht zeigt auch erfasste Anzeigen ohne Entwurf. Ein Veröffentlichungsdatum ohne Uhrzeit reicht für die Datumsansicht. Bewerbungsentwürfe und Versand gibt es für A* und A.
 
+Der Tab **Karte** zeigt die Angebote der Stufen A* bis C für denselben Zeitraum. Wähle einen Punkt für die Fahrzeit, die verfügbaren Miet- und Flächenangaben und den Link zum Inserat. Ein Angebot erscheint auf der Karte, sobald der Suchlauf einen geprüften Standort gespeichert hat. Die Karte nutzt [OpenStreetMap](https://www.openstreetmap.org/copyright).
+
 Lokal: Installiere die Abhängigkeiten mit `pip install -r requirements-dashboard.txt` und hinterlege ein eigenes langes Passwort als `MUNICH_DASHBOARD_PASSWORD` in deiner privaten `config/.env`. Starte den Worker und öffne das Dashboard in einem zweiten Terminal:
 
 ```bash

@@ -38,10 +38,14 @@ def install_listing_profiles(db: sqlite3.Connection) -> None:
             rent_eur REAL, rent_kind TEXT, area_sqm REAL,
             summary TEXT, fit TEXT, fit_reason TEXT,
             summary_hash TEXT, summary_check TEXT, photo_urls TEXT,
-            route_tier TEXT, route_minutes INTEGER
+            route_tier TEXT, route_minutes INTEGER,
+            latitude REAL, longitude REAL, location_address_hash TEXT
         )
     """)
-    additions = {"photo_urls": "TEXT", "route_tier": "TEXT", "route_minutes": "INTEGER"}
+    additions = {
+        "photo_urls": "TEXT", "route_tier": "TEXT", "route_minutes": "INTEGER",
+        "latitude": "REAL", "longitude": "REAL", "location_address_hash": "TEXT",
+    }
     columns = {column[1] for column in db.execute("PRAGMA table_info(listing_profiles)")}
     if additions.keys() <= columns:
         return
@@ -59,6 +63,37 @@ def record_listing_route(
     if tier is not None:
         db.execute("UPDATE listing_profiles SET route_tier = ?, route_minutes = ? WHERE id = ?",
                    (tier if tier in PRIMARY_TIERS else None, minutes if tier in PRIMARY_TIERS else None, listing_id))
+
+
+def valid_listing_coordinates(latitude: object, longitude: object) -> tuple[float, float] | None:
+    if (isinstance(latitude, (int, float)) and isinstance(longitude, (int, float))
+            and 47.99 <= latitude <= 48.30 and 11.30 <= longitude <= 11.75):
+        return float(latitude), float(longitude)
+    return None
+
+
+def _address_hash(address: str | None) -> str | None:
+    if address and (normalized := " ".join(address.casefold().split())):
+        return hashlib.sha256(normalized.encode()).hexdigest()
+    return None
+
+
+def record_listing_location(
+    db: sqlite3.Connection, listing_id: str, coordinates: tuple[float, float] | None, *, address: str | None = None,
+) -> None:
+    """Store a verified Munich point or clear the previous point for this listing."""
+    if coordinates is None:
+        latitude, longitude = None, None
+    elif not isinstance(coordinates, tuple) or len(coordinates) != 2:
+        return
+    elif point := valid_listing_coordinates(*coordinates):
+        latitude, longitude = point
+    else:
+        return
+    db.execute("""
+        UPDATE listing_profiles SET latitude = ?, longitude = ?,
+            location_address_hash = COALESCE(?, location_address_hash) WHERE id = ?
+    """, (latitude, longitude, _address_hash(address), listing_id))
 
 
 def _plain(text: str, limit: int) -> str:
@@ -82,6 +117,7 @@ def _summarize(title: str, description: str) -> tuple[str, str]:
 def record_listing_profile(
     db: sqlite3.Connection, listing, *, fit: str | None = None, reason: str | None = None, provider: str = "none",
     route_tier: CommuteTier | None = None, route_minutes: int | None = None,
+    coordinates: tuple[float, float] | None = None,
 ) -> None:
     title = _plain(listing.title, 240)
     description = _plain(listing.description, 1600)
@@ -127,3 +163,12 @@ def record_listing_profile(
         """, (listing.id, title, listing.rent_eur, listing.rent_kind, listing.area_sqm, summary,
               fit, reason, cached_hash, check, photos))
         record_listing_route(db, listing.id, route_tier, route_minutes)
+        if route_tier == "outside" or coordinates is not None:
+            record_listing_location(db, listing.id, None if route_tier == "outside" else coordinates,
+                                    address=listing.address)
+        elif address_hash := _address_hash(listing.address):
+            # A new address cannot inherit a marker from the previous address.
+            db.execute("""
+                UPDATE listing_profiles SET latitude = NULL, longitude = NULL, location_address_hash = ?
+                WHERE id = ? AND location_address_hash IS NOT NULL AND location_address_hash <> ?
+            """, (address_hash, listing.id, address_hash))

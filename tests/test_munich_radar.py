@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, Mock, patch
 from llm_personalizer import application_render_signature
 from munich_radar import Scanner, _database
 from munich_tiers import save_secondary_offer
-from rental_availability import AVAILABILITY_POLICY_VERSION
+from rental_availability import AVAILABILITY_POLICY_VERSION, record_listing_availability
 from wg_alerts import AlertsInbox, ListingAlert, extract_refs
 from wg_preferences import rejection_reason
 from wg_source import Listing, ListingRef, WGAccessBlocked, WGListingGone, WGSourceError
@@ -300,11 +300,15 @@ class ScannerTest(unittest.TestCase):
         source.candidates.return_value = [ref(east), ref(central)]
         source.details.side_effect = [east, central]
         router.classify.side_effect = [("b", 38), ("c", 45)]
+        points = {east.address: (48.128, 11.603), central.address: (48.14, 11.558)}
+        router.coordinates.side_effect = points.get
         scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 12, delivery=delivery)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             scanner.scan(db, NOW, {})
             self.assertEqual(db.execute("SELECT tier, station, minutes FROM munich_secondary_offers ORDER BY id").fetchall(),
                              [("b", "Ostbahnhof", 38), ("c", "Hbf", 45)])
+            self.assertEqual(db.execute("SELECT latitude, longitude FROM listing_profiles ORDER BY id").fetchall(),
+                             [points[east.address], points[central.address]])
             self.assertEqual(db.execute("SELECT count(*) FROM drafts").fetchone(), (0,))
         delivery.deliver.assert_not_called()
 
@@ -315,6 +319,7 @@ class ScannerTest(unittest.TestCase):
         source.candidates.return_value = []
         source.details.return_value = listing
         router.classify.return_value = ("a", None)
+        router.coordinates.return_value = (48.128, 11.603)
         template = "Hallo!\n\nIch bin Sam und arbeite als Architekt.\n\n{LLM_TEXT}"
         scanner = Scanner(source, router, template, "none", timedelta(hours=24), 12,
                           delivery=delivery, render_signature="new-template")
@@ -365,6 +370,7 @@ class ScannerTest(unittest.TestCase):
         source.inventory_scope = "munich"
         source.candidates.return_value = []
         source.details.return_value = listing
+        router.coordinates.return_value = (48.128, 11.603)
         scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 12)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             with db:
@@ -378,6 +384,36 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT message FROM drafts").fetchone(), ("Vorhandener Entwurf",))
         source.details.assert_called_once_with(ref(listing))
         router.classify.assert_not_called()
+
+    def test_coordinates_backfill_leaves_existing_drafts_and_commute_tiers_intact(self):
+        primary, secondary = offer(1, 1), offer(2, 2)
+        source, router, delivery = Mock(inventory_scope="munich"), Mock(), Mock()
+        source.candidates.return_value = []
+        listings = {listing.id: listing for listing in (primary, secondary)}
+        source.details.side_effect = lambda item: listings[item.id]
+        points = {primary.address: (48.128, 11.603), secondary.address: (48.14, 11.558)}
+        router.coordinates.side_effect = points.get
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(days=1), 12, delivery=delivery)
+
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Mein Entwurf', 0)",
+                           (primary.id, primary.url, primary.published_at.timestamp()))
+                db.execute("INSERT INTO listing_profiles(id, title, route_tier, route_minutes, photo_urls) "
+                           "VALUES (?, ?, 'a*', 17, '[]')", (primary.id, primary.title))
+                save_secondary_offer(db, secondary.id, secondary.url, secondary.title, secondary.published_at,
+                                     "veröffentlicht", "b", "Ostbahnhof", 38)
+                for listing_id in listings:
+                    record_listing_availability(db, listing_id, None)
+
+            scanner.scan(db, NOW, {})
+            self.assertEqual(db.execute("SELECT latitude, longitude FROM listing_profiles ORDER BY id").fetchall(),
+                             [points[primary.address], points[secondary.address]])
+            self.assertEqual(db.execute("SELECT message FROM drafts").fetchall(), [("Mein Entwurf",)])
+            self.assertEqual(db.execute("SELECT tier, minutes FROM munich_secondary_offers").fetchall(), [("b", 38)])
+
+        router.classify.assert_not_called()
+        delivery.deliver.assert_not_called()
 
 
 class AlertParsingTest(unittest.TestCase):

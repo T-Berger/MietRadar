@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from rental_availability import AVAILABILITY_POLICY_VERSION
 
 from listing_photos import listing_photo_urls
+from listing_profiles import valid_listing_coordinates
 
 
 _TABLE_COLUMNS = {
@@ -53,6 +54,9 @@ class ListingProfile:
     photo_urls: tuple[str, ...] = ()
     route_tier: str | None = None
     route_minutes: int | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    map_eligible: bool = True
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,22 @@ class SecondaryListing:
     tier: str
     station: str
     minutes: int
+
+
+@dataclass(frozen=True)
+class MapListing:
+    id: str
+    url: str | None
+    platform: str
+    title: str
+    tier: str
+    minutes: int | None
+    station: str | None
+    latitude: float | None
+    longitude: float | None
+    rent_eur: float | None
+    rent_kind: str | None
+    area_sqm: float | None
 
 
 @dataclass(frozen=True)
@@ -140,6 +160,38 @@ class DashboardData:
     listing_profiles: dict[str, ListingProfile] = field(default_factory=dict)
     application_reviews_available: bool = False
     wg_inbox_status: tuple[float, bool] | None = None
+    dated_secondary_offers: tuple[SecondaryListing, ...] = ()
+
+
+def map_listings(data: DashboardData, *, date_filtered: bool = False) -> tuple[MapListing, ...]:
+    """Return eligible A*–C listings, including those still waiting for a verified map point."""
+    secondary_rows = (*data.secondary_offers, *data.dated_secondary_offers) if date_filtered else data.secondary_offers
+    secondary_by_id = {row.id: row for row in secondary_rows if row.tier in {"b", "c"}}
+    candidates = (data.dated_listings if date_filtered else
+                  sorted((*data.matches, *data.secondary_offers), key=lambda row: row.fresh_at, reverse=True))
+    listings = {}
+    for row in candidates:
+        profile = data.listing_profiles.get(row.id)
+        if (profile and not profile.map_eligible) or (isinstance(row, Match) and row.state == "unavailable"):
+            continue
+        if secondary := secondary_by_id.get(row.id):
+            title, tier, minutes = secondary.title, secondary.tier, secondary.minutes
+            station = "Ostbahnhof" if tier == "b" else "Hauptbahnhof"
+        elif profile and profile.route_tier in {"a*", "a"} and (
+            isinstance(row, Match) or (isinstance(row, DatedListing) and row.matched)
+        ):
+            title, tier, minutes = profile.title, profile.route_tier, profile.route_minutes
+            station = None
+        else:
+            continue
+        point = valid_listing_coordinates(profile.latitude, profile.longitude) if profile else None
+        latitude, longitude = point or (None, None)
+        listings[row.id] = MapListing(
+            row.id, row.url, row.platform, title or "Mietangebot", tier, minutes, station, latitude, longitude,
+            profile.rent_eur if profile else None, profile.rent_kind if profile else None,
+            profile.area_sqm if profile else None,
+        )
+    return tuple(listings.values())
 
 
 def _platform_url(url: str) -> str | None:
@@ -279,14 +331,21 @@ def _address_checks(db: sqlite3.Connection, tables: set[str], cutoff: float, unt
 
 
 def _secondary_offers(
-    db: sqlite3.Connection, tables: set[str], cutoff: float, until: float,
+    db: sqlite3.Connection, tables: set[str], cutoff: float, until: float, *, ids: tuple[str, ...] | None = None,
 ) -> tuple[SecondaryListing, ...]:
     available = _availability_filter(db, tables, "m.id")
+    if ids == ():
+        return ()
+    if ids is None:
+        scope, params = "m.fresh_at BETWEEN ? AND ?", (cutoff, until)
+    else:
+        scope = f"m.fresh_at <= ? AND m.id IN ({', '.join('?' for _ in ids)})"
+        params = (until, *ids)
     rows = db.execute(f"""
         SELECT m.id, m.url, m.title, m.fresh_at, m.basis, m.tier, m.station, m.minutes FROM munich_secondary_offers m
-        WHERE m.fresh_at BETWEEN ? AND ? AND m.minutes BETWEEN 1 AND 45 AND {available}
+        WHERE {scope} AND m.minutes BETWEEN 1 AND 45 AND {available}
         ORDER BY m.fresh_at DESC, m.id DESC LIMIT ?
-    """, (cutoff, until, RESULT_LIMIT))
+    """, (*params, RESULT_LIMIT))
     return tuple(
         SecondaryListing(item, "Kleinanzeigen" if item.startswith("ka-") else "WG-Gesucht",
                          _platform_url(url), title, stamp, basis, tier, station, minutes)
@@ -351,20 +410,26 @@ def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[s
     columns = _columns(db, "listing_profiles")
     photo_column = "photo_urls" if "photo_urls" in columns else "NULL"
     route_columns = "route_tier, route_minutes" if {"route_tier", "route_minutes"} <= columns else "NULL, NULL"
+    location_columns = "latitude, longitude" if {"latitude", "longitude"} <= columns else "NULL, NULL"
+    available = _availability_filter(db, tables, "listing_profiles.id")
     rows = db.execute(f"""
-        SELECT id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, {photo_column}, {route_columns}
+        SELECT id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, {photo_column}, {route_columns},
+               {location_columns}, {available}
         FROM listing_profiles WHERE id IN ({placeholders})
     """, tuple(ids))
     profiles = {}
-    for listing_id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photos_json, tier, minutes in rows:
+    for (listing_id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photos_json, tier, minutes,
+         latitude, longitude, map_eligible) in rows:
         try:
             photos = json.loads(photos_json) if photos_json else []
         except (ValueError, TypeError):
             photos = []
         platform = "ka" if listing_id.startswith("ka-") else "wg"
         photo_urls = listing_photo_urls(photos, platform=platform) if isinstance(photos, list) else ()
+        latitude, longitude = valid_listing_coordinates(latitude, longitude) or (None, None)
         profiles[listing_id] = ListingProfile(
             title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photo_urls, tier, minutes,
+            latitude, longitude, bool(map_eligible),
         )
     return profiles
 
@@ -469,6 +534,9 @@ def load_dashboard(
             address_checks = _address_checks(db, tables, cutoff, until) if "klein_review" in tables else ()
             dated_listings = _dated_listings(db, tables, posting_window, now, date_basis) if posting_window else ()
             secondary_offers = _secondary_offers(db, tables, cutoff, until) if "munich_secondary_offers" in tables else ()
+            dated_secondary_offers = _secondary_offers(db, tables, cutoff, until, ids=tuple(
+                row.id for row in dated_listings
+            )) if dated_listings and "munich_secondary_offers" in tables else ()
             visible_ids = {row.id for group in (matches, address_checks, dated_listings, secondary_offers) for row in group}
             return DashboardData(
                 "ready",
@@ -482,6 +550,7 @@ def load_dashboard(
                 listing_profiles=_profiles(db, tables, visible_ids),
                 application_reviews_available="application_reviews" in tables,
                 wg_inbox_status=_wg_inbox_status(db, tables),
+                dated_secondary_offers=dated_secondary_offers,
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")

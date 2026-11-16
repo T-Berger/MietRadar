@@ -9,10 +9,11 @@ from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
-from dashboard_data import load_dashboard, weekend_dates
-from listing_profiles import record_listing_route
+from dashboard_data import load_dashboard, map_listings, weekend_dates
+from listing_profiles import record_listing_location, record_listing_profile, record_listing_route
 from munich_radar import _database
 from rental_availability import AVAILABILITY_POLICY_VERSION, record_listing_availability
+from wg_source import Listing
 
 
 NOW = datetime(2026, 11, 15, 12, tzinfo=timezone.utc)
@@ -133,6 +134,8 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.listing_profiles["12"].photo_urls, ())
         self.assertIsNone(data.listing_profiles["12"].route_tier)
         self.assertIsNone(data.listing_profiles["12"].route_minutes)
+        self.assertIsNone(data.listing_profiles["12"].latitude)
+        self.assertIsNone(data.listing_profiles["12"].longitude)
         self.assertIsNone(data.wg_scan)
 
     def test_previous_availability_schema_filters_only_recorded_exclusions(self):
@@ -334,6 +337,59 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual((profile.route_tier, profile.route_minutes), ("a*", 20))
         self.assertIsNone(data.listing_profiles["ka-77"].rent_eur)
         self.assertEqual(data.listing_profiles["ka-77"].photo_urls, ())
+
+    def test_map_uses_verified_current_tiers_and_follows_the_selected_date(self):
+        today = NOW.timestamp()
+        friday = (NOW - timedelta(days=2)).timestamp()
+        url = "https://www.wg-gesucht.de/12.html"
+        klein_url = "https://www.kleinanzeigen.de/s-anzeige/zimmer/77-199-650"
+        with closing(_database(self.path)) as db, db:
+            for listing_id in ("1", "2", "3", "5", "ka-77"):
+                record_listing_availability(db, listing_id, None)
+            record_listing_availability(db, "4", "keine Mindestmietdauer")
+            db.executemany("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Hallo', 0)", [
+                ("1", url, today), ("2", url, today), ("4", url, today),
+            ])
+            db.execute("INSERT INTO delivery VALUES ('4', 'sent', ?, ?)", (today, today))
+            db.executemany("INSERT INTO munich_secondary_offers VALUES (?, ?, ?, ?, 'veröffentlicht', ?, ?, ?)", [
+                ("3", url, "Zimmer", friday, "c", "Hbf", 39),
+                ("ka-77", klein_url, "Zimmer", today, "b", "Ostbahnhof", 41),
+            ])
+            db.executemany("""
+                INSERT INTO wg_observations (id, url, first_seen_at, last_seen_at, published_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, [(listing_id, url, friday, friday, friday) for listing_id in ("3", "5")])
+            db.executemany("""
+                INSERT INTO listing_profiles (id, title, route_tier, route_minutes, latitude, longitude)
+                VALUES (?, 'Zimmer', ?, ?, ?, ?)
+            """, [
+                ("1", "a*", 19, 48.12, 11.58), ("2", "a", None, 12.54, 11.55),
+                ("3", None, None, 48.15, 11.53), ("4", "a", None, 48.15, 11.55),
+                ("5", "a*", 12, 48.123, 11.54), ("ka-77", None, None, 48.14, 11.65),
+            ])
+
+        data = load_dashboard(self.path, now=NOW, posting_window=(date(2026, 11, 13), date(2026, 11, 13)))
+        self.assertIn("4", {row.id for row in data.matches})
+        current = {item.id: item for item in map_listings(data)}
+        self.assertEqual(set(current), {"1", "2", "ka-77"})
+        self.assertEqual((current["1"].tier, current["1"].minutes, current["1"].latitude), ("a*", 19, 48.12))
+        self.assertEqual((current["2"].latitude, current["2"].longitude), (None, None))
+        self.assertEqual((current["ka-77"].tier, current["ka-77"].station, current["ka-77"].platform),
+                         ("b", "Ostbahnhof", "Kleinanzeigen"))
+        historical, = map_listings(data, date_filtered=True)
+        self.assertEqual((historical.id, historical.tier, historical.station, historical.longitude),
+                         ("3", "c", "Hauptbahnhof", 11.53))
+
+    def test_address_change_invalidates_a_saved_map_point(self):
+        with closing(_database(self.path)) as db:
+            listing = Listing("1", "https://www.wg-gesucht.de/1.html", "Zimmer", "", NOW,
+                              "Beispielstraße 1, 80331 München")
+            new_listing = Listing("1", listing.url, listing.title, "", NOW, "Beispielstraße 2, 80331 München")
+            record_listing_profile(db, listing, route_tier="a*", route_minutes=15, coordinates=(48.12, 11.55))
+            record_listing_location(db, "1", (48.12, float("inf")))
+            self.assertEqual(db.execute("SELECT latitude, longitude FROM listing_profiles").fetchone(), (48.12, 11.55))
+            record_listing_profile(db, new_listing)
+            self.assertEqual(db.execute("SELECT latitude, longitude FROM listing_profiles").fetchone(), (None, None))
 
     def test_shows_latest_public_inventory_count_even_without_matches(self):
         current = NOW.timestamp()
