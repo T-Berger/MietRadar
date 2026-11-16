@@ -17,6 +17,7 @@ from rental_availability import AVAILABILITY_POLICY_VERSION
 
 from listing_photos import listing_photo_urls
 from listing_profiles import valid_listing_coordinates
+from wg_source import ListingRef
 
 if TYPE_CHECKING:
     from wg_source import RecipientRole
@@ -271,6 +272,29 @@ def set_listing_hidden(
             """, (listing_id, _platform_url(url), title or "Mietangebot", datetime.now(timezone.utc).timestamp()))
         else:
             db.execute("DELETE FROM dashboard_hidden_listings WHERE id = ?", (listing_id,))
+
+
+def confirm_application_delivery(db_path: Path | str, listing_id: str, *, now: datetime) -> bool:
+    """Record a user's inbox confirmation for an existing unclear WG-Gesucht attempt."""
+    if not (1 <= len(listing_id) <= 20 and listing_id.isascii() and listing_id.isdecimal()):
+        return False
+    with closing(sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=rw", uri=True, timeout=2)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        if not {"id", "state", "recorded_at"} <= _columns(db, "delivery"):
+            return False
+        if not {"id", "url", "done"} <= _columns(db, "drafts"):
+            return False
+        row = db.execute("""
+            SELECT d.url FROM delivery s JOIN drafts d ON d.id = s.id
+            WHERE s.id = ? AND s.state = 'unconfirmed'
+        """, (listing_id,)).fetchone()
+        if not row or not isinstance(row[0], str) or not (listing := ListingRef.from_url(row[0])):
+            return False
+        if listing.id != listing_id:
+            return False
+        db.execute("UPDATE delivery SET state = 'sent', recorded_at = ? WHERE id = ?", (now.timestamp(), listing_id))
+        db.execute("UPDATE drafts SET done = 1 WHERE id = ?", (listing_id,))
+        return True
 
 
 def _hidden_listings(db: sqlite3.Connection, tables: set[str]) -> tuple[HiddenListing, ...]:

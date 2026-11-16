@@ -20,8 +20,8 @@ from dotenv import load_dotenv
 from dashboard_auth import logout_button, require_authentication
 from dashboard_data import (
     BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, HiddenListing, ListingProfile,
-    MapListing, Match, ProviderFilter, Reply, SecondaryListing, SentApplication, filter_listing_providers, load_dashboard,
-    map_listings, set_listing_hidden, weekend_dates,
+    MapListing, Match, ProviderFilter, Reply, SecondaryListing, SentApplication, confirm_application_delivery,
+    filter_listing_providers, load_dashboard, map_listings, set_listing_hidden, weekend_dates,
 )
 from listing_profiles import valid_listing_coordinates
 from munich_transit import HAUPTBAHNHOF, OSTBAHNHOF
@@ -395,6 +395,21 @@ def _application(
 ) -> None:
     if row.state == "unconfirmed" and row.platform == "WG-Gesucht":
         st.warning("Der Versand ließ sich nicht bestätigen. Schau im WG-Gesucht-Postfach nach.")
+        with st.container(horizontal=True):
+            _location_link(WG_REPLY_INBOX, "Postfach öffnen")
+            confirm = st.button("Versand im Postfach bestätigt", key=f"confirm_delivery_{row.id}",
+                                help="Übernimmt die im Postfach geprüfte Bewerbung in deine Bewerbungsliste.")
+        if confirm:
+            try:
+                saved = confirm_application_delivery(db_path, row.id, now=datetime.now(timezone.utc))
+            except (OSError, sqlite3.Error):
+                st.error("Die Versandbestätigung konnte gerade nicht gespeichert werden.")
+                return
+            if not saved:
+                st.warning("Der Versandstatus hat sich geändert. Aktualisiere die Ansicht.")
+                return
+            st.session_state[_REVIEW_NOTICE] = "Die Bewerbung steht jetzt unter „Bewerbungen“."
+            st.rerun()
     elif row.review_reason and row.review_reason != row.judge_reason:
         st.text(row.review_reason)
     if row.message is None:
@@ -404,7 +419,8 @@ def _application(
     elif row.judge_approved is True:
         st.caption(row.judge_reason or "Diese Fassung hat die Textprüfung bestanden.")
 
-    editable = review_available and row.platform == "WG-Gesucht" and row.url is not None
+    editable = (review_available and row.platform == "WG-Gesucht" and row.url is not None
+                and row.state not in {"sent", "unconfirmed"})
     with st.expander("Bewerbung prüfen" if editable else "Bewerbung anzeigen"):
         if not editable:
             st.code(row.message, language=None, wrap_lines=True)
@@ -655,7 +671,7 @@ def _sent_applications(rows: tuple[SentApplication, ...]) -> None:
             if title == "Mietangebot":
                 title = f"Mietangebot {row.id.removeprefix('ka-')}"
             st.text(title)
-            st.caption(f"{row.platform} · Gesendet am {_date(row.sent_at)}")
+            st.caption(f"{row.platform} · Versand bestätigt am {_date(row.sent_at)}")
             _location_link(row.url)
 
 
