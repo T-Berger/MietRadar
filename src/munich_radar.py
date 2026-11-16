@@ -182,6 +182,42 @@ class Scanner:
             )
         return None
 
+    def validate_reviewed_listing(
+        self, db: sqlite3.Connection, item: ReviewedApplication, listing: Listing, now: datetime,
+        retry_after: dict[str, datetime],
+    ) -> bool:
+        """Recheck a queued application's current listing before handing it to a browser."""
+        if item.id != listing.id:
+            return False
+        if self._check_availability(db, listing, now):
+            return False
+        cutoff = now - min(self.max_age, timedelta(hours=24))
+        expired = (not cutoff <= listing.published_at <= now if listing.published_at is not None else
+                   bool(listing.published_day and not cutoff.astimezone(BERLIN).date() <= listing.published_day
+                        <= now.astimezone(BERLIN).date()))
+        if expired:
+            fail_application_review(db, item, "Die Anzeige liegt außerhalb des Versandzeitfensters.", now)
+            return False
+        if rejection_reason(
+            listing.title, listing.description, wanted=listing.wanted or "", resident_ages=listing.resident_ages or "",
+            wg_type=listing.wg_type or "", age=self.age, age_gap=self.age_gap,
+        ):
+            fail_application_review(db, item, "Die Anzeige entspricht inzwischen nicht mehr deinen Suchfiltern.", now)
+            return False
+        tier, minutes = self.router.classify(listing.address, now) if listing.address else (None, None)
+        if tier is None:
+            set_application_wait_reason(
+                db, item, "Die ÖPNV-Fahrzeit konnte gerade nicht bestätigt werden. MietRadar prüft sie erneut.",
+            )
+            retry_after[item.id] = now + timedelta(minutes=5)
+            return False
+        if tier not in PRIMARY_TIERS:
+            fail_application_review(db, item, "Die Fahrt dauert inzwischen länger als 30 Minuten.", now)
+            return False
+        with db:
+            record_listing_route(db, item.id, tier, minutes)
+        return True
+
     def send_reviewed(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         counts = Counter()
         if self.reviewed_delivery is None:
@@ -226,36 +262,13 @@ class Scanner:
                 retry_after[item.id] = retry_at
                 counts["Freigaben warten auf WG-Gesucht"] += 1
                 continue
-            if reason := self._check_availability(db, listing, now):
-                counts[reason] += 1
+            if not self.validate_reviewed_listing(db, item, listing, now, retry_after):
+                exclusion = db.execute("SELECT reason FROM listing_availability WHERE id = ?", (item.id,)).fetchone()
+                if exclusion and exclusion[0]:
+                    counts[exclusion[0]] += 1
+                elif item.id in retry_after:
+                    counts["Freigaben warten auf ÖPNV-Prüfung"] += 1
                 continue
-            cutoff = now - min(self.max_age, timedelta(hours=24))
-            expired = (not cutoff <= listing.published_at <= now if listing.published_at is not None else
-                       bool(listing.published_day and not cutoff.astimezone(BERLIN).date() <= listing.published_day
-                            <= now.astimezone(BERLIN).date()))
-            refused = rejection_reason(
-                listing.title, listing.description, wanted=listing.wanted or "", resident_ages=listing.resident_ages or "",
-                wg_type=listing.wg_type or "", age=self.age, age_gap=self.age_gap,
-            )
-            if expired:
-                fail_application_review(db, item, "Die Anzeige liegt außerhalb des Versandzeitfensters.", now)
-                continue
-            if refused:
-                fail_application_review(db, item, "Die Anzeige entspricht inzwischen nicht mehr deinen Suchfiltern.", now)
-                continue
-            tier, minutes = self.router.classify(listing.address, now) if listing.address else (None, None)
-            if tier is None:
-                set_application_wait_reason(
-                    db, item, "Die ÖPNV-Fahrzeit konnte gerade nicht bestätigt werden. MietRadar prüft sie erneut.",
-                )
-                retry_after[item.id] = retry_at
-                counts["Freigaben warten auf ÖPNV-Prüfung"] += 1
-                continue
-            if tier not in PRIMARY_TIERS:
-                fail_application_review(db, item, "Die Fahrt dauert inzwischen länger als 30 Minuten.", now)
-                continue
-            with db:
-                record_listing_route(db, item.id, tier, minutes)
             attachment = get_application_attachment(db, item.attachment_digest) if item.attachment_digest else None
             if item.attachment_digest and attachment is None:
                 fail_application_review(db, item, "Der freigegebene Anhang steht nicht mehr zur Verfügung.", now)
@@ -777,8 +790,9 @@ def main() -> int:
             with ExitStack() as sessions:
                 reviewed_send = _switch("MUNICH_REVIEWED_SEND", False)
                 auto_send = not reviewed_send and _switch("MUNICH_AUTOSEND", False)
+                send_in_service = reviewed_send and not os.getenv("MUNICH_WG_RELAY_TOKEN", "").strip()
                 wg_reply_drafts = _switch("MUNICH_WG_REPLY_DRAFTS", False)
-                if reviewed_send or auto_send or wg_reply_drafts:
+                if send_in_service or auto_send or wg_reply_drafts:
                     try:
                         from wg_delivery import BrowserSender
                     except ModuleNotFoundError as exc:
@@ -790,7 +804,7 @@ def main() -> int:
                     )
                     sessions.callback(sender.close)
                     queue = DeliveryQueue(sender, limit, judge_provider=outgoing_provider)
-                    if reviewed_send:
+                    if send_in_service:
                         scanner.reviewed_delivery = queue
                         scanner.reviewed_startup_problem = sender.startup_problem
                     elif auto_send:

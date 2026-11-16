@@ -114,6 +114,15 @@ def save_application_draft(
     return bool(saved.rowcount)
 
 
+def within_send_limit(db: sqlite3.Connection, now: datetime, limit: int) -> bool:
+    last_day = (now - timedelta(days=1)).timestamp()
+    attempts = db.execute("""SELECT
+        (SELECT COUNT(*) FROM delivery WHERE attempted_at >= ?) +
+        (SELECT COUNT(*) FROM klein_reply_drafts WHERE attempted_at >= ?)
+    """, (last_day, last_day)).fetchone()[0]
+    return attempts < limit
+
+
 class DeliveryQueue:
     def __init__(
         self,
@@ -155,12 +164,7 @@ class DeliveryQueue:
             ).fetchone()
             if info is None or not cutoff.timestamp() <= info[0] <= now.timestamp():
                 return False
-        last_day = (now - timedelta(days=1)).timestamp()
-        attempts = db.execute("""SELECT
-            (SELECT COUNT(*) FROM delivery WHERE attempted_at >= ?) +
-            (SELECT COUNT(*) FROM klein_reply_drafts WHERE attempted_at >= ?)
-        """, (last_day, last_day)).fetchone()[0]
-        return attempts < self.limit
+        return within_send_limit(db, now, self.limit)
 
     def deliver(
         self, db: sqlite3.Connection, listing_id: str, url: str, message: str,
