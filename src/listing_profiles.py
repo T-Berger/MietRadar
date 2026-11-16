@@ -39,13 +39,14 @@ def install_listing_profiles(db: sqlite3.Connection) -> None:
             summary TEXT, fit TEXT, fit_reason TEXT,
             summary_hash TEXT, summary_check TEXT, photo_urls TEXT,
             route_tier TEXT, route_minutes INTEGER,
-            latitude REAL, longitude REAL, location_address_hash TEXT, is_commercial INTEGER
+            latitude REAL, longitude REAL, location_address_hash TEXT, is_commercial INTEGER,
+            recipient_role TEXT
         )
     """)
     additions = {
         "photo_urls": "TEXT", "route_tier": "TEXT", "route_minutes": "INTEGER",
         "latitude": "REAL", "longitude": "REAL", "location_address_hash": "TEXT",
-        "is_commercial": "INTEGER",
+        "is_commercial": "INTEGER", "recipient_role": "TEXT",
     }
     columns = {column[1] for column in db.execute("PRAGMA table_info(listing_profiles)")}
     if additions.keys() <= columns:
@@ -126,6 +127,8 @@ def record_listing_profile(
                                          platform="ka" if listing.id.startswith("ka-") else "wg"))
     # Missing platform evidence does not establish that the advertiser rents privately.
     is_commercial = 1 if getattr(listing, "is_commercial", False) is True else None
+    role = getattr(listing, "recipient_role", None)
+    recipient_role = role if role in ("manager", "roommate") else None
     source_hash = hashlib.sha256(f"{title}\n{description}".encode()).hexdigest()
     previous = db.execute("SELECT summary, summary_hash, summary_check FROM listing_profiles WHERE id = ?",
                           (listing.id,)).fetchone()
@@ -148,8 +151,8 @@ def record_listing_profile(
         db.execute("""
             INSERT INTO listing_profiles
                 (id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, summary_hash, summary_check,
-                 photo_urls, is_commercial)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 photo_urls, is_commercial, recipient_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = COALESCE(NULLIF(excluded.title, ''), listing_profiles.title),
                 rent_eur = COALESCE(excluded.rent_eur, listing_profiles.rent_eur),
@@ -164,9 +167,10 @@ def record_listing_profile(
                 photo_urls = CASE WHEN excluded.photo_urls = '[]' AND excluded.id LIKE 'ka-%'
                                   THEN COALESCE(listing_profiles.photo_urls, '[]')
                                   ELSE excluded.photo_urls END,
-                is_commercial = COALESCE(excluded.is_commercial, listing_profiles.is_commercial)
+                is_commercial = COALESCE(excluded.is_commercial, listing_profiles.is_commercial),
+                recipient_role = COALESCE(excluded.recipient_role, listing_profiles.recipient_role)
         """, (listing.id, title, listing.rent_eur, listing.rent_kind, listing.area_sqm, summary,
-              fit, reason, cached_hash, check, photos, is_commercial))
+              fit, reason, cached_hash, check, photos, is_commercial, recipient_role))
         record_listing_route(db, listing.id, route_tier, route_minutes)
         if route_tier == "outside" or coordinates is not None:
             record_listing_location(db, listing.id, None if route_tier == "outside" else coordinates,

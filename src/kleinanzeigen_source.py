@@ -13,7 +13,7 @@ from urllib.parse import quote, unquote, urlsplit
 from bs4 import BeautifulSoup, Tag
 
 from listing_photos import listing_photo_urls
-from wg_source import Listing, RentKind, parse_area_sqm, parse_rent_eur, rent_kind_for_label
+from wg_source import Listing, RentKind, listing_recipient_role, parse_area_sqm, parse_rent_eur, rent_kind_for_label
 
 _HOSTS = {"www.kleinanzeigen.de", "kleinanzeigen.de"}
 _LISTING_PATH = re.compile(r"/s-anzeige/[\w-]+/(?P<id>[0-9]+)-(?P<category>[0-9]+)-[0-9]+")
@@ -226,12 +226,14 @@ def _listing(ref: _Reference, title: str, lines: list[str], photo_urls: tuple[st
         elif index not in address_lines and line.casefold() not in _GENERIC_LINK and not _URL.search(line):
             text.append(line)
     text, available_from, available_until = _alert_availability(text)
+    description = "\n".join(dict.fromkeys(text))
+    commercial = _commercial_provider(lines)
     return Listing(
-        id=ref.id, url=ref.url, title=title, description="\n".join(dict.fromkeys(text)),
+        id=ref.id, url=ref.url, title=title, description=description,
         published_at=None, address=address, district=area, is_wg=ref.is_wg,
         rent_eur=rent_eur, rent_kind=rent_kind, area_sqm=area_sqm, photo_urls=photo_urls,
         available_from=available_from, available_until=available_until,
-        is_commercial=_commercial_provider(lines),
+        is_commercial=commercial, recipient_role=listing_recipient_role(description, commercial=commercial),
     )
 
 
@@ -239,16 +241,17 @@ def _with_fallback_facts(primary: Listing, fallback: Listing) -> Listing:
     use_fallback_rent = primary.rent_eur is None or (
         primary.rent_eur == fallback.rent_eur and primary.rent_kind == "unspecified"
     )
+    description = "\n".join(dict.fromkeys((*primary.description.splitlines(), *fallback.description.splitlines())))
+    commercial = primary.is_commercial or fallback.is_commercial
     return replace(
-        primary, title=primary.title or fallback.title,
-        description="\n".join(dict.fromkeys((*primary.description.splitlines(), *fallback.description.splitlines()))),
+        primary, title=primary.title or fallback.title, description=description,
         rent_eur=fallback.rent_eur if use_fallback_rent else primary.rent_eur,
         rent_kind=fallback.rent_kind if use_fallback_rent else primary.rent_kind,
         area_sqm=primary.area_sqm if primary.area_sqm is not None else fallback.area_sqm,
         photo_urls=listing_photo_urls((*primary.photo_urls, *fallback.photo_urls), platform="ka"),
         available_from=primary.available_from or fallback.available_from,
         available_until=primary.available_until or fallback.available_until,
-        is_commercial=primary.is_commercial or fallback.is_commercial,
+        is_commercial=commercial, recipient_role=listing_recipient_role(description, commercial=commercial),
     )
 
 

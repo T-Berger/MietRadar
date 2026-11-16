@@ -313,7 +313,8 @@ class ScannerTest(unittest.TestCase):
         delivery.deliver.assert_not_called()
 
     def test_revisits_an_unsent_draft_once_to_add_intro_and_listing_facts(self):
-        listing = replace(offer(1, 1), rent_eur=720, rent_kind="warm", area_sqm=18)
+        listing = replace(offer(1, 1), rent_eur=720, rent_kind="warm", area_sqm=18,
+                          is_wg=True, recipient_role="roommate")
         source, router, delivery = Mock(), Mock(), Mock()
         source.inventory_scope = "munich"
         source.candidates.return_value = []
@@ -332,14 +333,14 @@ class ScannerTest(unittest.TestCase):
             self.assertIn("Ich bin Sam", db.execute("SELECT message FROM drafts").fetchone()[0])
             self.assertEqual(db.execute("SELECT rent_eur, rent_kind, area_sqm, fit FROM listing_profiles").fetchone(),
                              (720, "warm", 18, "strong"))
-            signature = application_render_signature(template, "none", first_message=True)
+            signature = application_render_signature(template, "none", first_message=True, recipient_role="roommate")
             self.assertEqual(db.execute("SELECT signature FROM draft_render_signatures").fetchone(), (signature,))
             self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Entwürfe aktualisiert"], 0)
         source.details.assert_called_once()
         delivery.deliver.assert_not_called()
 
-    def test_scan_saves_a_formal_company_draft_and_leaves_it_formal_on_refresh(self):
-        listing = replace(offer(1, 1), is_wg=True, is_commercial=True)
+    def test_scan_saves_a_formal_private_management_draft_and_leaves_it_formal_on_refresh(self):
+        listing = replace(offer(1, 1), is_wg=True, recipient_role="manager")
         source, router = Mock(), Mock()
         source.inventory_scope = "munich"
         source.candidates.return_value = [ref(listing)]
@@ -352,8 +353,10 @@ class ScannerTest(unittest.TestCase):
                           render_signature="test", applicant_intro=intro)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             self.assertEqual(scanner.scan(db, NOW, {})["neue Entwürfe"], 1)
-            message, commercial = db.execute("SELECT message, is_commercial FROM drafts JOIN listing_profiles USING(id)").fetchone()
-            self.assertEqual(commercial, 1)
+            message, role, commercial = db.execute(
+                "SELECT message, recipient_role, is_commercial FROM drafts JOIN listing_profiles USING(id)"
+            ).fetchone()
+            self.assertEqual((role, commercial), ("manager", None))
             self.assertTrue(message.startswith("Guten Tag,"))
             self.assertIn("Architekt", message)
             self.assertNotIn("koche", message)

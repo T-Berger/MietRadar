@@ -17,13 +17,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
 
-from munich_delivery import DeliveryOutcome, FirstMessageReview, review_outgoing, within_send_limit
+from munich_delivery import (
+    DeliveryOutcome, FirstMessageReview, application_recipient_role, review_outgoing, within_send_limit,
+)
 from munich_radar import ROOT, Scanner, _database, _number, _scanner, _switch
 from reviewed_applications import (
     ReviewedApplication, fail_application_review, get_application_attachment, pending_application_reviews,
     review_is_pending, set_application_wait_reason,
 )
-from wg_source import Listing
+from wg_source import Listing, listing_recipient_role
 
 
 LOG = logging.getLogger("wg_delivery_relay")
@@ -65,11 +67,14 @@ def _read_public_listing(body: object, item: ReviewedApplication) -> Listing:
     }
     days = {"published_day", "available_from", "available_until"}
     required = {"published_at", *text_limits, *days}
-    optional = {"is_commercial"} if isinstance(body, dict) and "is_commercial" in body else set()
+    optional = {"is_commercial", "recipient_role"}.intersection(body) if isinstance(body, dict) else set()
     fields = _read_fields(body, required | optional)
     is_commercial = fields.get("is_commercial", False)
     if type(is_commercial) is not bool:
         raise ValueError("Invalid public listing provider")
+    role = fields.get("recipient_role", "unknown")
+    if role not in ("manager", "roommate", "unknown"):
+        raise ValueError("Invalid public listing recipient role")
     values = {}
     for key, limit in text_limits.items():
         value = fields[key]
@@ -90,7 +95,10 @@ def _read_public_listing(body: object, item: ReviewedApplication) -> Listing:
     published_at = datetime.fromisoformat(value) if value else None
     if published_at is not None and published_at.tzinfo is None:
         raise ValueError("Publication time needs a time zone")
-    return Listing(id=item.id, url=item.url, published_at=published_at, is_commercial=is_commercial, **values)
+    if role == "unknown":
+        role = listing_recipient_role(values["description"])
+    return Listing(id=item.id, url=item.url, published_at=published_at, is_commercial=is_commercial,
+                   recipient_role=role, **values)
 
 
 class ReviewedDeliveryRelay:
@@ -171,12 +179,15 @@ class ReviewedDeliveryRelay:
         if not reuse:
             if not self.scanner.validate_reviewed_listing(db, item, listing, now, self.retry_after):
                 return {"ready": False}
-            provider_type = db.execute("SELECT is_commercial FROM listing_profiles WHERE id = ?", (item.id,)).fetchone()
+            profile = db.execute("SELECT recipient_role, is_commercial FROM listing_profiles WHERE id = ?",
+                                 (item.id,)).fetchone()
+            role = application_recipient_role(listing.recipient_role, profile[0] if profile else None,
+                                              commercial=listing.is_commercial or bool(profile and profile[1]))
             judgment = review_outgoing(
                 db, item.id, item.message, kind="application", context=listing.description,
                 provider=self.scanner.outgoing_provider, now=self.clock(),
                 first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
-                                                commercial=listing.is_commercial or bool(provider_type and provider_type[0])),
+                                                recipient_role=role),
             )
             if not judgment.approved:
                 fail_application_review(db, item, judgment.reason, self.clock())

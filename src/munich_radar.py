@@ -28,7 +28,10 @@ from llm_personalizer import (
     applicant_intro_from_template, application_render_signature, personalise_message,
     revise_first_message_draft, with_applicant_intro,
 )
-from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, review_outgoing, save_application_draft
+from munich_delivery import (
+    DeliveryQueue, FirstMessageReview, application_recipient_role, install_schema, review_outgoing,
+    save_application_draft,
+)
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import PRIMARY_TIERS, TransitRouter
 from rental_availability import AVAILABILITY_POLICY_VERSION, availability_rejection, record_listing_availability
@@ -41,7 +44,9 @@ from wg_first_message import applicant_answers, viewing_availability, viewing_sl
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
 from wg_preferences import rejection_reason
 from wg_reply_drafts import install_wg_reply_drafts, sync_wg_reply_drafts
-from wg_source import DEFAULT_SEARCH_URLS, Listing, ListingRef, WGAccessBlocked, WGListingGone, WGSource, WGSourceError
+from wg_source import (
+    DEFAULT_SEARCH_URLS, Listing, ListingRef, RecipientRole, WGAccessBlocked, WGListingGone, WGSource, WGSourceError,
+)
 
 if TYPE_CHECKING:
     from wg_reply_inbox import WGInboxEntry
@@ -123,7 +128,8 @@ class Scanner:
             SELECT d.id, d.url, d.fresh_at, d.basis, d.message, COALESCE(p.title, '')
             FROM drafts d LEFT JOIN listing_profiles p ON p.id = d.id
             WHERE d.done = 0 AND d.fresh_at BETWEEN ? AND ? AND d.message IS NOT NULL AND d.id NOT LIKE 'ka-%'
-              AND COALESCE(p.is_commercial, 0) = 0
+              AND (p.recipient_role = 'roommate' OR (p.recipient_role IS NULL AND COALESCE(p.is_commercial, 0) = 0
+                   AND NOT EXISTS (SELECT 1 FROM draft_render_signatures WHERE id = d.id)))
               AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
               AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id)
               AND NOT EXISTS (SELECT 1 FROM application_reviews WHERE id = d.id)
@@ -186,9 +192,16 @@ class Scanner:
             review_outgoing(
                 db, item.id, item.message, kind="application", context=listing.description, provider=self.outgoing_provider,
                 now=now, first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
-                                                         commercial=listing.is_commercial),
+                                                         recipient_role=self._recipient_role(db, listing)),
             )
         return None
+
+    @staticmethod
+    def _recipient_role(db: sqlite3.Connection, listing: Listing) -> RecipientRole:
+        row = db.execute("SELECT recipient_role, is_commercial FROM listing_profiles WHERE id = ?",
+                         (listing.id,)).fetchone()
+        return application_recipient_role(listing.recipient_role, row[0] if row else None,
+                                          commercial=listing.is_commercial or bool(row and row[1]))
 
     def validate_reviewed_listing(
         self, db: sqlite3.Connection, item: ReviewedApplication, listing: Listing, now: datetime,
@@ -293,7 +306,7 @@ class Scanner:
             result = self.reviewed_delivery.deliver(
                 db, item.id, item.url, item.message, item.fresh_at, self.max_age, context=listing.description,
                 first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
-                                                commercial=listing.is_commercial), attachment=attachment,
+                                                recipient_role=self._recipient_role(db, listing)), attachment=attachment,
             )
             if result:
                 counts[result] += 1
@@ -313,14 +326,12 @@ class Scanner:
         cutoff = now - self.max_age
         viewing_slots = viewing_slot_labels(self.viewing_availability, now)
         wg_template = with_applicant_intro(self.template, self.applicant_intro, first_message=True)
-        wg_signature = self.render_signature and application_render_signature(
-            wg_template, self.provider, first_message=True, viewing_slots=viewing_slots,
-            applicant_answers=self.applicant_answers,
-        )
-        commercial_signature = self.render_signature and application_render_signature(
-            wg_template, self.provider, first_message=True, viewing_slots=viewing_slots,
-            applicant_answers=self.applicant_answers, commercial=True,
-        )
+        signatures = {
+            role: self.render_signature and application_render_signature(
+                wg_template, self.provider, first_message=True, viewing_slots=viewing_slots,
+                applicant_answers=self.applicant_answers, recipient_role=role,
+            ) for role in ("manager", "roommate", "unknown")
+        }
         first_eligible_day = cutoff.astimezone(BERLIN).date()
         current_day = now.astimezone(BERLIN).date()
         with db:
@@ -371,7 +382,7 @@ class Scanner:
             inventory_error = exc
 
         refresh_refs = []
-        if wg_signature:
+        if self.render_signature:
             # Keep part of the detail budget available for newly seen offers when slots change.
             refresh_limit = max(1, self.limit // 3)
             older_drafts = db.execute("""
@@ -379,11 +390,13 @@ class Scanner:
                 LEFT JOIN listing_profiles p ON p.id = d.id
                 WHERE d.id NOT LIKE 'ka-%' AND d.done = 0 AND d.message IS NOT NULL
                   AND d.fresh_at BETWEEN ? AND ? AND COALESCE(s.signature, '') !=
-                      CASE WHEN p.is_commercial = 1 THEN ? ELSE ? END
+                      CASE WHEN p.recipient_role = 'roommate' THEN ?
+                           WHEN p.recipient_role = 'manager' OR p.is_commercial = 1 THEN ? ELSE ? END
                   AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
                   AND NOT EXISTS (SELECT 1 FROM application_reviews WHERE id = d.id)
                 ORDER BY d.fresh_at DESC LIMIT ?
-            """, (cutoff.timestamp(), now.timestamp(), commercial_signature, wg_signature, refresh_limit)).fetchall()
+            """, (cutoff.timestamp(), now.timestamp(), signatures["roommate"], signatures["manager"],
+                  signatures["unknown"], refresh_limit)).fetchall()
             refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
 
         metadata_backfill = db.execute("""
@@ -441,13 +454,15 @@ class Scanner:
             if ref.id in retry_after:
                 continue
             draft = db.execute(
-                """SELECT d.fresh_at, d.message, d.done, s.state, d.basis, r.signature, a.state, p.is_commercial FROM drafts d
+                """SELECT d.fresh_at, d.message, d.done, s.state, d.basis, r.signature, a.state, p.is_commercial,
+                          p.recipient_role FROM drafts d
                    LEFT JOIN delivery s ON s.id = d.id LEFT JOIN draft_render_signatures r ON r.id = d.id
                    LEFT JOIN application_reviews a ON a.id = d.id
                    LEFT JOIN listing_profiles p ON p.id = d.id
                    WHERE d.id = ?""", (ref.id,),
             ).fetchone()
-            expected_signature = commercial_signature if draft and draft[7] else wg_signature
+            cached_role = application_recipient_role(draft[8], commercial=bool(draft[7])) if draft else "unknown"
+            expected_signature = signatures[cached_role]
             refresh_draft = bool(draft and not draft[6] and expected_signature and draft[5] != expected_signature)
             skip_draft = bool(draft and (not draft[1] or draft[2] or draft[3] or draft[6] or
                                        (not refresh_draft and (not self.delivery or self.delivery.paused))))
@@ -481,8 +496,11 @@ class Scanner:
                 continue
             if draft and draft[7] and not listing.is_commercial:
                 listing = replace(listing, is_commercial=True)
+            role = application_recipient_role(listing.recipient_role, draft[8] if draft else None,
+                                             commercial=listing.is_commercial)
+            listing = replace(listing, recipient_role=role) if role != listing.recipient_role else listing
             if draft and not (draft[2] or draft[3] or draft[6]) and draft[1] and self.render_signature:
-                expected_signature = commercial_signature if listing.is_commercial else wg_signature
+                expected_signature = signatures[role]
                 if draft[5] != expected_signature:
                     refresh_draft = True
                     skip_draft = False
@@ -598,7 +616,7 @@ class Scanner:
                 retry_after[listing.id] = now + (self.max_age if tier == "outside" else timedelta(minutes=10))
                 continue
             first_message = FirstMessageReview(listing.title, self.applicant_intro, self.viewing_availability,
-                                               self.applicant_answers, commercial=listing.is_commercial)
+                                               self.applicant_answers, recipient_role=listing.recipient_role)
             if draft and not refresh_draft:
                 with db:
                     remove_secondary_offer(db, listing.id)
@@ -608,13 +626,13 @@ class Scanner:
                     wg_template, listing.description, listing_url=listing.url, listing_title=listing.title,
                     provider=self.provider, listing_type="wg" if listing.is_wg else "wohnung", first_message=True,
                     viewing_slots=viewing_slots, applicant_answers=self.applicant_answers,
-                    applicant_intro=self.applicant_intro, commercial=listing.is_commercial,
+                    applicant_intro=self.applicant_intro, recipient_role=listing.recipient_role,
                 )
                 with db:
                     saved = save_application_draft(
                         db, listing.id, listing.url, fresh_at.timestamp(), basis, message,
                         context=listing.description, provider=self.outgoing_provider, now=now,
-                        signature=commercial_signature if listing.is_commercial else wg_signature,
+                        signature=signatures[listing.recipient_role],
                         previous_message=draft[1] if draft else None,
                         first_message=first_message,
                     )

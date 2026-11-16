@@ -152,13 +152,14 @@ class KleinanzeigenRadarTest(unittest.TestCase):
         cutoff = NOW - timedelta(days=1)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             radar.scan(db, inbox, NOW, cutoff, 10, {})
+            draft = db.execute("SELECT message FROM drafts").fetchall()
             router.coordinates.return_value = (48.128, 11.603)
 
             radar.scan(db, inbox, NOW, cutoff, 10, {})
 
             self.assertEqual(db.execute("SELECT latitude, longitude, route_tier, route_minutes FROM listing_profiles")
                              .fetchall(), [(48.128, 11.603, "a*", 17)])
-            self.assertEqual(db.execute("SELECT message FROM drafts").fetchall(), [("Hallo!",)])
+            self.assertEqual(db.execute("SELECT message FROM drafts").fetchall(), draft)
         router.classify.assert_called_once()
 
     def test_move_in_and_short_tenancy_exclusions_are_decided_before_routes_and_drafts(self):

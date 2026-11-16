@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -17,6 +17,9 @@ from rental_availability import AVAILABILITY_POLICY_VERSION
 
 from listing_photos import listing_photo_urls
 from listing_profiles import valid_listing_coordinates
+
+if TYPE_CHECKING:
+    from wg_source import RecipientRole
 
 
 _TABLE_COLUMNS = {
@@ -59,6 +62,7 @@ class ListingProfile:
     longitude: float | None = None
     map_eligible: bool = True
     is_commercial: bool = False
+    recipient_role: RecipientRole = "unknown"
 
 
 @dataclass(frozen=True)
@@ -114,6 +118,7 @@ class MapListing:
     rent_kind: str | None
     area_sqm: float | None
     is_commercial: bool = False
+    recipient_role: RecipientRole = "unknown"
 
 
 @dataclass(frozen=True)
@@ -211,6 +216,7 @@ def map_listings(data: DashboardData, *, date_filtered: bool = False) -> tuple[M
             row.id, row.url, row.platform, title or "Mietangebot", tier, minutes, station, latitude, longitude,
             profile.rent_eur if profile else None, profile.rent_kind if profile else None,
             profile.area_sqm if profile else None, bool(profile and profile.is_commercial),
+            profile.recipient_role if profile else "unknown",
         )
     return tuple(listings.values())
 
@@ -433,15 +439,16 @@ def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[s
     route_columns = "route_tier, route_minutes" if {"route_tier", "route_minutes"} <= columns else "NULL, NULL"
     location_columns = "latitude, longitude" if {"latitude", "longitude"} <= columns else "NULL, NULL"
     commercial_column = "is_commercial" if "is_commercial" in columns else "NULL"
+    role_column = "recipient_role" if "recipient_role" in columns else "NULL"
     available = _availability_filter(db, tables, "listing_profiles.id")
     rows = db.execute(f"""
         SELECT id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, {photo_column}, {route_columns},
-               {location_columns}, {available}, {commercial_column}
+               {location_columns}, {available}, {commercial_column}, {role_column}
         FROM listing_profiles WHERE id IN ({placeholders})
     """, tuple(ids))
     profiles = {}
     for (listing_id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photos_json, tier, minutes,
-         latitude, longitude, map_eligible, is_commercial) in rows:
+         latitude, longitude, map_eligible, is_commercial, role) in rows:
         try:
             photos = json.loads(photos_json) if photos_json else []
         except (ValueError, TypeError):
@@ -452,6 +459,7 @@ def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[s
         profiles[listing_id] = ListingProfile(
             title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photo_urls, tier, minutes,
             latitude, longitude, bool(map_eligible), is_commercial == 1,
+            role if role in ("manager", "roommate") else "unknown",
         )
     return profiles
 

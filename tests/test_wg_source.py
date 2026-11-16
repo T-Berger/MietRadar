@@ -87,14 +87,37 @@ class PublicPageTests(unittest.TestCase):
             <div class="rhs_contact_information"><a href="https://example.org/profile/company/fremd.999.html">Verifiziert</a></div>
         """
         self.stub_pages({ref.url: ad + '<div class="contact_box_sticky">Private:r Nutzer:in</div>'})
-        self.assertFalse(self.source.details(ref).is_commercial)
+        listing = self.source.details(ref)
+        self.assertFalse(listing.is_commercial)
+        self.assertEqual(listing.recipient_role, "unknown")
 
         self.stub_pages({ref.url: ad + '''
             <div class="contact_box_sticky">
                 <a href="/profile/company/vermietung.456.html">Zum Profil</a>
             </div>
         '''})
-        self.assertTrue(self.source.details(ref).is_commercial)
+        listing = self.source.details(ref)
+        self.assertTrue(listing.is_commercial)
+        self.assertEqual(listing.recipient_role, "manager")
+
+    def test_recipient_role_comes_from_the_contact_or_narrator(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/wg-zimmer-in-Muenchen.123.html")
+        for contact, description, expected in (
+            ("Private:r Nutzer:in", "Ich verwalte diese Wohnung.", "manager"),
+            ("Private:r Nutzer:in", "Ich bin Lea und wohne selbst in der WG. Unser Vermieter ist nett.", "roommate"),
+            ("Kontakt: Hausverwaltung", "Wir wohnen hier schon seit zwei Jahren.", "manager"),
+            ("Private:r Nutzer:in", "Das Zimmer ist frei. Der Vermieter wohnt nebenan.", "unknown"),
+            ("Private:r Nutzer:in", "Ich wohne nicht mehr in der WG.", "unknown"),
+        ):
+            with self.subTest(description=description, contact=contact):
+                self.stub_pages({ref.url: f"""
+                    <h1 class="detailed-view-title">WG-Zimmer in München</h1>
+                    <div class="contact_box_sticky">{contact}</div>
+                    <div id="freitext_0">{description}</div>
+                """})
+                listing = self.source.details(ref)
+                self.assertFalse(listing.is_commercial)
+                self.assertEqual(listing.recipient_role, expected)
 
     def test_visit_order_keeps_update_time_separate_from_publication(self):
         def card(listing_id, age, class_name="", partner=""):

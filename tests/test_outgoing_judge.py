@@ -2,6 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+from llm_personalizer import personalise_message
 from outgoing_judge import judge_outgoing
 
 
@@ -193,3 +194,24 @@ class OutgoingJudgeTest(unittest.TestCase):
         self.assertIn("Sie-Anrede", system)
         self.assertNotIn("Ein gemeinsamer Kochabend klingt gut", system)
         self.assertEqual(json.loads(payload)["vorstellung"], "Mein Name ist Alex Neumann. Ich arbeite als Architekt.")
+
+    def test_checks_generated_drafts_with_the_tone_of_the_contact_role(self):
+        intro = "Ich bin Alex Neumann, 31. Ich arbeite als Architekt. In meiner Freizeit koche ich gern."
+        practical_intro = "Mein Name ist Alex Neumann. Ich arbeite als Architekt."
+        for role, expected_tone, expected_intro in (
+            ("manager", "Sie-Anrede", practical_intro),
+            ("roommate", "wie man einer WG direkt schreiben würde", intro),
+            ("unknown", "Die Rolle der Kontaktperson ist unklar", practical_intro),
+        ):
+            with self.subTest(role=role), patch(
+                "outgoing_judge._generate_via_mistral", return_value='{"approved":true,"reason":"ok"}',
+            ) as complete:
+                draft = personalise_message(
+                    "Hi zusammen,\n\n{LLM_TEXT}\n\nViele Grüße\nAlex Neumann", "", provider="none",
+                    recipient_role=role, applicant_intro=intro,
+                )
+                verdict = judge_outgoing(draft, recipient_role=role, applicant_intro=intro, provider="mistral")
+                self.assertTrue(verdict.approved, verdict.reason)
+                system, payload, _ = complete.call_args.args
+                self.assertIn(expected_tone, system)
+                self.assertEqual(json.loads(payload)["vorstellung"], expected_intro)
