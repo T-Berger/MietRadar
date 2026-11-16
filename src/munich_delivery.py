@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from typing import Protocol
 
 from munich_tiers import install_secondary_offers
 from outgoing_judge import OutgoingJudgment, judge_outgoing
+from wg_first_message import viewing_slot_labels
 
 
 class DeliveryOutcome(Enum):
@@ -24,6 +26,24 @@ class DeliveryOutcome(Enum):
 
 class Sender(Protocol):
     def send(self, url: str, text: str, before_submit: Callable[[], bool]) -> DeliveryOutcome: ...
+
+
+@dataclass(frozen=True)
+class FirstMessageReview:
+    listing_title: str
+    applicant_intro: str
+    viewing_availability: tuple[datetime, ...]
+    applicant_answers: dict[str, str]
+
+    def slots(self, now: datetime) -> tuple[str, ...]:
+        return viewing_slot_labels(self.viewing_availability, now)
+
+    def judge(self, message: str, *, context: str, provider: str, now: datetime) -> OutgoingJudgment:
+        return judge_outgoing(
+            message, context=context, provider=provider, first_message=True, listing_title=self.listing_title,
+            applicant_intro=self.applicant_intro, viewing_slots=self.slots(now),
+            applicant_answers=self.applicant_answers,
+        )
 
 
 def install_schema(db: sqlite3.Connection) -> None:
@@ -54,8 +74,9 @@ def _record_outgoing(
                (item_id, kind, digest, verdict.approved, verdict.reason, now.timestamp()))
 
 
-def review_outgoing(db, item_id, message, *, kind, context="", provider="none", now):
-    verdict = judge_outgoing(message, kind=kind, context=context, provider=provider)
+def review_outgoing(db, item_id, message, *, kind, context="", provider="none", now, first_message=None):
+    verdict = (first_message.judge(message, context=context, provider=provider, now=now) if first_message else
+               judge_outgoing(message, kind=kind, context=context, provider=provider))
     with db:
         _record_outgoing(db, item_id, message, kind, verdict, now)
     return verdict
@@ -64,9 +85,11 @@ def review_outgoing(db, item_id, message, *, kind, context="", provider="none", 
 def save_application_draft(
     db: sqlite3.Connection, listing_id: str, url: str, fresh_at: float, basis: str, message: str,
     *, context: str, provider: str, now: datetime, signature: str | None = None, previous_message: str | None = None,
+    first_message: FirstMessageReview | None = None,
 ) -> bool:
     """Review the draft, then save both records in the caller's transaction."""
-    verdict = judge_outgoing(message, kind="application", context=context, provider=provider)
+    verdict = (first_message.judge(message, context=context, provider=provider, now=now) if first_message else
+               judge_outgoing(message, kind="application", context=context, provider=provider))
     if previous_message is None:
         saved = db.execute(
             "INSERT OR IGNORE INTO drafts(id, url, fresh_at, basis, message) VALUES (?, ?, ?, ?, ?)",
@@ -124,12 +147,13 @@ class DeliveryQueue:
     def deliver(
         self, db: sqlite3.Connection, listing_id: str, url: str, message: str,
         fresh_at: datetime, max_age: timedelta,
-        *, context: str = "",
+        *, context: str = "", first_message: FirstMessageReview | None = None,
     ) -> str | None:
         if self.paused or not self._eligible(db, listing_id, fresh_at, max_age):
             return None
+        checked_at = self.clock()
         if not review_outgoing(db, listing_id, message, kind="application", context=context,
-                               provider=self.judge_provider, now=self.clock()).approved:
+                               provider=self.judge_provider, now=checked_at, first_message=first_message).approved:
             return "Bewerbung vom Prüfer zurückgehalten"
 
         reserved = False
@@ -141,7 +165,10 @@ class DeliveryQueue:
                 db.execute("BEGIN IMMEDIATE")
                 if not self._eligible(db, listing_id, fresh_at, max_age):
                     return False
-                stamp = self.clock().timestamp()
+                submit_at = self.clock()
+                if first_message and first_message.slots(checked_at) != first_message.slots(submit_at):
+                    return False
+                stamp = submit_at.timestamp()
                 db.execute("INSERT INTO delivery VALUES (?, 'unconfirmed', ?, ?)", (listing_id, stamp, stamp))
             reserved = True
             return True
