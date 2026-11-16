@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 
 from dashboard_data import load_dashboard, weekend_dates
@@ -42,7 +43,7 @@ class DashboardDataTest(unittest.TestCase):
             ])
             db.execute("INSERT INTO delivery VALUES (?, ?, ?, ?)", ("ka-55", "sent", recent, recent))
             db.execute("INSERT INTO outgoing_checks VALUES (?, ?, ?, ?, ?, ?)",
-                       ("12", "application", "checksum", 0, "Termin klären", recent))
+                       ("12", "application", sha256(b"Hallo").hexdigest(), 0, "Termin klären", recent))
             db.execute("INSERT INTO klein_review VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                        ("ka-44", "https://www.kleinanzeigen.de/s-anzeige/wohnung/44-203-650",
                         "Zimmer", "", 1, recent, "Suchalarm", "Adresse fehlt"))
@@ -58,11 +59,51 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual([(row.id, row.platform, row.state, row.message) for row in data.matches], [
             ("12", "WG-Gesucht", "held", "Hallo"), ("ka-55", "Kleinanzeigen", "sent", None),
         ])
-        self.assertEqual(data.matches[0].review_reason, "Termin klären")
+        self.assertEqual(data.matches[0].judge_reason, "Termin klären")
+        self.assertIs(data.matches[0].judge_approved, False)
         self.assertEqual(data.address_checks[0].title, "Zimmer")
         self.assertEqual(data.replies[0].url, "https://www.kleinanzeigen.de/m-nachrichten.html#test")
         self.assertIsNone(data.activity[0].url)
         self.assertEqual(self.path.read_bytes(), original)
+
+    def test_shows_exact_queued_text_verdict_separately_from_browser_delay(self):
+        now = NOW.timestamp()
+        message = "Hallo"
+        digest = sha256(message.encode()).hexdigest()
+        previous_digest = sha256(b"Previous message").hexdigest()
+        with closing(_database(self.path)) as db, db:
+            for listing_id, check_digest in (("12", digest), ("13", previous_digest)):
+                db.execute("INSERT INTO drafts VALUES (?, ?, ?, ?, ?, ?)",
+                           (listing_id, f"https://www.wg-gesucht.de/{listing_id}.html",
+                            now, "Veröffentlicht", message, 0))
+                db.execute("INSERT INTO application_reviews VALUES (?, ?, 'queued', ?, ?, NULL)",
+                           (listing_id, digest, "Versandbrowser nicht verfügbar.", now))
+                db.execute("INSERT INTO outgoing_checks VALUES (?, 'application', ?, 0, ?, ?)",
+                           (listing_id, check_digest, "Ein persönlicher Bezug fehlt.", now))
+
+        matches = {row.id: row for row in load_dashboard(self.path, now=NOW).matches}
+        for row in matches.values():
+            self.assertEqual(row.state, "queued")
+            self.assertEqual(row.review_reason, "Versandbrowser nicht verfügbar.")
+            self.assertEqual(row.message, message)
+        self.assertIs(matches["12"].judge_approved, False)
+        self.assertEqual(matches["12"].judge_reason, "Ein persönlicher Bezug fehlt.")
+        self.assertIsNone(matches["13"].judge_approved)
+        self.assertIsNone(matches["13"].judge_reason)
+
+    def test_legacy_check_schema_does_not_claim_a_judgment_for_exact_text(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TABLE drafts (id TEXT, url TEXT, fresh_at REAL, basis TEXT, message TEXT, done INTEGER)")
+            db.execute("CREATE TABLE outgoing_checks (id TEXT, kind TEXT, approved INTEGER, reason TEXT)")
+            db.execute("INSERT INTO drafts VALUES ('12', ?, ?, 'Veröffentlicht', 'Hallo', 0)",
+                       ("https://www.wg-gesucht.de/12.html", NOW.timestamp()))
+            db.execute("INSERT INTO outgoing_checks VALUES ('12', 'application', 0, 'Termin klären')")
+
+        row, = load_dashboard(self.path, now=NOW).matches
+        self.assertEqual(row.state, "held")
+        self.assertEqual(row.review_reason, "Termin klären")
+        self.assertIsNone(row.judge_approved)
+        self.assertIsNone(row.judge_reason)
 
     def test_older_schema_without_delivery_keeps_drafts_visible(self):
         with closing(sqlite3.connect(self.path)) as db, db:
