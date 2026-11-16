@@ -129,6 +129,35 @@ Verbinde das Repo als [Dockerfile-Service](https://docs.railway.com/builds/docke
 
 Trage die Variablen aus der lokalen Anleitung in Railway ein, inklusive `MUNICH_MESSAGE_TEMPLATE` als mehrzeilige Variable. Lass den Dienst zuerst im Entwurfsmodus laufen. Der Versand braucht einen erfolgreichen Browserstart mit aktiver Chromium-Sandbox und eine reguläre Anmeldung. Für Kleinanzeigen muss das Browserprofil auf dem Host bereits angemeldet sein. Ohne interaktive Anmeldung auf dem Host kannst du den Kleinanzeigen-Versand lokal betreiben.
 
+#### Freigegebene WG-Gesucht-Bewerbungen über den Mac versenden
+
+Der Mac übernimmt den Versand über ein eigenes Chrome-Profil. Railway prüft die exakte Dashboard-Freigabe für Text und gegebenenfalls PDF und übernimmt die Rückmeldung zum Versand. Der Mac muss dafür wach sein und die macOS-Sitzung angemeldet bleiben.
+
+Lege den privaten Verbindungsschlüssel auf dem Mac an und kopiere ihn für die Railway-Variable `MUNICH_WG_RELAY_TOKEN` in die Zwischenablage. Setze in Railway auch `MUNICH_DASHBOARD_ENABLED=true` und `MUNICH_REVIEWED_SEND=true` und deploye den Dienst. Die HTTPS-Adresse des Dashboards ist zugleich die Adresse für die Verbindung vom Mac.
+
+```bash
+sender_dir="$HOME/Library/Application Support/MietRadar WG"
+(umask 077; mkdir -p "$sender_dir")
+if [ ! -f "$sender_dir/relay-token" ]; then
+  (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$sender_dir/relay-token")
+fi
+pbcopy < "$sender_dir/relay-token"
+```
+
+Führe im Repo die folgenden Befehle aus. Setze `relay_origin` auf die HTTPS-Adresse deines Dashboards. Der Befehl `login` öffnet Chrome für die Anmeldung bei WG-Gesucht. `check` prüft anschließend Anmeldung und Verbindung zu Railway. Der letzte Befehl installiert den Versanddienst für dein macOS-Konto.
+
+```bash
+relay_origin="https://mein-dashboard.up.railway.app"
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-send.txt
+.venv/bin/python src/wg_mac_worker.py login --profile "$sender_dir/chrome"
+.venv/bin/python src/wg_mac_worker.py check --profile "$sender_dir/chrome" \
+  --relay-url "$relay_origin" --token-file "$sender_dir/relay-token"
+scripts/install-wg-mac-relay.sh "$relay_origin" "$sender_dir/relay-token"
+```
+
+Das Protokoll steht im Ordner `~/Library/Application Support/MietRadar WG/worker.log`. Falls WG-Gesucht eine erneute Anmeldung verlangt, führe `login` erneut aus und starte den Dienst mit `launchctl kickstart "gui/$(id -u)/com.mietradar.wg-sender"`.
+
 Mit [Railway SSH](https://docs.railway.com/cli/ssh) kannst du Entwürfe und Versandstatus lesen:
 
 ```bash

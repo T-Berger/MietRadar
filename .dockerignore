@@ -14,6 +14,7 @@
 !src/wg_alerts.py
 !src/wg_preferences.py
 !src/wg_delivery.py
+!src/wg_delivery_relay.py
 !src/wg_first_message.py
 !src/reviewed_applications.py
 !src/rental_availability.py
