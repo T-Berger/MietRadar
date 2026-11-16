@@ -12,6 +12,7 @@ from typing import Protocol
 
 from munich_tiers import install_secondary_offers
 from outgoing_judge import OutgoingJudgment, judge_outgoing
+from reviewed_applications import install_application_reviews, review_is_pending
 from wg_first_message import viewing_slot_labels
 
 
@@ -34,6 +35,7 @@ class FirstMessageReview:
     applicant_intro: str
     viewing_availability: tuple[datetime, ...]
     applicant_answers: dict[str, str]
+    user_reviewed: bool = False
 
     def slots(self, now: datetime) -> tuple[str, ...]:
         return viewing_slot_labels(self.viewing_availability, now)
@@ -42,12 +44,13 @@ class FirstMessageReview:
         return judge_outgoing(
             message, context=context, provider=provider, first_message=True, listing_title=self.listing_title,
             applicant_intro=self.applicant_intro, viewing_slots=self.slots(now),
-            applicant_answers=self.applicant_answers,
+            applicant_answers=self.applicant_answers, user_reviewed=self.user_reviewed,
         )
 
 
 def install_schema(db: sqlite3.Connection) -> None:
     install_secondary_offers(db)
+    install_application_reviews(db)
     db.execute("""CREATE TABLE IF NOT EXISTS draft_render_signatures (
         id TEXT PRIMARY KEY REFERENCES drafts(id), signature TEXT NOT NULL
     )""")
@@ -99,6 +102,7 @@ def save_application_draft(
         saved = db.execute("""
             UPDATE drafts SET message = ? WHERE id = ? AND done = 0 AND message = ?
               AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = drafts.id)
+              AND NOT EXISTS (SELECT 1 FROM application_reviews WHERE id = drafts.id)
         """, (message, listing_id, previous_message))
     if saved.rowcount:
         _record_outgoing(db, listing_id, message, "application", verdict, now)
@@ -121,22 +125,28 @@ class DeliveryQueue:
         self.paused = False
         self.judge_provider = judge_provider
 
-    def _eligible(self, db: sqlite3.Connection, listing_id: str, fresh_at: datetime, max_age: timedelta) -> bool:
+    def _eligible(self, db: sqlite3.Connection, listing_id: str, fresh_at: datetime, max_age: timedelta,
+                  *, reviewed_message: str | None = None) -> bool:
         now = self.clock()
         # Keep the hard 24h ceiling for external delivery even when the draft
         # window has been configured to retain older listings for review.
         cutoff = now - min(max_age, timedelta(hours=24))
         if not cutoff <= fresh_at <= now:
             return False
-        info = db.execute(
-            """SELECT d.fresh_at FROM drafts d LEFT JOIN delivery s ON s.id = d.id
-               WHERE d.id = ? AND d.done = 0 AND d.message IS NOT NULL AND s.id IS NULL
-                 AND d.basis != 'zuerst gesehen'
-                 AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = d.id)""",
-            (listing_id,),
-        ).fetchone()
-        if info is None or not cutoff.timestamp() <= info[0] <= now.timestamp():
-            return False
+        if reviewed_message is not None:
+            if not review_is_pending(db, listing_id, reviewed_message, now, max_age):
+                return False
+        else:
+            info = db.execute(
+                """SELECT d.fresh_at FROM drafts d LEFT JOIN delivery s ON s.id = d.id
+                   WHERE d.id = ? AND d.done = 0 AND d.message IS NOT NULL AND s.id IS NULL
+                     AND d.basis != 'zuerst gesehen'
+                     AND NOT EXISTS (SELECT 1 FROM application_reviews r WHERE r.id = d.id)
+                     AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = d.id)""",
+                (listing_id,),
+            ).fetchone()
+            if info is None or not cutoff.timestamp() <= info[0] <= now.timestamp():
+                return False
         last_day = (now - timedelta(days=1)).timestamp()
         attempts = db.execute("""SELECT
             (SELECT COUNT(*) FROM delivery WHERE attempted_at >= ?) +
@@ -149,7 +159,9 @@ class DeliveryQueue:
         fresh_at: datetime, max_age: timedelta,
         *, context: str = "", first_message: FirstMessageReview | None = None,
     ) -> str | None:
-        if self.paused or not self._eligible(db, listing_id, fresh_at, max_age):
+        user_reviewed = bool(first_message and first_message.user_reviewed)
+        reviewed_message = message if user_reviewed else None
+        if self.paused or not self._eligible(db, listing_id, fresh_at, max_age, reviewed_message=reviewed_message):
             return None
         checked_at = self.clock()
         if not review_outgoing(db, listing_id, message, kind="application", context=context,
@@ -163,10 +175,10 @@ class DeliveryQueue:
             with db:
                 # Serialize the final quota and listing checks with the write.
                 db.execute("BEGIN IMMEDIATE")
-                if not self._eligible(db, listing_id, fresh_at, max_age):
+                if not self._eligible(db, listing_id, fresh_at, max_age, reviewed_message=reviewed_message):
                     return False
                 submit_at = self.clock()
-                if first_message and first_message.slots(checked_at) != first_message.slots(submit_at):
+                if first_message and not user_reviewed and first_message.slots(checked_at) != first_message.slots(submit_at):
                     return False
                 stamp = submit_at.timestamp()
                 db.execute("INSERT INTO delivery VALUES (?, 'unconfirmed', ?, ?)", (listing_id, stamp, stamp))

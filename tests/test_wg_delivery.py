@@ -28,6 +28,7 @@ class SenderTest(unittest.TestCase):
         self.link = element("Nachricht senden", CONTACT)
         self.link.click.side_effect = lambda: setattr(self.driver, "current_url", CONTACT)
         self.area = element()
+        self.area.send_keys.side_effect = self.compose
         self.area.find_element.side_effect = NoSuchElementException()
         self.submit = element("Senden")
         self.timestamp = element("Heute, 10:00")
@@ -39,6 +40,9 @@ class SenderTest(unittest.TestCase):
         self.web_wait = patch("wg_delivery.WebDriverWait", return_value=self.wait)
         self.web_wait.start()
         self.addCleanup(self.web_wait.stop)
+
+    def compose(self, text):
+        self.area.get_property.return_value = text
 
     def evaluate(self, predicate):
         if value := predicate(self.driver):
@@ -61,7 +65,10 @@ class SenderTest(unittest.TestCase):
 
     def test_checks_eligibility_immediately_before_click_and_confirms_delivery(self):
         call_order = []
-        self.area.send_keys.side_effect = lambda _: call_order.append("compose")
+        def compose(text):
+            self.compose(text)
+            call_order.append("compose")
+        self.area.send_keys.side_effect = compose
 
         def claim():
             call_order.append("claim")
@@ -77,6 +84,13 @@ class SenderTest(unittest.TestCase):
 
     def test_expired_or_claimed_elsewhere_does_not_click(self):
         self.assertIs(self.sender.send(PUBLIC, "Hallo", lambda: False), DeliveryOutcome.SKIPPED)
+        self.submit.click.assert_not_called()
+
+    def test_changed_browser_text_is_never_submitted(self):
+        self.area.send_keys.side_effect = lambda text: self.compose(text[:4])
+        claim = Mock()
+        self.assertIs(self.sender.send(PUBLIC, "Hallo zusammen!", claim), DeliveryOutcome.BLOCKED)
+        claim.assert_not_called()
         self.submit.click.assert_not_called()
 
     def test_already_contacted_listing_does_not_compose_or_click(self):
