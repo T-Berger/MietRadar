@@ -9,7 +9,7 @@ import sqlite3
 from http.client import HTTPException
 
 from kleinanzeigen_judge import _redact
-from listing_photos import listing_photo_urls
+from listing_photos import PHOTO_GALLERY_VERSION, listing_photo_urls
 from llm_personalizer import _generate_via_mistral
 from munich_transit import PRIMARY_TIERS, CommuteTier
 
@@ -37,14 +37,14 @@ def install_listing_profiles(db: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY, title TEXT NOT NULL,
             rent_eur REAL, rent_kind TEXT, area_sqm REAL,
             summary TEXT, fit TEXT, fit_reason TEXT,
-            summary_hash TEXT, summary_check TEXT, photo_urls TEXT,
+            summary_hash TEXT, summary_check TEXT, photo_urls TEXT, photo_gallery_version INTEGER,
             route_tier TEXT, route_minutes INTEGER,
             latitude REAL, longitude REAL, location_address_hash TEXT, is_commercial INTEGER,
             recipient_role TEXT
         )
     """)
     additions = {
-        "photo_urls": "TEXT", "route_tier": "TEXT", "route_minutes": "INTEGER",
+        "photo_urls": "TEXT", "photo_gallery_version": "INTEGER", "route_tier": "TEXT", "route_minutes": "INTEGER",
         "latitude": "REAL", "longitude": "REAL", "location_address_hash": "TEXT",
         "is_commercial": "INTEGER", "recipient_role": "TEXT",
     }
@@ -151,8 +151,8 @@ def record_listing_profile(
         db.execute("""
             INSERT INTO listing_profiles
                 (id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, summary_hash, summary_check,
-                 photo_urls, is_commercial, recipient_role)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 photo_urls, photo_gallery_version, is_commercial, recipient_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = COALESCE(NULLIF(excluded.title, ''), listing_profiles.title),
                 rent_eur = COALESCE(excluded.rent_eur, listing_profiles.rent_eur),
@@ -164,13 +164,15 @@ def record_listing_profile(
                 fit_reason = COALESCE(excluded.fit_reason, listing_profiles.fit_reason),
                 summary_hash = COALESCE(excluded.summary_hash, listing_profiles.summary_hash),
                 summary_check = COALESCE(excluded.summary_check, listing_profiles.summary_check),
-                photo_urls = CASE WHEN excluded.photo_urls = '[]' AND excluded.id LIKE 'ka-%'
+                photo_urls = CASE WHEN excluded.photo_urls = '[]' AND (
+                                      excluded.id LIKE 'ka-%' OR listing_profiles.photo_gallery_version IS NULL)
                                   THEN COALESCE(listing_profiles.photo_urls, '[]')
                                   ELSE excluded.photo_urls END,
+                photo_gallery_version = excluded.photo_gallery_version,
                 is_commercial = COALESCE(excluded.is_commercial, listing_profiles.is_commercial),
                 recipient_role = COALESCE(excluded.recipient_role, listing_profiles.recipient_role)
         """, (listing.id, title, listing.rent_eur, listing.rent_kind, listing.area_sqm, summary,
-              fit, reason, cached_hash, check, photos, is_commercial, recipient_role))
+              fit, reason, cached_hash, check, photos, PHOTO_GALLERY_VERSION, is_commercial, recipient_role))
         record_listing_route(db, listing.id, route_tier, route_minutes)
         if route_tier == "outside" or coordinates is not None:
             record_listing_location(db, listing.id, None if route_tier == "outside" else coordinates,

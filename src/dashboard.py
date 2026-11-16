@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from collections.abc import Sequence
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from html import escape
 from math import isfinite, log2
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import unquote, urlsplit
 
 import streamlit as st
@@ -38,11 +40,14 @@ STATES = {
 }
 _REVIEW_NOTICE = "mietradar_application_review_notice"
 _VISIBILITY_NOTICE = "mietradar_listing_visibility_notice"
+OFFERS_PER_PAGE = 4
+OfferRow = TypeVar("OfferRow", Match, DatedListing, SecondaryListing)
 SMALL_WORDS = {"am", "an", "auf", "für", "im", "in", "mit", "und", "von", "zu", "zur"}
 WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
 RENT_LABELS = {"warm": "Warmmiete", "cold": "Kaltmiete", "total": "Gesamtmiete"}
 FIT_LABELS = {"strong": "Passt gut", "possible": "Könnte passen", "unclear": "Noch unklar"}
 RECIPIENT_LABELS = {"manager": "Verwaltung/Vermietung", "roommate": "Mitbewohner"}
+COMMERCIAL_LABEL = "Gewerblicher Anbieter"
 PROVIDER_FILTER_LABELS: dict[ProviderFilter, str] = {
     "all": "Alle Anbieter",
     "commercial": "Gewerbliche Anbieter",
@@ -77,18 +82,15 @@ INTRO = """
   .radar-listing__source { font-weight: 650; }
   .radar-listing__badge { padding: .15rem .55rem; border-radius: .45rem; font-size: .76rem; font-weight: 650;
     background: #e1efed; color: #224a44; }
-  .radar-listing__photos { display: grid; gap: .55rem; }
+  .radar-listing__commercial { background: #fbe3a9; color: #523600; }
+  .radar-listing__photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(11rem, 45%), 1fr));
+    gap: .55rem; }
   .radar-listing__photo { position: relative; display: block; overflow: hidden; border-radius: .7rem;
     background: rgba(78, 133, 123, .12); }
   .radar-listing__photo::before { content: 'Inseratsfoto'; position: absolute; inset: 0; display: grid;
     place-items: center; color: var(--text-color); opacity: .75; font-size: .85rem; }
-  .radar-listing__photo img { position: relative; display: block; width: 100%; aspect-ratio: 16 / 9;
+  .radar-listing__photo img { position: relative; display: block; width: 100%; aspect-ratio: 4 / 3;
     object-fit: cover; font-size: 0; }
-  .radar-listing__cover img { aspect-ratio: 2 / 1; max-height: 15rem; }
-  .radar-listing__gallery summary { cursor: pointer; font-size: .88rem; font-weight: 650; }
-  .radar-listing__gallery[open] summary { margin-bottom: .6rem; }
-  .radar-listing__thumbnails { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(9rem, 100%), 1fr)); gap: .55rem; }
-  @media (max-width: 600px) { .radar-listing__cover img { aspect-ratio: 4 / 3; } }
   .radar-listing__facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(9rem, 100%), 1fr)); gap: .6rem; }
   .radar-listing__fact { background: rgba(78, 133, 123, .12); border-radius: .6rem; padding: .55rem .75rem; }
   .radar-listing__label { display: block; font-size: .78rem; opacity: .84; }
@@ -203,7 +205,7 @@ def _map_facts(row: MapListing) -> str:
     if rent and (rent_kind := RENT_LABELS.get(row.rent_kind)):
         rent = f"{rent} {rent_kind}"
     area = _format_value(row.area_sqm, "m²")
-    provider = "Gewerblich" if row.is_commercial else None
+    provider = COMMERCIAL_LABEL if row.is_commercial else None
     recipient = RECIPIENT_LABELS.get(row.recipient_role)
     return " · ".join(filter(None, (row.platform, provider, recipient, f"{route} {direction}", rent, area)))
 
@@ -281,10 +283,6 @@ def _offer_location_map(profile: ListingProfile | None, title: str, *, key: str)
         st.caption("Standort noch nicht bestätigt.")
         return
 
-    panel = st.expander("Lage auf der Karte", icon=":material/location_on:", key=key, on_change="rerun")
-    if not panel.open:
-        return
-
     import plotly.graph_objects as go
 
     latitude, longitude = point
@@ -296,9 +294,9 @@ def _offer_location_map(profile: ListingProfile | None, title: str, *, key: str)
         height=320, margin={"l": 0, "r": 0, "t": 0, "b": 0},
         map={**OSM_TILES, "center": {"lat": latitude, "lon": longitude}, "zoom": 15},
     )
-    with panel:
-        st.plotly_chart(figure, key=f"{key}_chart", config=MAP_CONFIG)
-        st.caption(OSM_COPYRIGHT)
+    st.markdown("**Lage auf der Karte**")
+    st.plotly_chart(figure, key=key, config=MAP_CONFIG)
+    st.caption(OSM_COPYRIGHT)
 
 
 def _listing_photos(photo_urls: tuple[str, ...]) -> str:
@@ -308,18 +306,13 @@ def _listing_photos(photo_urls: tuple[str, ...]) -> str:
     links = []
     for position, url in enumerate(photo_urls, start=1):
         source = escape(url, quote=True)
-        decoration = " radar-listing__cover" if position == 1 else ""
         links.append(
-            f'<a class="radar-listing__photo{decoration}" href="{source}" target="_blank" '
+            f'<a class="radar-listing__photo" href="{source}" target="_blank" '
             f'rel="noopener noreferrer" aria-label="Inseratsfoto {position} in voller Größe öffnen">'
             f'<img src="{source}" alt="Inseratsfoto {position}" loading="lazy" decoding="async" '
             'referrerpolicy="no-referrer"></a>'
         )
-    gallery = ""
-    if len(links) > 1:
-        gallery = ('<details class="radar-listing__gallery"><summary>Weitere Fotos</summary>'
-                   f'<div class="radar-listing__thumbnails">{"".join(links[1:])}</div></details>')
-    return f'<div class="radar-listing__photos">{links[0]}{gallery}</div>'
+    return f'<div class="radar-listing__photos" role="group" aria-label="Inseratsfotos">{"".join(links)}</div>'
 
 
 def _listing_card(
@@ -345,7 +338,10 @@ def _listing_card(
     if note:
         sections.append(f'<p class="radar-listing__foot">{escape(note)}</p>')
     badge = f'<span class="radar-listing__badge">{escape(status)}</span>' if status else ""
-    provider = '<span class="radar-listing__badge">Gewerblich</span>' if profile and profile.is_commercial else ""
+    provider = (
+        f'<span class="radar-listing__badge radar-listing__commercial">{COMMERCIAL_LABEL}</span>'
+        if profile and profile.is_commercial else ""
+    )
     recipient = RECIPIENT_LABELS.get(profile.recipient_role) if profile else None
     recipient_badge = f'<span class="radar-listing__badge">{recipient}</span>' if recipient else ""
     photos = _listing_photos(profile.photo_urls) if profile else ""
@@ -469,9 +465,24 @@ def _application(
         st.rerun()
 
 
+def _offer_page(rows: Sequence[OfferRow], view: str) -> Sequence[OfferRow]:
+    # Keep concurrent OpenStreetMap charts within the browser's WebGL context budget.
+    if len(rows) <= OFFERS_PER_PAGE:
+        return rows
+    page_count = (len(rows) + OFFERS_PER_PAGE - 1) // OFFERS_PER_PAGE
+    options = range(1, page_count + 1)
+    key = f"{view}_offer_page"
+    if st.session_state.get(key, 1) not in options:
+        del st.session_state[key]
+    page = st.selectbox("Angebotsseite", options, format_func=lambda page: f"{page} von {page_count}", key=key)
+    start = (page - 1) * OFFERS_PER_PAGE
+    return rows[start:start + OFFERS_PER_PAGE]
+
+
 def _matches(
     rows: tuple[Match, ...], hours: int, wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile],
     db_path: Path, *, review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
+    show_maps: bool,
 ) -> None:
     st.subheader("Neue Mietangebote", anchor=False)
     _scan_status(wg_scan)
@@ -481,15 +492,14 @@ def _matches(
         return
     platform = st.selectbox("Plattform", ["Alle", *platforms]) if len(platforms) > 1 else "Alle"
     category = st.selectbox("ÖPNV-Kategorie", ["A* und A", "A*", "A"])
-    shown = False
-    for row in rows:
-        if platform != "Alle" and row.platform != platform:
-            continue
+    filtered = [row for row in rows if (platform == "Alle" or row.platform == platform)
+                and (category == "A* und A" or _primary_route(profiles.get(row.id))[0] == category)]
+    if not filtered:
+        st.info("Keine Angebote mit diesen Filtern.")
+        return
+    for row in _offer_page(filtered, "current"):
         profile = profiles.get(row.id)
         tier, route = _primary_route(profile)
-        if category not in ("A* und A", tier):
-            continue
-        shown = True
         with st.container(border=True):
             date_label = f"{row.basis.capitalize()} · {_date(row.fresh_at)}"
             if row.basis == "zuerst gesehen":
@@ -509,14 +519,12 @@ def _matches(
             _listing_card(
                 profile, title=_headline(row.url), platform=row.platform,
                 status=f"{tier} · {status}", date_label=f"{date_label} · {row.id}", route=route,
-                map_key=f"current_map_{row.id}" if row.state != "unavailable" else None,
+                map_key=f"current_map_{row.id}" if show_maps and row.state != "unavailable" else None,
             )
             _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
                            row.url, view="current")
             _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
                          attachment=attachment)
-    if not shown:
-        st.info("Keine Angebote mit diesen Filtern.")
 
 
 def _scan_status(wg_scan: tuple[float, int] | None) -> None:
@@ -544,7 +552,7 @@ def _date_filter(today: date) -> tuple[DateBasis | None, tuple[date, date] | Non
 def _dated_offers(
     rows: tuple[DatedListing, ...], days: tuple[date, date] | None, basis: DateBasis,
     wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile], db_path: Path,
-    *, provider_filtered: bool = False,
+    *, provider_filtered: bool = False, show_maps: bool,
 ) -> None:
     sightings = basis == "first_seen"
     st.subheader("Zuerst erfasste Mietangebote" if sightings else "Veröffentlichte Mietangebote", anchor=False)
@@ -565,7 +573,7 @@ def _dated_offers(
         return
     if len(rows) == RESULT_LIMIT:
         st.caption(f"Anzeige auf {RESULT_LIMIT} Ergebnisse begrenzt.")
-    for row in rows:
+    for row in _offer_page(rows, "dated"):
         with st.container(border=True):
             if sightings:
                 date_label = (f"Zuerst gesehen am {WEEKDAYS[row.day.weekday()]}, {row.day:%d.%m.%Y}"
@@ -579,7 +587,8 @@ def _dated_offers(
                 tier, route = _primary_route(profile)
                 status = f"{tier} · {status}"
             _listing_card(profile, title=_headline(row.url), platform=row.platform,
-                          status=status, date_label=date_label, route=route, map_key=f"dated_map_{row.id}")
+                          status=status, date_label=date_label, route=route,
+                          map_key=f"dated_map_{row.id}" if show_maps else None)
             _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
                            row.url, view="dated")
 
@@ -606,8 +615,9 @@ def _secondary_offers(
     if not rows:
         st.info(f"Keine Angebote der Kategorie B oder C in den letzten {hours} Stunden.")
         return
+    page = _offer_page(sorted(rows, key=lambda row: row.tier), "secondary")
     for tier in ("b", "c"):
-        offers = [row for row in rows if row.tier == tier]
+        offers = [row for row in page if row.tier == tier]
         if not offers:
             continue
         st.subheader(f"Kategorie {tier.upper()}", anchor=False)
@@ -745,16 +755,17 @@ def main() -> None:
                 _credit_proof(db_path, attachment)
         if date_basis:
             _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan, data.listing_profiles, db_path,
-                          provider_filtered=provider != "all")
+                          provider_filtered=provider != "all", show_maps=bool(offers.open))
         else:
             _matches(data.matches, hours, data.wg_scan, data.listing_profiles, db_path,
                      review_available=data.application_reviews_available,
-                     reviewed_send=reviewed_send, attachment=attachment)
+                     reviewed_send=reviewed_send, attachment=attachment, show_maps=bool(offers.open))
     if map_tab.open:
         with map_tab:
             _listing_map(map_listings(data, date_filtered=date_basis is not None), db_path)
-    with secondary:
-        _secondary_offers(data.secondary_offers, hours, data.listing_profiles, db_path)
+    if secondary.open:
+        with secondary:
+            _secondary_offers(data.secondary_offers, hours, data.listing_profiles, db_path)
     with address:
         _addresses(data.address_checks, data.listing_profiles, db_path)
     with replies:

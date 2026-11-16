@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from kleinanzeigen_activity import EmailNotifier, install_activity, record_activity, record_replies
 from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
+from listing_photos import LEGACY_PHOTO_GALLERY_LIMIT, PHOTO_GALLERY_VERSION
 from listing_profiles import (
     ROUTE_FIT, install_listing_profiles, record_listing_location, record_listing_profile, record_listing_route,
 )
@@ -400,7 +401,11 @@ class Scanner:
             refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
 
         metadata_backfill = db.execute("""
-            SELECT f.url, p.photo_urls IS NULL, MAX(f.check_route) AND p.route_tier IS NULL,
+            SELECT f.url,
+                   p.photo_urls IS NULL OR (COALESCE(p.photo_gallery_version, 0) < ? AND
+                       CASE WHEN json_valid(p.photo_urls) THEN json_array_length(p.photo_urls) = ? ELSE 0 END
+                   ) AS photos_outdated,
+                   MAX(f.check_route) AND p.route_tier IS NULL,
                    a.policy_version IS NOT ? AS availability_outdated,
                    (p.latitude IS NULL OR p.longitude IS NULL)
                        AND (MAX(f.is_secondary) OR p.route_tier IN ('a*', 'a')) AS location_missing
@@ -415,10 +420,11 @@ class Scanner:
                 LEFT JOIN listing_availability a ON a.id = f.id
             WHERE f.id NOT LIKE 'ka-%' AND f.fresh_at BETWEEN ? AND ?
             GROUP BY f.id
-            HAVING p.photo_urls IS NULL OR (MAX(f.check_route) AND p.route_tier IS NULL)
+            HAVING photos_outdated OR (MAX(f.check_route) AND p.route_tier IS NULL)
                 OR availability_outdated OR (location_missing AND a.reason IS NULL)
             ORDER BY availability_outdated DESC, p.photo_urls IS NOT NULL, MAX(f.fresh_at) DESC
-        """, (AVAILABILITY_POLICY_VERSION, cutoff.timestamp(), now.timestamp()))
+        """, (PHOTO_GALLERY_VERSION, LEGACY_PHOTO_GALLERY_LIMIT, AVAILABILITY_POLICY_VERSION,
+              cutoff.timestamp(), now.timestamp()))
         metadata_limit = self.limit if inventory_error is not None else (self.limit + 1) // 2
         metadata_refs = []
         for url, photos, route, availability, location in metadata_backfill:
@@ -481,8 +487,13 @@ class Scanner:
                     reject_unavailable_approval(db, ref.id, reason, now)
                     record_listing_location(db, ref.id, None)
                     if ref.id in photo_ids:
-                        db.execute("""INSERT INTO listing_profiles(id, title, photo_urls) VALUES (?, '', '[]')
-                                      ON CONFLICT(id) DO UPDATE SET photo_urls = excluded.photo_urls""", (ref.id,))
+                        db.execute("""
+                            INSERT INTO listing_profiles(id, title, photo_urls, photo_gallery_version)
+                            VALUES (?, '', '[]', ?)
+                            ON CONFLICT(id) DO UPDATE SET
+                                photo_urls = COALESCE(listing_profiles.photo_urls, excluded.photo_urls),
+                                photo_gallery_version = excluded.photo_gallery_version
+                        """, (ref.id, PHOTO_GALLERY_VERSION))
                 counts[reason] += 1
                 retry_after[ref.id] = now + self.max_age
                 continue

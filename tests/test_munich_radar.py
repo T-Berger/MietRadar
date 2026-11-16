@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from contextlib import closing
@@ -408,6 +409,39 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT photo_urls FROM listing_profiles").fetchone(), (f'["{photo}"]',))
             self.assertEqual(db.execute("SELECT message FROM drafts").fetchone(), ("Vorhandener Entwurf",))
         source.details.assert_called_once_with(ref(listing))
+        router.classify.assert_not_called()
+
+    def test_legacy_five_photo_galleries_refresh_once_under_the_metadata_budget(self):
+        def photos(prefix, count):
+            return tuple(f"https://img.wg-gesucht.de/media/up/2026/46/{prefix}-{index}.jpg"
+                         for index in range(count))
+
+        expanded = replace(offer(1, 1), photo_urls=photos("expanded", 7))
+        unchanged = replace(offer(2, 2), photo_urls=photos("unchanged", 5))
+        profiles = {listing.id: listing for listing in (expanded, unchanged)}
+        source, router = Mock(inventory_scope="munich"), Mock()
+        source.candidates.return_value = []
+        source.details.side_effect = lambda item: profiles[item.id]
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(days=1), 2)
+
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                for listing in profiles.values():
+                    db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Mein Entwurf', 0)",
+                               (listing.id, listing.url, listing.published_at.timestamp()))
+                    db.execute("""INSERT INTO listing_profiles(id, title, route_tier, latitude, longitude, photo_urls)
+                                  VALUES (?, ?, 'a', 48.128, 11.603, ?)""",
+                               (listing.id, listing.title, json.dumps(listing.photo_urls[:5])))
+                    record_listing_availability(db, listing.id, None)
+
+            self.assertEqual(scanner.scan(db, NOW, {})["Inserate mit Fotos ergänzt"], 1)
+            self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Inserate mit Fotos ergänzt"], 1)
+            self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=2), {})["Inserate mit Fotos ergänzt"], 0)
+            saved = dict(db.execute("SELECT id, photo_urls FROM listing_profiles"))
+            for listing in profiles.values():
+                self.assertEqual(tuple(json.loads(saved[listing.id])), listing.photo_urls)
+
+        self.assertEqual(source.details.call_count, 2)
         router.classify.assert_not_called()
 
     def test_coordinates_backfill_leaves_existing_drafts_and_commute_tiers_intact(self):
