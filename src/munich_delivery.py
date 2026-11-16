@@ -14,6 +14,7 @@ from typing import Protocol
 
 from munich_tiers import install_secondary_offers
 from outgoing_judge import OutgoingJudgment, judge_outgoing
+from rental_availability import AVAILABILITY_POLICY_VERSION
 from reviewed_applications import ApplicationAttachment, install_application_reviews, review_is_pending
 from wg_first_message import viewing_slot_labels
 
@@ -147,8 +148,10 @@ class DeliveryQueue:
                      AND NOT EXISTS (SELECT 1 FROM application_reviews r WHERE r.id = d.id)
                      AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = d.id)
                      AND NOT EXISTS (SELECT 1 FROM listing_availability a WHERE a.id = d.id AND a.reason IS NOT NULL)
-                     AND (d.id NOT LIKE 'ka-%' OR EXISTS (SELECT 1 FROM listing_availability a WHERE a.id = d.id))""",
-                (listing_id,),
+                     AND (d.id NOT LIKE 'ka-%' OR EXISTS (
+                         SELECT 1 FROM listing_availability a WHERE a.id = d.id AND a.policy_version = ?
+                     ))""",
+                (listing_id, AVAILABILITY_POLICY_VERSION),
             ).fetchone()
             if info is None or not cutoff.timestamp() <= info[0] <= now.timestamp():
                 return False

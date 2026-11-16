@@ -14,7 +14,7 @@ from llm_personalizer import personalise_message
 from munich_delivery import DeliveryQueue, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer
 from munich_transit import MUNICH_TIME, PRIMARY_TIERS, TransitRouter
-from rental_availability import availability_rejection, record_listing_availability
+from rental_availability import AVAILABILITY_POLICY_VERSION, availability_rejection, record_listing_availability
 from wg_alerts import AlertsInbox
 from wg_preferences import rejection_reason
 
@@ -196,12 +196,12 @@ class KleinanzeigenRadar:
         send_window = min(now - cutoff, timedelta(hours=24))
         rows = db.execute("""SELECT d.id, d.url, d.message, d.fresh_at, o.address FROM drafts d
             JOIN klein_origins o ON o.id = d.id
-            JOIN listing_availability a ON a.id = d.id AND a.reason IS NULL
+            JOIN listing_availability a ON a.id = d.id AND a.reason IS NULL AND a.policy_version = ?
             LEFT JOIN delivery s ON s.id = d.id
             WHERE d.done = 0 AND d.message IS NOT NULL AND d.fresh_at BETWEEN ? AND ? AND s.id IS NULL
               AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o2 WHERE o2.id = d.id)
             ORDER BY d.fresh_at DESC, d.id DESC
-        """, ((now - send_window).timestamp(), now.timestamp()))
+        """, (AVAILABILITY_POLICY_VERSION, (now - send_window).timestamp(), now.timestamp()))
         for listing_id, url, message, fresh_at, address in rows.fetchall():
             if self.delivery.paused:
                 break

@@ -29,7 +29,7 @@ from llm_personalizer import (
 from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, review_outgoing, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import PRIMARY_TIERS, TransitRouter
-from rental_availability import availability_rejection, record_listing_availability
+from rental_availability import AVAILABILITY_POLICY_VERSION, availability_rejection, record_listing_availability
 from reviewed_applications import (
     ReviewedApplication, fail_application_review, get_application_attachment, pending_application_reviews,
     reject_unavailable_approval, set_application_wait_reason,
@@ -39,7 +39,7 @@ from wg_first_message import applicant_answers, viewing_availability, viewing_sl
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
 from wg_preferences import rejection_reason
 from wg_reply_drafts import install_wg_reply_drafts, sync_wg_reply_drafts
-from wg_source import DEFAULT_SEARCH_URLS, Listing, ListingRef, WGListingGone, WGSource, WGSourceError
+from wg_source import DEFAULT_SEARCH_URLS, Listing, ListingRef, WGAccessBlocked, WGListingGone, WGSource, WGSourceError
 
 if TYPE_CHECKING:
     from wg_reply_inbox import WGInboxEntry
@@ -159,7 +159,10 @@ class Scanner:
         self, db: sqlite3.Connection, item: ReviewedApplication, now: datetime,
     ) -> str | None:
         """Check older offers and rejudge the approved text without starting a send."""
-        needs_availability = not db.execute("SELECT 1 FROM listing_availability WHERE id = ?", (item.id,)).fetchone()
+        needs_availability = not db.execute(
+            "SELECT 1 FROM listing_availability WHERE id = ? AND policy_version = ?",
+            (item.id, AVAILABILITY_POLICY_VERSION),
+        ).fetchone()
         needs_judgment = self.outgoing_provider == "mistral" and not db.execute("""
             SELECT 1 FROM outgoing_checks
             WHERE id = ? AND kind = 'application' AND message_hash = ? AND checked_at >= ?
@@ -307,20 +310,27 @@ class Scanner:
                 LOG.warning("Kleinanzeigen-Suchalarm nicht erreichbar: %s", exc)
 
         observations = {}
-        if self.alerts:
-            refs = [(alert.ref, alert.received_at) for alert in self.alerts.recent(cutoff, self.limit)]
-        else:
-            inventory = self.source.candidates()
-            observations = record_inventory(db, inventory, self.source.inventory_scope, now, cutoff)
-            counts["WG-Gesucht-Angebote beobachtet"] = len(inventory)
-            candidates = sorted(
-                (ref for ref in inventory if ref.id in observations),
-                key=lambda ref: (
-                    observations[ref.id].recent_first_seen(cutoff) is None,
-                    observations[ref.id].details_checked_at or 0,
-                ),
-            )
-            refs = [(ref, None) for ref in candidates]
+        refs: list[tuple[ListingRef, datetime | None]] = []
+        inventory_error = None
+        try:
+            if self.alerts:
+                refs = [(alert.ref, alert.received_at) for alert in self.alerts.recent(cutoff, self.limit)]
+            else:
+                inventory = self.source.candidates()
+                observations = record_inventory(db, inventory, self.source.inventory_scope, now, cutoff)
+                counts["WG-Gesucht-Angebote beobachtet"] = len(inventory)
+                candidates = sorted(
+                    (ref for ref in inventory if ref.id in observations),
+                    key=lambda ref: (
+                        observations[ref.id].recent_first_seen(cutoff) is None,
+                        observations[ref.id].details_checked_at or 0,
+                    ),
+                )
+                refs = [(ref, None) for ref in candidates]
+        except WGAccessBlocked:
+            raise
+        except (WGSourceError, AlertsError) as exc:
+            inventory_error = exc
 
         refresh_refs = []
         if wg_signature:
@@ -337,7 +347,9 @@ class Scanner:
             refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
 
         metadata_backfill = db.execute("""
-            SELECT f.url, p.photo_urls IS NULL, MAX(f.check_route) AND p.route_tier IS NULL, a.id IS NULL FROM (
+            SELECT f.url, p.photo_urls IS NULL, MAX(f.check_route) AND p.route_tier IS NULL,
+                   a.policy_version IS NOT ? AS availability_outdated
+            FROM (
                 SELECT id, url, fresh_at,
                        NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id) AS check_route
                 FROM drafts d WHERE done = 0 AND message IS NOT NULL
@@ -346,13 +358,21 @@ class Scanner:
             ) f LEFT JOIN listing_profiles p ON p.id = f.id
                 LEFT JOIN listing_availability a ON a.id = f.id
             WHERE f.id NOT LIKE 'ka-%' AND f.fresh_at BETWEEN ? AND ?
-              AND (p.photo_urls IS NULL OR (f.check_route AND p.route_tier IS NULL) OR a.id IS NULL)
-            GROUP BY f.id ORDER BY p.photo_urls IS NOT NULL, MAX(f.fresh_at) DESC LIMIT ?
-        """, (cutoff.timestamp(), now.timestamp(), (self.limit + 1) // 2)).fetchall()
-        metadata_refs = [(ref, photos, route, availability) for url, photos, route, availability in metadata_backfill
-                         if (ref := ListingRef.from_url(url))]
+              AND (p.photo_urls IS NULL OR (f.check_route AND p.route_tier IS NULL) OR a.policy_version IS NOT ?)
+            GROUP BY f.id ORDER BY availability_outdated DESC, p.photo_urls IS NOT NULL, MAX(f.fresh_at) DESC
+        """, (AVAILABILITY_POLICY_VERSION, cutoff.timestamp(), now.timestamp(), AVAILABILITY_POLICY_VERSION))
+        metadata_limit = self.limit if inventory_error is not None else (self.limit + 1) // 2
+        metadata_refs = []
+        for url, photos, route, availability in metadata_backfill:
+            ref = ListingRef.from_url(url)
+            if ref is not None and ref.id not in retry_after:
+                metadata_refs.append((ref, photos, route, availability))
+                if len(metadata_refs) >= metadata_limit:
+                    break
+        metadata_backfill.close()
         photo_ids = {ref.id for ref, photos, _, _ in metadata_refs if photos}
         route_ids = {ref.id for ref, _, route, _ in metadata_refs if route}
+        availability_ids = {ref.id for ref, _, _, availability in metadata_refs if availability}
         metadata_ids = {ref.id for ref, _, _, _ in metadata_refs}
         original_ids = {ref.id for ref, _ in refs}
         refresh_ids = {ref.id for ref, _ in refresh_refs}
@@ -361,11 +381,13 @@ class Scanner:
             if ref.id not in queued_ids:
                 refs.append((ref, None))
                 queued_ids.add(ref.id)
-        refs.sort(key=lambda row: (row[0].id not in refresh_ids, row[0].id not in photo_ids,
+        refs.sort(key=lambda row: (row[0].id not in availability_ids, row[0].id not in refresh_ids, row[0].id not in photo_ids,
                                    row[0].id not in original_ids))
 
         eligible = []
         detail_reads = 0
+        detail_errors = 0
+        detail_error = None
         for ref, received_at in refs:
             if ref.id in retry_after:
                 continue
@@ -386,13 +408,24 @@ class Scanner:
             try:
                 listing = self.source.details(ref)
             except WGListingGone:
+                reason = "Anzeige nicht mehr verfügbar"
                 with db:
+                    record_listing_availability(db, ref.id, reason)
                     remove_secondary_offer(db, ref.id)
+                    reject_unavailable_approval(db, ref.id, reason, now)
                     if ref.id in photo_ids:
                         db.execute("""INSERT INTO listing_profiles(id, title, photo_urls) VALUES (?, '', '[]')
                                       ON CONFLICT(id) DO UPDATE SET photo_urls = excluded.photo_urls""", (ref.id,))
-                counts["nicht mehr verfügbar"] += 1
+                counts[reason] += 1
                 retry_after[ref.id] = now + self.max_age
+                continue
+            except WGAccessBlocked:
+                raise
+            except WGSourceError as exc:
+                detail_error = exc
+                detail_errors += 1
+                counts["Inserate derzeit nicht abrufbar"] += 1
+                retry_after[ref.id] = now + timedelta(minutes=5)
                 continue
             record_listing_profile(db, listing)
             if reason := self._check_availability(db, listing, now):
@@ -523,6 +556,10 @@ class Scanner:
                                                context=listing.description, first_message=first_message)
                 if result:
                     counts[result] += 1
+        if inventory_error is not None:
+            raise inventory_error
+        if detail_error is not None and detail_reads == detail_errors:
+            raise detail_error
         return counts
 
 

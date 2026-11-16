@@ -13,6 +13,8 @@ from typing import Literal
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+from rental_availability import AVAILABILITY_POLICY_VERSION
+
 from listing_photos import listing_photo_urls
 
 
@@ -193,9 +195,15 @@ def _parse_day(raw: str | None) -> date | None:
         return None
 
 
-def _availability_filter(tables: set[str], listing_id: str) -> str:
+def _availability_filter(db: sqlite3.Connection, tables: set[str], listing_id: str) -> str:
     if "listing_availability" not in tables:
         return "1"
+    if "policy_version" in _columns(db, "listing_availability"):
+        return f"""EXISTS (
+            SELECT 1 FROM listing_availability availability
+            WHERE availability.id = {listing_id} AND availability.reason IS NULL
+              AND availability.policy_version = {AVAILABILITY_POLICY_VERSION}
+        )"""
     return f"""NOT EXISTS (
         SELECT 1 FROM listing_availability availability
         WHERE availability.id = {listing_id} AND availability.reason IS NOT NULL
@@ -219,7 +227,7 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     observations = _columns(db, "wg_observations") if "wg_observations" in tables else set()
     observation_join = "LEFT JOIN wg_observations o ON o.id = d.id" if {"id", "published_day"} <= observations else ""
     day = "o.published_day" if observation_join else "NULL"
-    available = _availability_filter(tables, "d.id")
+    available = _availability_filter(db, tables, "d.id")
     secondary_filter = ""
     parameters = [cutoff, until]
     if "munich_secondary_offers" in tables:
@@ -261,7 +269,7 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
 
 
 def _address_checks(db: sqlite3.Connection, tables: set[str], cutoff: float, until: float) -> tuple[AddressCheck, ...]:
-    available = _availability_filter(tables, "r.id")
+    available = _availability_filter(db, tables, "r.id")
     rows = db.execute(f"""
         SELECT r.id, r.url, r.title, r.fresh_at, r.basis, r.reason FROM klein_review r
         WHERE r.fresh_at BETWEEN ? AND ? AND {available} ORDER BY r.fresh_at DESC, r.id DESC LIMIT ?
@@ -273,7 +281,7 @@ def _address_checks(db: sqlite3.Connection, tables: set[str], cutoff: float, unt
 def _secondary_offers(
     db: sqlite3.Connection, tables: set[str], cutoff: float, until: float,
 ) -> tuple[SecondaryListing, ...]:
-    available = _availability_filter(tables, "m.id")
+    available = _availability_filter(db, tables, "m.id")
     rows = db.execute(f"""
         SELECT m.id, m.url, m.title, m.fresh_at, m.basis, m.tier, m.station, m.minutes FROM munich_secondary_offers m
         WHERE m.fresh_at BETWEEN ? AND ? AND m.minutes BETWEEN 1 AND 45 AND {available}
@@ -377,7 +385,7 @@ def _dated_listings(
     has_observations = {"id", "url", "published_at"} <= observation_columns
     has_observation_day = "published_day" in observation_columns
     matched = "EXISTS (SELECT 1 FROM drafts d WHERE d.id = o.id)" if has_drafts else "0"
-    observations_filter = _availability_filter(tables, "o.id")
+    observations_filter = _availability_filter(db, tables, "o.id")
 
     if basis == "first_seen":
         if not has_observations or "first_seen_at" not in observation_columns:
@@ -419,7 +427,7 @@ def _dated_listings(
 
     if has_drafts:
         fallback = ""
-        drafts_filter = _availability_filter(tables, "d.id")
+        drafts_filter = _availability_filter(db, tables, "d.id")
         if has_observations:
             day_clause = " OR o.published_day IS NOT NULL" if has_observation_day else ""
             fallback = f"""AND NOT EXISTS (SELECT 1 FROM wg_observations o WHERE o.id = d.id

@@ -101,6 +101,15 @@ Wohnfläche: 75 m²
         self.assertEqual((listing.available_from, listing.available_until), (date(2026, 12, 15), date(2027, 4, 15)))
         self.assertIsNone(listing.published_at)
 
+    def test_keeps_a_move_in_month_found_only_in_the_plain_alternate(self):
+        email = EmailMessage()
+        email["From"] = SENDER
+        email.set_content(f"Verfügbar ab Januar 2027\n{ROOM}")
+        email.add_alternative(f'<article><a href="{ROOM}">Zimmer mit Balkon</a></article>', subtype="html")
+        [listing] = extract_listings(email.as_bytes(), SENDER)
+        self.assertEqual(listing.title, "Zimmer mit Balkon")
+        self.assertIn("Verfügbar ab Januar 2027", listing.description)
+
     def test_manual_location_must_be_a_complete_munich_address(self):
         self.assertEqual(normalize_munich_address("Maximilianstr. 4 A, 80539 München"),
                          "Maximilianstr. 4 A, 80539 München")
