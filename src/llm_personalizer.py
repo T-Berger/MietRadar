@@ -54,12 +54,12 @@ _MORE_ABOUT_ME = re.compile(
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])(?<!\d\.)\s+")
 _NAME_WORD = r"[A-ZÄÖÜ][^\W\d_]*(?:[’'-][^\W\d_]+)*"
 _NAME = rf"{_NAME_WORD}(?: +(?:(?:von|van|de|der) +)?{_NAME_WORD})*"
-_COMMERCIAL_NAME = re.compile(
+_PROFILE_NAME = re.compile(
     rf"^(?i:ich\s+(?:heiße|heisse)|mein\s+name\s+ist)\s+(?P<name>{_NAME})"
     r"(?=\s*(?:[,!.]|und\b|$))",
 )
 _NAME_BEFORE_AGE = re.compile(rf"^(?i:ich\s+bin\s+(?:(?:der|die)\s+)?)(?P<name>{_NAME})\s*,\s*\d{{1,3}}\b")
-_COMMERCIAL_WORK = re.compile(
+_PROFILE_OCCUPATION = re.compile(
     r"(?:(?:^|(?<=[.!?])\s+)(?:ich|beruflich)\s+|\bund\s+)"
     r"(?P<work>(?:arbeite|studiere|mache eine Ausbildung|bin berufstätig)\b.*)",
     re.I,
@@ -777,7 +777,7 @@ def _first_message_details(description: str, title: str, offer_type: str, provid
 def _viewing_question(
     slots: tuple[str, ...], offer_type: str, *, recipient_role: RecipientRole | None = None,
 ) -> str:
-    roommate = offer_type == "wg" and recipient_role != "unknown"
+    roommate = recipient_role == "roommate" or (recipient_role is None and offer_type == "wg")
     if not slots:
         if recipient_role == "manager":
             return "Könnten Sie mir einen Besichtigungstermin vorschlagen?"
@@ -878,10 +878,11 @@ def applicant_intro_from_template(template: str) -> str:
     return ""
 
 
-def _commercial_intro(applicant_intro: str, template: str = "") -> str:
+def _short_rental_intro(applicant_intro: str, template: str = "") -> str:
+    """Select the supplied name and occupation for a concise rental inquiry."""
     profile = applicant_intro.strip() or applicant_intro_from_template(template)
     sentences = re.split(r"\n|(?<=[.!?])(?<!\d\.)\s+", profile)
-    name = next((match["name"] for part in sentences if (match := _COMMERCIAL_NAME.match(part.strip()))), "")
+    name = next((match["name"] for part in sentences if (match := _PROFILE_NAME.match(part.strip()))), "")
     if not name:
         lines = template.strip().splitlines()
         if (len(lines) >= 2 and _SIGN_OFF.match(lines[-2].strip())
@@ -892,7 +893,7 @@ def _commercial_intro(applicant_intro: str, template: str = "") -> str:
     occupation = ""
     for part in sentences:
         practical = _PERSONAL_ASIDE.split(part.strip(), maxsplit=1)[0]
-        if match := _COMMERCIAL_WORK.search(practical):
+        if match := _PROFILE_OCCUPATION.search(practical):
             occupation = re.split(r",?\s+und\s+", match["work"], maxsplit=1, flags=re.I)[0].rstrip(",.!? ")
             break
     facts = [f"Mein Name ist {name}."] if name else []
@@ -905,7 +906,7 @@ def _short_rental_message(
     template: str, description: str, title: str, offer_type: str, provider: str,
     viewing_slots: tuple[str, ...], applicant_answers: dict[str, str], applicant_intro: str, role: RecipientRole,
 ) -> str:
-    intro = _commercial_intro(applicant_intro, template)
+    intro = _short_rental_intro(applicant_intro, template)
     if role == "manager":
         accommodation = "Ihre Wohnung" if offer_type == "wohnung" else "Ihr Zimmer"
         greeting, closing = "Guten Tag,", "Mit freundlichen Grüßen"

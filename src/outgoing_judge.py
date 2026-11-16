@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from kleinanzeigen_judge import _redact, judge_reply
 from llm_personalizer import (
-    _advertisement_voice, _commercial_intro, _effective_recipient_role, _generate_via_mistral, _truncate_description,
+    _advertisement_voice, _effective_recipient_role, _generate_via_mistral, _short_rental_intro, _truncate_description,
 )
 
 if TYPE_CHECKING:
@@ -95,7 +95,8 @@ _MANAGER_FIRST_MESSAGE_TONE = (
     "Eine kurze und freundliche Mietanfrage mit Sie-Anrede und einer konkreten Frage zur Besichtigung passt. "
     "Name, Beruf und ein möglicher Einzugstermin genügen, sofern bekannt. Hobbys und ein Kennenlernen des WG-Lebens "
     "sind hier keine Voraussetzung. „Guten Tag“ und „Mit freundlichen Grüßen“ sind angemessen. "
-    "Wenn keine privaten Angaben vorliegen, ist eine Anfrage ohne erfundene Vorstellung gültig."
+    "Wenn keine privaten Angaben vorliegen, ist eine Anfrage ohne erfundene Vorstellung gültig. "
+    "Bankdaten, Einkommensangaben, Vertragszusagen und Zusagen über Unterlagen dürfen nie erfunden werden."
 )
 _UNKNOWN_FIRST_MESSAGE_TONE = (
     "Die Rolle der Kontaktperson ist unklar. Eine kurze, freundliche und neutrale Nachricht wie „Hallo“ und "
@@ -208,7 +209,7 @@ def judge_outgoing(
     if first_message and (reason := _ad_language_hold(text, listing_title, context)):
         return OutgoingJudgment(False, reason)
     short_intro = role in {"manager", "unknown"}
-    expected_intro = _commercial_intro(applicant_intro) if short_intro else applicant_intro
+    expected_intro = _short_rental_intro(applicant_intro) if short_intro else applicant_intro
     if first_message and not user_reviewed and (
         reason := _first_message_hold(text, expected_intro, viewing_slots, short_intro=short_intro)
     ):
