@@ -26,11 +26,12 @@ from llm_personalizer import (
     applicant_intro_from_template, application_render_signature, personalise_message,
     revise_first_message_draft, with_applicant_intro,
 )
-from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, save_application_draft
+from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, review_outgoing, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import PRIMARY_TIERS, TransitRouter
 from reviewed_applications import (
-    fail_application_review, get_application_attachment, pending_application_reviews, set_application_wait_reason,
+    ReviewedApplication, fail_application_review, get_application_attachment, pending_application_reviews,
+    set_application_wait_reason,
 )
 from wg_alerts import AlertsError, AlertsInbox
 from wg_first_message import applicant_answers, viewing_availability, viewing_slot_labels
@@ -140,6 +141,24 @@ class Scanner:
                 )
         return updated
 
+    def _recheck_text_while_browser_is_blocked(
+        self, db: sqlite3.Connection, item: ReviewedApplication, now: datetime,
+    ) -> None:
+        """Get a verdict on the approved text once per approval even when it cannot send."""
+        if self.outgoing_provider != "mistral" or db.execute("""
+            SELECT 1 FROM outgoing_checks
+            WHERE id = ? AND kind = 'application' AND message_hash = ? AND checked_at >= ?
+        """, (item.id, item.message_hash, item.updated_at)).fetchone():
+            return
+        try:
+            listing = self.source.details(ListingRef.from_url(item.url))
+        except WGSourceError:
+            return
+        review_outgoing(
+            db, item.id, item.message, kind="application", context=listing.description, provider=self.outgoing_provider,
+            now=now, first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True),
+        )
+
     def send_reviewed(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         counts = Counter()
         if self.reviewed_delivery is None:
@@ -164,6 +183,7 @@ class Scanner:
                 retry_after[item.id] = retry_at
                 continue
             if startup_problem:
+                self._recheck_text_while_browser_is_blocked(db, item, now)
                 set_application_wait_reason(db, item, startup_problem)
                 retry_after[item.id] = retry_at
                 counts["Freigaben warten auf Versandbrowser"] += 1

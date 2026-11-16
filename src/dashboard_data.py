@@ -7,6 +7,7 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 from urllib.parse import parse_qs, urlsplit, urlunsplit
@@ -63,6 +64,8 @@ class Match:
     review_reason: str | None
     published_day: date | None = None
     attachment_digest: str | None = None
+    judge_approved: bool | None = None
+    judge_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -195,8 +198,10 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     delivery_join = "LEFT JOIN delivery s ON s.id = d.id" if "delivery" in tables else ""
     state = "s.state" if delivery_join else "NULL"
     check_join = "LEFT JOIN outgoing_checks c ON c.id = d.id AND c.kind = 'application'" if "outgoing_checks" in tables else ""
+    has_check_hash = bool(check_join and "message_hash" in _columns(db, "outgoing_checks"))
     reason = "c.reason" if check_join else "NULL"
     approved = "c.approved" if check_join else "NULL"
+    check_hash = "c.message_hash" if has_check_hash else "NULL"
     review_join = "LEFT JOIN application_reviews r ON r.id = d.id" if "application_reviews" in tables else ""
     review_state, review_reason = ("r.state", "r.reason") if review_join else ("NULL", "NULL")
     attachment_digest = ("r.attachment_digest" if review_join and
@@ -215,22 +220,32 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     parameters.append(RESULT_LIMIT)
     rows = db.execute(f"""
         SELECT d.id, d.url, d.fresh_at, d.basis, d.message, {state}, {reason}, {approved}, {day},
-               {review_state}, {review_reason}, {attachment_digest}
+               {review_state}, {review_reason}, {attachment_digest}, {check_hash}
         FROM drafts d {delivery_join} {check_join} {observation_join} {review_join}
         WHERE d.fresh_at BETWEEN ? AND ?
           AND ((d.done = 0 AND d.message IS NOT NULL) OR {state} IS NOT NULL)
           {secondary_filter}
         ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
     """, parameters)
-    return tuple(
-        Match(listing_id, "Kleinanzeigen" if listing_id.startswith("ka-") else "WG-Gesucht",
-              _platform_url(url), stamp, basis, message if delivery is None else None,
-              delivery or review or ("held" if approved == 0 else "draft"),
-              outcome_reason if review and delivery is None else check_reason,
-              _parse_day(day_string), attachment)
-        for (listing_id, url, stamp, basis, message, delivery, check_reason, approved, day_string,
-             review, outcome_reason, attachment) in rows
-    )
+    matches = []
+    for (listing_id, url, stamp, basis, message, delivery, check_reason, approved, day_string,
+         review, outcome_reason, attachment, message_hash) in rows:
+        exact_check = (
+            delivery is None and message is not None and approved in (0, 1)
+            and message_hash == sha256(message.encode("utf-8")).hexdigest()
+        )
+        held = approved == 0 and (exact_check or not has_check_hash)
+        reason = outcome_reason if review and delivery is None else None
+        if delivery or (not review and not has_check_hash):
+            reason = check_reason
+        matches.append(Match(
+            listing_id, "Kleinanzeigen" if listing_id.startswith("ka-") else "WG-Gesucht",
+            _platform_url(url), stamp, basis, message if delivery is None else None,
+            delivery or review or ("held" if held else "draft"), reason,
+            _parse_day(day_string), attachment, bool(approved) if exact_check else None,
+            check_reason if exact_check else None,
+        ))
+    return tuple(matches)
 
 
 def _address_checks(db: sqlite3.Connection, cutoff: float, until: float) -> tuple[AddressCheck, ...]:

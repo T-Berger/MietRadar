@@ -180,7 +180,7 @@ def _listing_card(
         facts += _fact(*route)
     sections = []
     if profile and profile.summary:
-        sections.append('<section class="radar-listing__section"><span class="radar-listing__label">Kurz &amp; knapp</span>'
+        sections.append('<section class="radar-listing__section"><span class="radar-listing__label">Inseratszusammenfassung</span>'
                         f'<p>{escape(profile.summary)}</p></section>')
     if profile and (profile.fit or profile.fit_reason):
         fit = profile.fit if profile.fit in FIT_LABELS else "unclear"
@@ -238,10 +238,14 @@ def _application(
 ) -> None:
     if row.state == "unconfirmed" and row.platform == "WG-Gesucht":
         st.warning("Der Versand ließ sich nicht bestätigen. Schau im WG-Gesucht-Postfach nach.")
-    elif row.review_reason:
+    elif row.review_reason and row.review_reason != row.judge_reason:
         st.text(row.review_reason)
     if row.message is None:
         return
+    if row.judge_approved is False:
+        st.warning(row.judge_reason or "Die Textprüfung hat diese Fassung zurückgehalten.")
+    elif row.judge_approved is True:
+        st.caption(row.judge_reason or "Diese Fassung hat die Textprüfung bestanden.")
 
     editable = review_available and row.platform == "WG-Gesucht" and row.url is not None
     with st.expander("Bewerbung prüfen" if editable else "Bewerbung anzeigen"):
@@ -337,7 +341,9 @@ def _matches(
                     else:
                         date_label += " · nur als Entwurf"
             status = STATES.get(row.state, "Entwurf")
-            if row.state == "queued" and row.review_reason:
+            if row.judge_approved is False:
+                status = "Freigegeben · Text zurückgehalten" if row.state == "queued" else "Text zurückgehalten"
+            elif row.state == "queued" and row.review_reason:
                 status = "Freigegeben · Versand verzögert"
             _listing_card(
                 profile, title=_headline(row.url), platform=row.platform,

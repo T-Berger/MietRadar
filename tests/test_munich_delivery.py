@@ -216,6 +216,27 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(state, "queued")
         self.assertIn("MietRadar versucht es erneut.", reason)
 
+    def test_approved_text_is_rechecked_once_with_mistral_when_the_browser_cannot_start(self):
+        listing = offer(1, None)
+        sender = Mock()
+        scanner, message = self.reviewed_scanner(sender, listing)
+        scanner.outgoing_provider = "mistral"
+        scanner.reviewed_startup_problem = lambda: "Chromium startet nicht."
+        retry_after = {}
+
+        with patch("munich_delivery.judge_outgoing", return_value=OutgoingJudgment(True, "ok")) as judge:
+            scanner.send_reviewed(self.db, NOW, retry_after)
+            scanner.send_reviewed(self.db, NOW + timedelta(minutes=5), retry_after)
+        judge.assert_called_once()
+        self.assertEqual(judge.call_args.args, (message,))
+        self.assertEqual(judge.call_args.kwargs["context"], listing.description)
+        self.assertEqual(judge.call_args.kwargs["provider"], "mistral")
+        self.assertTrue(judge.call_args.kwargs["user_reviewed"])
+        self.assertEqual(self.db.execute("SELECT approved FROM outgoing_checks").fetchone(), (1,))
+        self.assertEqual(self.db.execute("SELECT state, reason FROM application_reviews").fetchone(),
+                         ("queued", "Chromium startet nicht."))
+        sender.send.assert_not_called()
+
     def test_reviewed_attachment_reaches_sender_with_exactly_the_approved_bytes(self):
         listing = offer(1, None)
         attachment_bytes = b"%PDF-1.4\n% fictional test document\n%%EOF\n"
