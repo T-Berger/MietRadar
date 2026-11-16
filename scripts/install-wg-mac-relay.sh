@@ -120,10 +120,39 @@ with open(plist, "wb") as stream:
 PY
 /usr/bin/plutil -lint "$stage_dir/agent.plist" >/dev/null
 
+bootstrap_agent() {
+    local attempt error
+    for attempt in 1 2 3 4 5; do
+        if error="$(/bin/launchctl bootstrap "$domain" "$plist" 2>&1)"; then
+            return 0
+        fi
+        # launchd can still be finishing a bootout when asked to load the same label.
+        if [[ "$error" != *"Bootstrap failed: 5:"* || "$attempt" == 5 ]]; then
+            break
+        fi
+        if /bin/launchctl print "$target" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    printf '%s\n' "$error" >&2
+    return 1
+}
+
 was_running=false
 if /bin/launchctl print "$target" >/dev/null 2>&1; then
     /bin/launchctl bootout "$target"
     was_running=true
+    for attempt in 1 2 3 4 5; do
+        if ! /bin/launchctl print "$target" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    if /bin/launchctl print "$target" >/dev/null 2>&1; then
+        echo "macOS is still stopping the previous WG-Gesucht sender. Run the installer again shortly." >&2
+        exit 1
+    fi
 fi
 if [[ -e "$worker_dir" ]]; then
     mv "$worker_dir" "$stage_dir/previous-worker"
@@ -134,7 +163,7 @@ fi
 mv "$stage_dir/worker" "$worker_dir"
 mv "$stage_dir/agent.plist" "$plist"
 
-if ! /bin/launchctl bootstrap "$domain" "$plist"; then
+if ! bootstrap_agent; then
     mv "$worker_dir" "$stage_dir/worker"
     mv "$plist" "$stage_dir/agent.plist"
     if [[ -e "$stage_dir/previous-worker" ]]; then
@@ -142,8 +171,8 @@ if ! /bin/launchctl bootstrap "$domain" "$plist"; then
     fi
     if [[ -e "$stage_dir/previous.plist" ]]; then
         mv "$stage_dir/previous.plist" "$plist"
-        if [[ "$was_running" == true ]]; then
-            /bin/launchctl bootstrap "$domain" "$plist"
+        if [[ "$was_running" == true ]] && ! bootstrap_agent; then
+            echo "macOS could not restore the previous WG-Gesucht sender." >&2
         fi
     fi
     echo "macOS could not start the WG-Gesucht sender." >&2
