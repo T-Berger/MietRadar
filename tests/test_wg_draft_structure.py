@@ -32,6 +32,16 @@ class WGDraftStructureTest(unittest.TestCase):
         self.assertEqual(draft, f"Hi zusammen,\n\n{INTRO}\n\n{DETAIL}\n\n{QUESTION}\n\nViele Grüße\nAlex")
         self.assertEqual(revise_first_message_draft(draft, INTRO, listing_title="Zimmer mit Balkon"), draft)
 
+    def test_extending_the_private_intro_replaces_the_entire_cached_intro(self):
+        old_intro = f"{INTRO} Wenn ich Zeit habe, zeichne ich oft."
+        new_intro = f"{old_intro} Nebenbei mache ich Musik."
+        draft = f"Hi zusammen,\n\n{old_intro}\n\n{DETAIL}\n\n{QUESTION}\n\nViele Grüße\nAlex"
+
+        refreshed = revise_first_message_draft(draft, new_intro)
+
+        self.assertEqual(refreshed, draft.replace(old_intro, new_intro, 1))
+        self.assertEqual(revise_first_message_draft(refreshed, new_intro), refreshed)
+
 
 if __name__ == "__main__":
     unittest.main()

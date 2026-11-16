@@ -707,6 +707,9 @@ def with_applicant_intro(template: str, applicant_intro: str, *, first_message: 
         body = re.sub(rf"^[ \t]*{re.escape(intro)}[ \t]*", "", body, flags=re.I | re.M).strip()
         previous_intro = applicant_intro_from_template(body)
         if previous_intro:
+            first_paragraph = body.split("\n\n", 1)[0]
+            if first_paragraph.startswith(previous_intro) and re.match(rf"{re.escape(first_paragraph)}\s", intro, re.I):
+                previous_intro = first_paragraph
             body = re.sub(rf"^[ \t]*{re.escape(previous_intro)}[ \t]*", "", body, count=1, flags=re.I | re.M).strip()
         return "\n\n".join(part for part in (greeting, intro, body) if part)
     if "{APPLICANT_INTRO}" in template:
