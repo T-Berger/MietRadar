@@ -8,11 +8,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Protocol
 
 from munich_tiers import install_secondary_offers
 from outgoing_judge import OutgoingJudgment, judge_outgoing
-from reviewed_applications import install_application_reviews, review_is_pending
+from reviewed_applications import ApplicationAttachment, install_application_reviews, review_is_pending
 from wg_first_message import viewing_slot_labels
 
 
@@ -126,7 +128,7 @@ class DeliveryQueue:
         self.judge_provider = judge_provider
 
     def _eligible(self, db: sqlite3.Connection, listing_id: str, fresh_at: datetime, max_age: timedelta,
-                  *, reviewed_message: str | None = None) -> bool:
+                  *, reviewed_message: str | None = None, attachment_digest: str | None = None) -> bool:
         now = self.clock()
         # Keep the hard 24h ceiling for external delivery even when the draft
         # window has been configured to retain older listings for review.
@@ -134,7 +136,8 @@ class DeliveryQueue:
         if not cutoff <= fresh_at <= now:
             return False
         if reviewed_message is not None:
-            if not review_is_pending(db, listing_id, reviewed_message, now, max_age):
+            if not review_is_pending(db, listing_id, reviewed_message, now, max_age,
+                                     attachment_digest=attachment_digest):
                 return False
         else:
             info = db.execute(
@@ -158,10 +161,15 @@ class DeliveryQueue:
         self, db: sqlite3.Connection, listing_id: str, url: str, message: str,
         fresh_at: datetime, max_age: timedelta,
         *, context: str = "", first_message: FirstMessageReview | None = None,
+        attachment: ApplicationAttachment | None = None,
     ) -> str | None:
         user_reviewed = bool(first_message and first_message.user_reviewed)
+        if attachment is not None and not user_reviewed:
+            return None
         reviewed_message = message if user_reviewed else None
-        if self.paused or not self._eligible(db, listing_id, fresh_at, max_age, reviewed_message=reviewed_message):
+        attachment_digest = attachment.digest if attachment is not None else None
+        if self.paused or not self._eligible(db, listing_id, fresh_at, max_age, reviewed_message=reviewed_message,
+                                             attachment_digest=attachment_digest):
             return None
         checked_at = self.clock()
         if not review_outgoing(db, listing_id, message, kind="application", context=context,
@@ -175,7 +183,8 @@ class DeliveryQueue:
             with db:
                 # Serialize the final quota and listing checks with the write.
                 db.execute("BEGIN IMMEDIATE")
-                if not self._eligible(db, listing_id, fresh_at, max_age, reviewed_message=reviewed_message):
+                if not self._eligible(db, listing_id, fresh_at, max_age, reviewed_message=reviewed_message,
+                                      attachment_digest=attachment_digest):
                     return False
                 submit_at = self.clock()
                 if first_message and not user_reviewed and first_message.slots(checked_at) != first_message.slots(submit_at):
@@ -185,7 +194,13 @@ class DeliveryQueue:
             reserved = True
             return True
 
-        outcome = self.sender.send(url, message, reserve)
+        if attachment is None:
+            outcome = self.sender.send(url, message, reserve)
+        else:
+            with TemporaryDirectory(prefix="mietradar-attachment-") as workspace:
+                document = Path(workspace) / Path(attachment.name).name
+                document.write_bytes(attachment.content)
+                outcome = self.sender.send(url, message, reserve, attachment=document)
         stamp = self.clock().timestamp()
         if outcome == DeliveryOutcome.BLOCKED:
             self.paused = True

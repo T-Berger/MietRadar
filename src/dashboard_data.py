@@ -57,6 +57,7 @@ class Match:
     state: str
     review_reason: str | None
     published_day: date | None = None
+    attachment_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,8 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     approved = "c.approved" if check_join else "NULL"
     review_join = "LEFT JOIN application_reviews r ON r.id = d.id" if "application_reviews" in tables else ""
     review_state, review_reason = ("r.state", "r.reason") if review_join else ("NULL", "NULL")
+    attachment_digest = ("r.attachment_digest" if review_join and
+                         "attachment_digest" in _columns(db, "application_reviews") else "NULL")
     observations = _columns(db, "wg_observations") if "wg_observations" in tables else set()
     observation_join = "LEFT JOIN wg_observations o ON o.id = d.id" if {"id", "published_day"} <= observations else ""
     day = "o.published_day" if observation_join else "NULL"
@@ -186,7 +189,7 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     parameters.append(RESULT_LIMIT)
     rows = db.execute(f"""
         SELECT d.id, d.url, d.fresh_at, d.basis, d.message, {state}, {reason}, {approved}, {day},
-               {review_state}, {review_reason}
+               {review_state}, {review_reason}, {attachment_digest}
         FROM drafts d {delivery_join} {check_join} {observation_join} {review_join}
         WHERE d.fresh_at BETWEEN ? AND ?
           AND ((d.done = 0 AND d.message IS NOT NULL) OR {state} IS NOT NULL)
@@ -198,8 +201,9 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
               _platform_url(url), stamp, basis, message if delivery is None else None,
               delivery or review or ("held" if approved == 0 else "draft"),
               outcome_reason if review and delivery is None else check_reason,
-              _parse_day(day_string))
-        for listing_id, url, stamp, basis, message, delivery, check_reason, approved, day_string, review, outcome_reason in rows
+              _parse_day(day_string), attachment)
+        for (listing_id, url, stamp, basis, message, delivery, check_reason, approved, day_string,
+             review, outcome_reason, attachment) in rows
     )
 
 

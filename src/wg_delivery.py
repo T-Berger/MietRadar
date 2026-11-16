@@ -22,6 +22,8 @@ _HOSTS = {"www.wg-gesucht.de", "wg-gesucht.de"}
 _CONTACT_PREFIXES = ("/nachricht-senden/", "/en/nachricht-senden/")
 _CONTACT_LABELS = {"nachricht senden", "send message"}
 _SEND_LABELS = _CONTACT_LABELS | {"senden", "send"}
+_PDF_INPUT = "#messenger_form input#file_input[type='file']"
+_FORM_ERROR = "#messenger_form #validation-error-placeholder"
 _VERIFICATION = (
     "#login_two_factor_authentication_form, #registration_verification_phone_number_form, "
     "#registration_verification_code_form, #sicherheit_bestaetigung, "
@@ -176,8 +178,33 @@ class BrowserSender:
         return next((button for button in scope.find_elements(By.CSS_SELECTOR, selectors)
                      if button.is_displayed() and button.is_enabled() and _label(button) in _SEND_LABELS), None)
 
-    def _confirmed(self, driver, listing: ListingRef, message: str) -> bool:
+    @staticmethod
+    def _attachment_input(driver):
+        inputs = driver.find_elements(By.CSS_SELECTOR, _PDF_INPUT)
+        if len(inputs) != 1 or not inputs[0].is_enabled():
+            return None
+        accepted_types = {value.strip().casefold() for value in (inputs[0].get_attribute("accept") or "").split(",")}
+        return inputs[0] if accepted_types.intersection({"application/pdf", ".pdf"}) else None
+
+    @staticmethod
+    def _attachment_label(driver, filename: str, *, sent: bool) -> bool:
+        literal = _xpath_text(filename)
+        scope = "not(ancestor::form[@id='messenger_form'])" if sent else "ancestor::form[@id='messenger_form']"
+        return any(element.is_displayed() for element in driver.find_elements(
+            By.XPATH, f"//*[not(self::textarea) and {scope} and (normalize-space(.) = {literal} or @title = {literal})]",
+        ))
+
+    def _attachment_ready(self, driver, field, filename: str, size: int) -> bool:
+        files = driver.execute_script(
+            "return Array.from(arguments[0].files, file => [file.name, file.size]);", field,
+        )
+        # Some uploaders clear the native selection once a filename has appeared in their preview.
+        return files == [[filename, size]] or (files == [] and self._attachment_label(driver, filename, sent=False))
+
+    def _confirmed(self, driver, listing: ListingRef, message: str, attachment_name: str | None = None) -> bool:
         if self._blocked(driver) or _visible(driver, "#message_timestamp") is None:
+            return False
+        if attachment_name and not self._attachment_label(driver, attachment_name, sent=True):
             return False
         if _contact_id(driver.current_url) == listing.id:
             return True
@@ -195,12 +222,19 @@ class BrowserSender:
             By.XPATH, f"//*[not(self::textarea) and normalize-space(.) = {literal}]"
         ))
 
-    def send(self, url: str, text: str, before_submit: Callable[[], bool]) -> DeliveryOutcome:
+    def send(
+        self, url: str, text: str, before_submit: Callable[[], bool], *, attachment: Path | None = None,
+    ) -> DeliveryOutcome:
         listing = ListingRef.from_url(url) if _wg_page(url) else None
         if listing is None or not text.strip():
             return DeliveryOutcome.UNAVAILABLE
         claimed = False
         try:
+            if attachment is not None:
+                attachment = attachment.resolve(strict=True)
+                attachment_size = attachment.stat().st_size
+                if attachment.suffix.casefold() != ".pdf" or not attachment.is_file() or attachment_size <= 0:
+                    return DeliveryOutcome.BLOCKED
             driver = self._browser()
             wait = WebDriverWait(driver, 12)
             driver.get(listing.url)
@@ -224,11 +258,31 @@ class BrowserSender:
             submit = self._submit_button(driver, area)
             if submit is None or self._composer_state(driver, listing) != "ready":
                 return DeliveryOutcome.BLOCKED
+            if attachment is not None:
+                field = self._attachment_input(driver)
+                if field is None or _visible(driver, _FORM_ERROR) is not None:
+                    return DeliveryOutcome.BLOCKED
             if not before_submit():
                 return DeliveryOutcome.SKIPPED
             claimed = True
+            if attachment is not None:
+                # Selecting the file may start an upload, so the approved send is reserved above.
+                field.send_keys(str(attachment))
+
+                def ready_after_upload(browser):
+                    if self._composer_state(browser, listing) != "ready" or _visible(browser, _FORM_ERROR) is not None:
+                        return DeliveryOutcome.UNCONFIRMED
+                    if self._attachment_ready(browser, field, attachment.name, attachment_size):
+                        return self._submit_button(browser, area)
+                    return None
+
+                submit = wait.until(ready_after_upload)
+                if submit == DeliveryOutcome.UNCONFIRMED or area.get_property("value") != text:
+                    return DeliveryOutcome.UNCONFIRMED
             submit.click()
-            wait.until(lambda browser: self._blocked(browser) or self._confirmed(browser, listing, text))
-            return DeliveryOutcome.SENT if self._confirmed(driver, listing, text) else DeliveryOutcome.UNCONFIRMED
+            attachment_name = attachment.name if attachment is not None else None
+            wait.until(lambda browser: self._blocked(browser) or self._confirmed(browser, listing, text, attachment_name))
+            return (DeliveryOutcome.SENT if self._confirmed(driver, listing, text, attachment_name)
+                    else DeliveryOutcome.UNCONFIRMED)
         except (TimeoutException, WebDriverException, OSError):
             return DeliveryOutcome.UNCONFIRMED if claimed else DeliveryOutcome.BLOCKED

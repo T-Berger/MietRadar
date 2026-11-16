@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
@@ -31,6 +32,9 @@ class SenderTest(unittest.TestCase):
         self.area.send_keys.side_effect = self.compose
         self.area.find_element.side_effect = NoSuchElementException()
         self.submit = element("Senden")
+        self.file_input = None
+        self.attached_name = None
+        self.reported_attachment = False
         self.timestamp = element("Heute, 10:00")
         self.confirmed = False
         self.blocked = False
@@ -50,6 +54,8 @@ class SenderTest(unittest.TestCase):
         raise TimeoutException()
 
     def find_elements(self, by, selector):
+        if by == By.XPATH:
+            return [element(self.attached_name)] if self.confirmed and self.reported_attachment else []
         assert by == By.CSS_SELECTOR
         if "captcha" in selector:
             return [element()] if self.blocked else []
@@ -59,6 +65,8 @@ class SenderTest(unittest.TestCase):
             return [self.timestamp] if self.confirmed else []
         if selector == "textarea#message_input":
             return [self.area]
+        if selector == "#messenger_form input#file_input[type='file']":
+            return [self.file_input] if self.file_input else []
         if selector.startswith("button[data-ng-click"):
             return [self.submit]
         return []
@@ -120,6 +128,55 @@ class SenderTest(unittest.TestCase):
         self.assertIs(self.sender.send(PUBLIC, "Hallo", claim), DeliveryOutcome.UNAVAILABLE)
         self.link.click.assert_not_called()
         claim.assert_not_called()
+
+    def prepare_attachment(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "Nachweis.pdf"
+        path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        self.file_input = element()
+        self.file_input.get_attribute.side_effect = lambda name: "application/pdf" if name == "accept" else None
+        self.driver.execute_script.return_value = [[path.name, path.stat().st_size]]
+        self.attached_name = path.name
+        return path
+
+    def test_reserves_before_upload_and_checks_file_in_sent_conversation(self):
+        attachment = self.prepare_attachment()
+        calls = []
+        self.file_input.send_keys.side_effect = lambda path: calls.append(("attach", path))
+
+        def reserve():
+            calls.append(("reserve", None))
+            return True
+
+        def click():
+            calls.append(("send", None))
+            self.confirmed = self.reported_attachment = True
+
+        self.submit.click.side_effect = click
+        result = self.sender.send(PUBLIC, "Hallo", reserve, attachment=attachment)
+        self.assertIs(result, DeliveryOutcome.SENT)
+        self.assertEqual(calls, [("reserve", None), ("attach", str(attachment.resolve())), ("send", None)])
+
+    def test_revoked_approval_keeps_the_pdf_with_the_worker(self):
+        attachment = self.prepare_attachment()
+        self.assertIs(self.sender.send(PUBLIC, "Hallo", lambda: False, attachment=attachment), DeliveryOutcome.SKIPPED)
+        self.file_input.send_keys.assert_not_called()
+        self.submit.click.assert_not_called()
+
+    def test_unverified_selection_prevents_text_only_send(self):
+        attachment = self.prepare_attachment()
+        self.driver.execute_script.return_value = []
+        result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
+        self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+        self.submit.click.assert_not_called()
+
+    def test_confirmation_requires_the_attachment_as_well_as_the_message(self):
+        attachment = self.prepare_attachment()
+        self.submit.click.side_effect = lambda: setattr(self, "confirmed", True)
+        result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
+        self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+        self.submit.click.assert_called_once_with()
 
 
 if __name__ == "__main__":

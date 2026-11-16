@@ -27,7 +27,7 @@ from llm_personalizer import (
 from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import TransitRouter
-from reviewed_applications import fail_application_review, pending_application_reviews
+from reviewed_applications import fail_application_review, get_application_attachment, pending_application_reviews
 from wg_alerts import AlertsError, AlertsInbox
 from wg_first_message import applicant_answers, viewing_availability, viewing_slot_labels
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
@@ -171,9 +171,13 @@ class Scanner:
             if tier != "a":
                 fail_application_review(db, item, "Die Fahrt dauert inzwischen länger als 30 Minuten.", now)
                 continue
+            attachment = get_application_attachment(db, item.attachment_digest) if item.attachment_digest else None
+            if item.attachment_digest and attachment is None:
+                fail_application_review(db, item, "Der freigegebene Anhang steht nicht mehr zur Verfügung.", now)
+                continue
             result = self.reviewed_delivery.deliver(
                 db, item.id, item.url, item.message, item.fresh_at, self.max_age, context=listing.description,
-                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True),
+                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True), attachment=attachment,
             )
             if result:
                 counts[result] += 1
