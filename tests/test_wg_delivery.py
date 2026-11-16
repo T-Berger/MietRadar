@@ -64,6 +64,7 @@ class SenderTest(unittest.TestCase):
         self.area.find_element.side_effect = NoSuchElementException()
         self.submit = element("Senden")
         self.file_input = None
+        self.upload_error = None
         self.upload_preview = None
         self.attached_name = None
         self.reported_attachment = False
@@ -105,6 +106,8 @@ class SenderTest(unittest.TestCase):
             return [self.area]
         if selector == "#messenger_form input#file_input[type='file']":
             return [self.file_input] if self.file_input else []
+        if selector == "#attachments_modal_content #validation-error-placeholder":
+            return [self.upload_error] if self.upload_error else []
         if selector == "#messenger_form .message_input_wrapper.pre_attached_file":
             return [self.upload_preview] if self.upload_preview else []
         if selector.startswith("button[data-ng-click"):
@@ -236,6 +239,18 @@ class SenderTest(unittest.TestCase):
         self.file_input.send_keys.side_effect = lambda _path: self.show_upload_preview("Anderer Nachweis.pdf")
         result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
         self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+        self.submit.click.assert_not_called()
+
+    def test_hidden_upload_error_blocks_submission_and_logs_safe_reason(self):
+        attachment = self.prepare_attachment()
+        error = element()
+        error.is_displayed.return_value = False
+        error.get_property.return_value = "Eine Datei mit demselben Namen ist in Ihrer Bibliothek bereits vorhanden."
+        self.file_input.send_keys.side_effect = lambda _path: setattr(self, "upload_error", error)
+        with self.assertLogs("wg_delivery", level="INFO") as logs:
+            result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
+        self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+        self.assertIn("bereits vorhandenen Dateinamen", logs.output[0])
         self.submit.click.assert_not_called()
 
     def test_confirmation_requires_the_attachment_as_well_as_the_message(self):

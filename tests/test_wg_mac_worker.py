@@ -13,7 +13,8 @@ from selenium.common.exceptions import TimeoutException
 
 from munich_delivery import DeliveryOutcome
 from wg_mac_worker import (
-    Relay, RelayError, RelayTemporaryError, UnconfirmedDelivery, _check_browser, _poll_jobs, process_next, read_token,
+    Relay, RelayError, RelayTemporaryError, UnconfirmedDelivery, _check_browser, _poll_jobs, _write_attachment,
+    process_next, read_token,
 )
 from wg_source import Listing, WGAccessBlocked, WGListingGone
 
@@ -84,6 +85,21 @@ class MacWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(RelayError, "PDF-Anhang"):
             process_next(self.relay, self.browser, self.source)
         self.browser.send.assert_not_called()
+
+    def test_repeated_uploads_use_distinct_generic_names_for_the_approved_pdf(self):
+        attachment = {
+            "name": "Bewerberin Änne Muster (vertraulich).pdf",
+            "digest": hashlib.sha256(PDF).hexdigest(),
+            "content": base64.b64encode(PDF).decode("ascii"),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            first = _write_attachment(attachment, Path(directory))
+            second = _write_attachment(attachment, Path(directory))
+
+            self.assertNotEqual(first, second)
+            for staged in (first, second):
+                self.assertRegex(staged.name, r"^Bonitaetsnachweis_[0-9a-f]{16}\.pdf$")
+                self.assertEqual(staged.read_bytes(), PDF)
 
     def test_interrupted_claim_never_permits_submission_or_overwrites_status(self):
         self.relay.post.side_effect = [

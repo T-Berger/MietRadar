@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import stat
 import sys
@@ -186,7 +187,8 @@ def _write_attachment(raw: object, directory: Path) -> Path | None:
     if (len(content) > MAX_APPLICATION_ATTACHMENT_BYTES or not content.startswith(b"%PDF-")
             or b"%%EOF" not in content[-1024:] or hashlib.sha256(content).hexdigest() != digest):
         raise invalid
-    path = directory / name
+    # WG-Gesucht rejects repeated filenames in the account's file library. Only the upload name changes.
+    path = directory / f"Bonitaetsnachweis_{secrets.token_hex(8)}.pdf"
     try:
         with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
             handle.write(content)
