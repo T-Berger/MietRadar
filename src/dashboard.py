@@ -1,10 +1,12 @@
-"""Password-protected read-only view of MietRadar's Munich database."""
+"""Password-protected dashboard for MietRadar's Munich listings and drafts."""
 
 from __future__ import annotations
 
 import os
 import re
-from datetime import date, datetime, timezone
+import sqlite3
+from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
 from html import escape
 from math import isfinite
 from pathlib import Path
@@ -18,13 +20,16 @@ from dashboard_data import (
     BERLIN, RESULT_LIMIT, AddressCheck, DateBasis, DatedListing, ListingProfile, Match,
     SecondaryListing, load_dashboard, weekend_dates,
 )
+from reviewed_applications import ApplicationReviewError, cancel_application_review, review_application
 
 
 ROOT = Path(__file__).resolve().parent.parent
 STATES = {
     "draft": "Entwurf", "held": "Zurückgehalten", "sent": "Gesendet", "done": "Erledigt",
     "unconfirmed": "Versand unklar", "already_contacted": "Bereits kontaktiert", "unavailable": "Kontakt nicht verfügbar",
+    "edited": "Entwurf bearbeitet", "queued": "Freigegeben · wartet auf Versand", "failed": "Versand nicht erfolgt",
 }
+_REVIEW_NOTICE = "mietradar_application_review_notice"
 SMALL_WORDS = {"am", "an", "auf", "für", "im", "in", "mit", "und", "von", "zu", "zur"}
 WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
 RENT_LABELS = {"warm": "Warmmiete", "cold": "Kaltmiete", "total": "Gesamtmiete"}
@@ -180,8 +185,64 @@ def _listing_card(
     )
 
 
+def _application(row: Match, db_path: Path, hours: int, *, review_available: bool, reviewed_send: bool) -> None:
+    if row.message is None:
+        if row.state == "unconfirmed" and row.platform == "WG-Gesucht":
+            st.warning("Der Versand ließ sich nicht bestätigen. Schau im WG-Gesucht-Postfach nach.")
+        elif row.review_reason:
+            st.text(row.review_reason)
+        return
+
+    editable = review_available and row.platform == "WG-Gesucht" and row.url is not None
+    with st.expander("Bewerbung prüfen" if editable else "Bewerbung anzeigen"):
+        if row.review_reason:
+            st.text(row.review_reason)
+        if not editable:
+            st.code(row.message, language=None, wrap_lines=True)
+            return
+
+        version = sha256(row.message.encode("utf-8")).hexdigest()
+        try:
+            if row.state == "queued":
+                st.code(row.message, language=None, wrap_lines=True)
+                if not st.button("Freigabe zurückziehen", key=f"cancel-application-{row.id}-{version}"):
+                    return
+                cancel_application_review(db_path, row.id, row.message, now=datetime.now(timezone.utc))
+                notice = "Die Versandfreigabe wurde zurückgezogen. Dein Entwurf bleibt gespeichert."
+            else:
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=min(hours, 24))
+                may_approve = reviewed_send and row.fresh_at >= cutoff.timestamp()
+                with st.form(f"application-{row.id}-{version}", enter_to_submit=False):
+                    message = st.text_area("Deine Nachricht", value=row.message, height=220, max_chars=6000)
+                    save = st.form_submit_button("Entwurf speichern")
+                    approve = False
+                    if may_approve:
+                        approve = st.form_submit_button("Freigeben und senden", type="primary")
+                        st.caption("Mit der Freigabe beauftragst du MietRadar, genau diesen Text an das Inserat zu senden.")
+                    elif reviewed_send:
+                        st.caption("Das Zeitfenster für den Versand ist abgelaufen.")
+                    else:
+                        st.caption("Der Versand nach Freigabe ist noch nicht eingerichtet.")
+                if not (save or approve):
+                    return
+                result = review_application(
+                    db_path, row.id, row.message, message, approve=approve,
+                    now=datetime.now(timezone.utc), max_age=timedelta(hours=hours),
+                )
+                notice = "Deine Nachricht wurde zum Versand freigegeben." if result == "queued" else "Entwurf gespeichert."
+        except ApplicationReviewError as error:
+            st.error(str(error))
+            return
+        except (OSError, sqlite3.Error):
+            st.error("Die Änderung konnte gerade nicht gespeichert werden. Versuch es nach dem Aktualisieren erneut.")
+            return
+        st.session_state[_REVIEW_NOTICE] = notice
+        st.rerun()
+
+
 def _matches(
     rows: tuple[Match, ...], hours: int, wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile],
+    db_path: Path, *, review_available: bool, reviewed_send: bool,
 ) -> None:
     st.subheader("Neue Mietangebote", anchor=False)
     _scan_status(wg_scan)
@@ -196,21 +257,21 @@ def _matches(
         with st.container(border=True):
             date_label = f"{row.basis.capitalize()} · {_date(row.fresh_at)}"
             if row.basis == "zuerst gesehen":
-                posting = _posting_day(row.published_day) if row.published_day else "Veröffentlichungsdatum unbekannt"
-                date_label = f"{date_label} · {posting} · nur als Entwurf"
+                posting = (f"{_posting_day(row.published_day)}, Uhrzeit unbekannt"
+                           if row.published_day else "Veröffentlichungsdatum unbekannt")
+                date_label = f"{date_label} · {posting}"
+                if row.message and row.state != "queued":
+                    if review_available and reviewed_send and row.platform == "WG-Gesucht":
+                        date_label += " · Versand nur nach Freigabe"
+                    else:
+                        date_label += " · nur als Entwurf"
             _listing_card(
                 profiles.get(row.id), title=_headline(row.url), platform=row.platform,
                 status=f"A · {STATES.get(row.state, 'Entwurf')}", date_label=f"{date_label} · {row.id}",
                 route=("Zum Hbf oder Ostbahnhof", "Bis zu 30 Min."),
             )
             _location_link(row.url)
-            if row.message:
-                with st.expander("Bewerbung anzeigen"):
-                    st.code(row.message, language=None, wrap_lines=True)
-                    if row.review_reason:
-                        st.text(row.review_reason)
-            elif row.review_reason:
-                st.text(row.review_reason)
+            _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send)
 
 
 def _scan_status(wg_scan: tuple[float, int] | None) -> None:
@@ -351,7 +412,8 @@ def main() -> None:
         date_basis, date_window = _date_filter(now.astimezone(BERLIN).date())
         logout_button()
 
-    data = load_dashboard(directory / "munich_radar.sqlite3", now=now, max_age_hours=hours,
+    db_path = directory / "munich_radar.sqlite3"
+    data = load_dashboard(db_path, now=now, max_age_hours=hours,
                           posting_window=date_window, date_basis=date_basis or "published")
     if data.status == "missing":
         st.info("MietRadar hat hier noch keine Datenbank angelegt. Starte den Worker für den ersten Suchlauf.")
@@ -359,6 +421,8 @@ def main() -> None:
     if data.status != "ready":
         st.warning("Die MietRadar-Daten konnten gerade nicht gelesen werden. Aktualisiere die Seite in Kürze.")
         return
+    if notice := st.session_state.pop(_REVIEW_NOTICE, None):
+        st.success(notice)
 
     matches, drafts, pending = st.columns(3)
     if date_basis:
@@ -375,7 +439,9 @@ def main() -> None:
         if date_basis:
             _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan, data.listing_profiles)
         else:
-            _matches(data.matches, hours, data.wg_scan, data.listing_profiles)
+            _matches(data.matches, hours, data.wg_scan, data.listing_profiles, db_path,
+                     review_available=data.application_reviews_available,
+                     reviewed_send=os.getenv("MUNICH_REVIEWED_SEND", "").strip().lower() == "true")
     with secondary:
         _secondary_offers(data.secondary_offers, hours, data.listing_profiles)
     with address:

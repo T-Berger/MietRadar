@@ -10,6 +10,7 @@ from munich_delivery import DeliveryOutcome, DeliveryQueue, FirstMessageReview
 from munich_radar import Scanner, _database
 from munich_tiers import save_secondary_offer
 from outgoing_judge import OutgoingJudgment
+from reviewed_applications import cancel_application_review, review_application
 from test_munich_radar import NOW, offer, ref
 from wg_first_message import viewing_slot_labels
 
@@ -153,6 +154,54 @@ class DeliveryTest(unittest.TestCase):
                           timedelta(hours=24), first_message=review)
         sender.send.assert_called_once()
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM delivery").fetchone(), (0,))
+
+    def reviewed_scanner(self, sender, listing):
+        self.draft(offer(1, 1))
+        original = "Hi, ich bin 28."
+        message = "Hi zusammen,\n\nich bin Alex und koche gern. Passt euch eine Besichtigung?"
+        with self.db:
+            self.db.execute("UPDATE drafts SET basis = 'zuerst gesehen' WHERE id = ?", (listing.id,))
+        review_application(self.path, listing.id, original, message, approve=True, now=NOW, max_age=timedelta(days=1))
+        source = Mock()
+        source.details.return_value = listing
+        router = Mock()
+        router.classify.return_value = ("a", 12)
+        queue = DeliveryQueue(sender, clock=lambda: NOW)
+        return Scanner(source, router, "Hi!", "none", timedelta(days=1), 12, reviewed_delivery=queue), message
+
+    def test_reviewed_first_seen_message_is_rejudged_and_delivered_exactly_once(self):
+        listing = offer(1, None)
+        sender = RecordingSender()
+        scanner, message = self.reviewed_scanner(sender, listing)
+        with patch("munich_delivery.judge_outgoing", return_value=OutgoingJudgment(True, "ok")) as judge:
+            self.assertEqual(scanner.send_reviewed(self.db, NOW, {})["Bewerbung gesendet"], 1)
+            self.assertFalse(scanner.send_reviewed(self.db, NOW, {}))
+        self.assertEqual(sender.attempts, [(listing.url, message)])
+        self.assertEqual(judge.call_args.args, (message,))
+        self.assertTrue(judge.call_args.kwargs["user_reviewed"])
+
+    def test_withdrawing_review_during_composition_stops_submission(self):
+        listing = offer(1, None)
+        sender = Mock()
+        scanner, message = self.reviewed_scanner(sender, listing)
+
+        def send(url, text, before_submit):
+            cancel_application_review(self.path, listing.id, message, now=NOW)
+            self.assertFalse(before_submit())
+            return DeliveryOutcome.SKIPPED
+
+        sender.send.side_effect = send
+        self.assertFalse(scanner.send_reviewed(self.db, NOW, {}))
+        sender.send.assert_called_once()
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM delivery").fetchone(), (0,))
+
+    def test_discovery_of_an_old_publication_day_stops_reviewed_send(self):
+        listing = replace(offer(1, None), published_day=(NOW - timedelta(days=3)).date())
+        sender = Mock()
+        scanner, _ = self.reviewed_scanner(sender, listing)
+        scanner.send_reviewed(self.db, NOW, {})
+        sender.send.assert_not_called()
+        self.assertEqual(self.db.execute("SELECT state FROM application_reviews").fetchone(), ("failed",))
 
 
 if __name__ == "__main__":

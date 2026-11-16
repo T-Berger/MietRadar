@@ -219,6 +219,8 @@ class BrowserSender:
                 return DeliveryOutcome.BLOCKED
             area.clear()
             area.send_keys(text)
+            if area.get_property("value") != text:
+                return DeliveryOutcome.BLOCKED
             submit = self._submit_button(driver, area)
             if submit is None or self._composer_state(driver, listing) != "ready":
                 return DeliveryOutcome.BLOCKED

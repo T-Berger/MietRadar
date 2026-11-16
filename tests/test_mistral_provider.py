@@ -167,3 +167,48 @@ class MistralProviderTest(unittest.TestCase):
             "Die Wohnung ist ab Dezember frei.", provider="mistral", first_message=True, listing_type="wohnung",
         )
         self.assertEqual(message, "Hi,\n\nich bin Lea.\n\nWann wäre eine Besichtigung möglich?\n\nViele Grüße\nLea")
+
+    def test_first_message_finds_private_intro_and_keeps_other_template_text(self):
+        intro = "ich bin Lea und arbeite im Theater.  In meiner Freizeit wandere ich gerne."
+        template = f"Hi {{name}},\n\n{{LLM_TEXT}}\n\n{intro} Ich kann ab 1. Dezember einziehen."
+        self.assertEqual(llm_personalizer.applicant_intro_from_template(template), intro)
+        prepared = llm_personalizer.with_applicant_intro(template, "", first_message=True)
+        self.assertEqual(prepared, f"Hi {{name}},\n\n{intro}\n\n{{LLM_TEXT}}\n\nIch kann ab 1. Dezember einziehen.")
+        inline = f"Hi zusammen, {intro} Ich kann ab 1. Dezember einziehen."
+        self.assertEqual(llm_personalizer.with_applicant_intro(inline, "", first_message=True),
+                         f"Hi zusammen,\n\n{intro}\n\nIch kann ab 1. Dezember einziehen.")
+
+    def test_replacing_a_short_intro_keeps_the_move_in_and_ad_reference(self):
+        previous = "Ich bin Lea und arbeite im Theater."
+        intro = "Ich bin Lea. Ich koche gern und wandere viel. Beruflich arbeite ich im Theater."
+        remaining = "Dass ihr zusammen kocht, find ich schön.\n\nIch kann ab 1. Dezember einziehen."
+        draft = f"Hi zusammen,\n\n{previous}\n\n{remaining}\n\nWann passt euch eine Besichtigung?"
+        rendered = llm_personalizer.revise_first_message_draft(draft, intro)
+        self.assertTrue(rendered.startswith(f"Hi zusammen,\n\n{intro}\n\n{remaining}"))
+        self.assertNotIn(previous, rendered)
+
+    def test_wg_fallback_uses_confirmed_ad_detail_even_without_title_or_model(self):
+        template = "Hi zusammen,\n\nIch bin Lea.\n\n{LLM_TEXT}\n\nLiebe Grüße\nLea"
+        message = llm_personalizer.personalise_message(
+            template, "Wir kochen ab und zu gemeinsam. Das Zimmer hat einen Balkon.",
+            listing_type="wg", provider="none", first_message=True,
+        )
+        self.assertIn("Dass ihr zusammen kocht, find ich schön.", message)
+        self.assertNotIn("Balkon", message)
+        message = llm_personalizer.personalise_message(
+            template, "Wir kochen nicht zusammen. Das Zimmer hat einen Balkon.",
+            listing_type="wg", provider="none", first_message=True,
+        )
+        self.assertIn("Der Balkon gefällt mir.", message)
+        self.assertNotIn("kocht", message)
+
+    def test_offline_revision_keeps_the_draft_and_adds_only_a_verified_title_fact(self):
+        draft = "Hi zusammen,\n\nIch kann ab 1. Dezember einziehen.\n\nLiebe Grüße\nLea"
+        intro = "Ich bin Lea und arbeite im Theater."
+        revised = llm_personalizer.revise_first_message_draft(draft, intro, listing_title="Zimmer mit Balkon")
+        self.assertTrue(revised.startswith(f"Hi zusammen,\n\n{intro}\n\nDas Zimmer mit Balkon interessiert mich."))
+        self.assertIn("Ich kann ab 1. Dezember einziehen.", revised)
+        self.assertEqual(revised, llm_personalizer.revise_first_message_draft(revised, intro,
+                                                                             listing_title="Zimmer mit Balkon"))
+        uncertain = llm_personalizer.revise_first_message_draft(draft, intro, listing_title="Zimmer mit Balkon gesucht")
+        self.assertNotIn("Balkon", uncertain)

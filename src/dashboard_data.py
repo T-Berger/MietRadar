@@ -18,6 +18,7 @@ from listing_photos import listing_photo_urls
 _TABLE_COLUMNS = {
     "drafts": {"id", "url", "fresh_at", "basis", "message", "done"},
     "delivery": {"id", "state"},
+    "application_reviews": {"id", "state", "reason"},
     "outgoing_checks": {"id", "kind", "approved", "reason"},
     "klein_review": {"id", "url", "title", "fresh_at", "basis", "reason"},
     "klein_reply_drafts": {"id", "listing_id", "url", "message", "received_at", "state"},
@@ -122,6 +123,7 @@ class DashboardData:
     dated_listings: tuple[DatedListing, ...] = ()
     secondary_offers: tuple[SecondaryListing, ...] = ()
     listing_profiles: dict[str, ListingProfile] = field(default_factory=dict)
+    application_reviews_available: bool = False
 
 
 def _platform_url(url: str) -> str | None:
@@ -168,6 +170,8 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     check_join = "LEFT JOIN outgoing_checks c ON c.id = d.id AND c.kind = 'application'" if "outgoing_checks" in tables else ""
     reason = "c.reason" if check_join else "NULL"
     approved = "c.approved" if check_join else "NULL"
+    review_join = "LEFT JOIN application_reviews r ON r.id = d.id" if "application_reviews" in tables else ""
+    review_state, review_reason = ("r.state", "r.reason") if review_join else ("NULL", "NULL")
     observations = _columns(db, "wg_observations") if "wg_observations" in tables else set()
     observation_join = "LEFT JOIN wg_observations o ON o.id = d.id" if {"id", "published_day"} <= observations else ""
     day = "o.published_day" if observation_join else "NULL"
@@ -181,8 +185,9 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
         parameters.extend((cutoff, until))
     parameters.append(RESULT_LIMIT)
     rows = db.execute(f"""
-        SELECT d.id, d.url, d.fresh_at, d.basis, d.message, {state}, {reason}, {approved}, {day}
-        FROM drafts d {delivery_join} {check_join} {observation_join}
+        SELECT d.id, d.url, d.fresh_at, d.basis, d.message, {state}, {reason}, {approved}, {day},
+               {review_state}, {review_reason}
+        FROM drafts d {delivery_join} {check_join} {observation_join} {review_join}
         WHERE d.fresh_at BETWEEN ? AND ?
           AND ((d.done = 0 AND d.message IS NOT NULL) OR {state} IS NOT NULL)
           {secondary_filter}
@@ -190,9 +195,11 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     """, parameters)
     return tuple(
         Match(listing_id, "Kleinanzeigen" if listing_id.startswith("ka-") else "WG-Gesucht",
-              _platform_url(url), stamp, basis, message if state is None else None,
-              state or ("held" if approved == 0 else "draft"), reason, _parse_day(day_string))
-        for listing_id, url, stamp, basis, message, state, reason, approved, day_string in rows
+              _platform_url(url), stamp, basis, message if delivery is None else None,
+              delivery or review or ("held" if approved == 0 else "draft"),
+              outcome_reason if review and delivery is None else check_reason,
+              _parse_day(day_string))
+        for listing_id, url, stamp, basis, message, delivery, check_reason, approved, day_string, review, outcome_reason in rows
     )
 
 
@@ -377,6 +384,7 @@ def load_dashboard(
                 dated_listings=dated_listings,
                 secondary_offers=secondary_offers,
                 listing_profiles=_profiles(db, tables, visible_ids),
+                application_reviews_available="application_reviews" in tables,
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")

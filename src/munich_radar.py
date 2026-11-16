@@ -20,10 +20,14 @@ from kleinanzeigen_activity import EmailNotifier, install_activity, record_activ
 from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
 from listing_profiles import ROUTE_FIT, install_listing_profiles, record_listing_profile
-from llm_personalizer import application_render_signature, personalise_message, with_applicant_intro
+from llm_personalizer import (
+    applicant_intro_from_template, application_render_signature, personalise_message,
+    revise_first_message_draft, with_applicant_intro,
+)
 from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import TransitRouter
+from reviewed_applications import fail_application_review, pending_application_reviews
 from wg_alerts import AlertsError, AlertsInbox
 from wg_first_message import applicant_answers, viewing_availability, viewing_slot_labels
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
@@ -89,6 +93,7 @@ class Scanner:
     age: int = 28
     age_gap: int = 7
     delivery: DeliveryQueue | None = None
+    reviewed_delivery: DeliveryQueue | None = None
     klein_alerts: AlertsInbox | None = None
     klein_delivery: DeliveryQueue | None = None
     outgoing_provider: str = "none"
@@ -99,23 +104,89 @@ class Scanner:
 
     def add_intro_to_current_drafts(self, db: sqlite3.Connection, now: datetime) -> int:
         """Repair introductions when the listing source cannot be rechecked."""
-        if not self.applicant_intro:
-            return 0
         drafts = db.execute("""
-            SELECT d.id, d.url, d.fresh_at, d.basis, d.message FROM drafts d
-            WHERE d.done = 0 AND d.fresh_at BETWEEN ? AND ? AND instr(d.message, ?) = 0
+            SELECT d.id, d.url, d.fresh_at, d.basis, d.message, COALESCE(p.title, '')
+            FROM drafts d LEFT JOIN listing_profiles p ON p.id = d.id
+            WHERE d.done = 0 AND d.fresh_at BETWEEN ? AND ? AND d.message IS NOT NULL AND d.id NOT LIKE 'ka-%'
               AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
               AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id)
+              AND NOT EXISTS (SELECT 1 FROM application_reviews WHERE id = d.id)
             ORDER BY d.fresh_at DESC LIMIT ?
-        """, ((now - self.max_age).timestamp(), now.timestamp(), self.applicant_intro, self.limit)).fetchall()
+        """, ((now - self.max_age).timestamp(), now.timestamp(), self.limit)).fetchall()
         updated = 0
-        for listing_id, url, stamp, basis, previous in drafts:
+        for listing_id, url, stamp, basis, previous, title in drafts:
+            revised = revise_first_message_draft(
+                previous, self.applicant_intro, listing_title=title,
+                listing_type="wg" if "/wg-zimmer-" in url else "wohnung",
+                viewing_slots=viewing_slot_labels(self.viewing_availability, now),
+            )
+            if revised == previous:
+                continue
             with db:
                 updated += save_application_draft(
-                    db, listing_id, url, stamp, basis, with_applicant_intro(previous, self.applicant_intro),
+                    db, listing_id, url, stamp, basis, revised,
                     context="", provider=self.outgoing_provider, now=now, previous_message=previous,
                 )
         return updated
+
+    def send_reviewed(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
+        counts = Counter()
+        if self.reviewed_delivery is None or self.reviewed_delivery.paused:
+            return counts
+        for listing_id in [key for key, deadline in retry_after.items() if deadline <= now]:
+            del retry_after[listing_id]
+        for item in pending_application_reviews(db, now, self.max_age):
+            if retry_after.get(item.id, now) > now or self.reviewed_delivery.paused:
+                continue
+            ref = ListingRef.from_url(item.url)
+            try:
+                listing = self.source.details(ref)
+            except WGListingGone:
+                fail_application_review(db, item, "Die Anzeige ist nicht mehr verfügbar.", now)
+                continue
+            except WGSourceError:
+                retry_after[item.id] = now + timedelta(minutes=5)
+                counts["Freigaben warten auf WG-Gesucht"] += 1
+                continue
+            cutoff = now - min(self.max_age, timedelta(hours=24))
+            expired = (not cutoff <= listing.published_at <= now if listing.published_at is not None else
+                       bool(listing.published_day and not cutoff.astimezone(BERLIN).date() <= listing.published_day
+                            <= now.astimezone(BERLIN).date()))
+            refused = rejection_reason(
+                listing.title, listing.description, wanted=listing.wanted or "", resident_ages=listing.resident_ages or "",
+                wg_type=listing.wg_type or "", age=self.age, age_gap=self.age_gap,
+            )
+            if expired:
+                fail_application_review(db, item, "Die Anzeige liegt außerhalb des Versandzeitfensters.", now)
+                continue
+            if refused:
+                fail_application_review(db, item, "Die Anzeige entspricht inzwischen nicht mehr deinen Suchfiltern.", now)
+                continue
+            tier, _ = self.router.classify(listing.address, now) if listing.address else (None, None)
+            if tier is None:
+                retry_after[item.id] = now + timedelta(minutes=5)
+                counts["Freigaben warten auf ÖPNV-Prüfung"] += 1
+                continue
+            if tier != "a":
+                fail_application_review(db, item, "Die Fahrt dauert inzwischen länger als 30 Minuten.", now)
+                continue
+            result = self.reviewed_delivery.deliver(
+                db, item.id, item.url, item.message, item.fresh_at, self.max_age, context=listing.description,
+                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True),
+            )
+            if result:
+                counts[result] += 1
+                if "zurückgehalten" in result or result.startswith("Versand pausiert"):
+                    judgment = db.execute("SELECT reason FROM outgoing_checks WHERE id = ? AND kind = 'application'",
+                                          (item.id,)).fetchone()
+                    reason = judgment[0] if judgment and "zurückgehalten" in result else (
+                        "Versand pausiert. Prüfe die WG-Gesucht-Anmeldung (WG_EMAIL und WG_PASSWORD), "
+                        "den Browser und mögliche Bestätigungsabfragen der Plattform."
+                    )
+                    fail_application_review(db, item, reason, now)
+            else:
+                retry_after[item.id] = now + timedelta(minutes=1)
+        return counts
 
     def scan(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         cutoff = now - self.max_age
@@ -172,6 +243,7 @@ class Scanner:
                 WHERE d.id NOT LIKE 'ka-%' AND d.done = 0 AND d.message IS NOT NULL
                   AND d.fresh_at BETWEEN ? AND ? AND COALESCE(s.signature, '') != ?
                   AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
+                  AND NOT EXISTS (SELECT 1 FROM application_reviews WHERE id = d.id)
                 ORDER BY d.fresh_at DESC LIMIT ?
             """, (cutoff.timestamp(), now.timestamp(), wg_signature, refresh_limit)).fetchall()
             refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
@@ -202,12 +274,13 @@ class Scanner:
             if ref.id in retry_after:
                 continue
             draft = db.execute(
-                """SELECT d.fresh_at, d.message, d.done, s.state, d.basis, r.signature FROM drafts d
+                """SELECT d.fresh_at, d.message, d.done, s.state, d.basis, r.signature, a.state FROM drafts d
                    LEFT JOIN delivery s ON s.id = d.id LEFT JOIN draft_render_signatures r ON r.id = d.id
+                   LEFT JOIN application_reviews a ON a.id = d.id
                    WHERE d.id = ?""", (ref.id,),
             ).fetchone()
-            refresh_draft = bool(draft and wg_signature and draft[5] != wg_signature)
-            skip_draft = bool(draft and (not draft[1] or draft[2] or draft[3] or
+            refresh_draft = bool(draft and not draft[6] and wg_signature and draft[5] != wg_signature)
+            skip_draft = bool(draft and (not draft[1] or draft[2] or draft[3] or draft[6] or
                                        (not refresh_draft and (not self.delivery or self.delivery.paused))))
             if skip_draft and ref.id not in photo_ids:
                 continue
@@ -420,7 +493,7 @@ def _scanner(max_age: timedelta) -> Scanner:
         _number("MUNICH_APPLICANT_AGE", 28, 18, 100), _number("MUNICH_MAX_AGE_GAP", 7, 0, 100),
         klein_alerts=klein_alerts, outgoing_provider=_outgoing_provider(),
         render_signature=application_render_signature(template, provider),
-        applicant_intro=os.getenv("MUNICH_APPLICANT_INTRO", "").strip(),
+        applicant_intro=os.getenv("MUNICH_APPLICANT_INTRO", "").strip() or applicant_intro_from_template(template),
         viewing_availability=viewing_availability(os.getenv("MUNICH_VIEWING_SLOTS", "")),
         applicant_answers=applicant_answers(os.getenv("MUNICH_APPLICANT_ANSWERS", "")),
     )
@@ -558,7 +631,8 @@ def main() -> int:
             limit = _number("MUNICH_DAILY_SEND_LIMIT", 3, 1, 5)
             reply_dispatcher = None
             with ExitStack() as sessions:
-                if _switch("MUNICH_AUTOSEND", False):
+                reviewed_send = _switch("MUNICH_REVIEWED_SEND", False)
+                if reviewed_send or _switch("MUNICH_AUTOSEND", False):
                     try:
                         from wg_delivery import BrowserSender
                     except ModuleNotFoundError as exc:
@@ -569,7 +643,11 @@ def main() -> int:
                         email=os.getenv("WG_EMAIL", "").strip(), password=os.getenv("WG_PASSWORD", ""),
                     )
                     sessions.callback(sender.close)
-                    scanner.delivery = DeliveryQueue(sender, limit, judge_provider=outgoing_provider)
+                    queue = DeliveryQueue(sender, limit, judge_provider=outgoing_provider)
+                    if reviewed_send:
+                        scanner.reviewed_delivery = queue
+                    else:
+                        scanner.delivery = queue
                 klein_autosend = _switch("KLEINANZEIGEN_AUTOSEND", False)
                 if klein_autosend or reply_mode == "auto":
                     if klein_autosend and scanner.klein_alerts is None:
@@ -611,6 +689,7 @@ def _poll(
 ) -> int:
     delay = interval
     retry_after: dict[str, datetime] = {}
+    review_retry_after: dict[str, datetime] = {}
     while True:
         started = time.monotonic()
         failed = False
@@ -624,8 +703,9 @@ def _poll(
             delay = min(max(600, delay * 2), 3600)
             updated = scanner.add_intro_to_current_drafts(db, datetime.now(timezone.utc))
             if updated:
-                counts["Entwürfe mit Vorstellung ergänzt"] += updated
+                counts["Entwürfe mit persönlicherem Text aktualisiert"] += updated
         now = datetime.now(timezone.utc)
+        counts.update(scanner.send_reviewed(db, now, review_retry_after))
         klein_paused = scanner.klein_delivery is not None and scanner.klein_delivery.paused
         if reply_inbox:
             try:
@@ -651,8 +731,17 @@ def _poll(
                 failed = True
         LOG.info("Scan fertig: %s", ", ".join(f"{n} {key}" for key, n in counts.items()) or "nichts Neues")
         if once:
-            return int(failed or klein_paused or reply_paused or (scanner.delivery is not None and scanner.delivery.paused))
-        time.sleep(max(1, delay - (time.monotonic() - started)))
+            return int(failed or klein_paused or reply_paused or
+                       any(queue is not None and queue.paused for queue in (scanner.delivery, scanner.reviewed_delivery)))
+        remaining = max(1, delay - (time.monotonic() - started))
+        if scanner.reviewed_delivery is None:
+            time.sleep(remaining)
+            continue
+        deadline = time.monotonic() + remaining
+        while (remaining := deadline - time.monotonic()) > 0:
+            time.sleep(min(10, remaining))
+            for outcome, count in scanner.send_reviewed(db, datetime.now(timezone.utc), review_retry_after).items():
+                LOG.info("Freigegebene Bewerbungen: %s %s", count, outcome)
 
 
 if __name__ == "__main__":
