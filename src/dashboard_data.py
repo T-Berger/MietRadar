@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -40,6 +40,7 @@ WG_REPLY_INBOX = "https://www.wg-gesucht.de/nachrichten.html"
 RESULT_LIMIT = 100
 BERLIN = ZoneInfo("Europe/Berlin")
 DateBasis = Literal["published", "first_seen"]
+ProviderFilter = Literal["all", "commercial", "other"]
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class ListingProfile:
     latitude: float | None = None
     longitude: float | None = None
     map_eligible: bool = True
+    is_commercial: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,7 @@ class MapListing:
     rent_eur: float | None
     rent_kind: str | None
     area_sqm: float | None
+    is_commercial: bool = False
 
 
 @dataclass(frozen=True)
@@ -163,6 +166,24 @@ class DashboardData:
     dated_secondary_offers: tuple[SecondaryListing, ...] = ()
 
 
+def filter_listing_providers(data: DashboardData, provider: ProviderFilter) -> DashboardData:
+    if provider == "all":
+        return data
+
+    def includes(listing_id: str) -> bool:
+        profile = data.listing_profiles.get(listing_id)
+        return (provider == "commercial") == bool(profile and profile.is_commercial)
+
+    return replace(
+        data,
+        matches=tuple(row for row in data.matches if includes(row.id)),
+        address_checks=tuple(row for row in data.address_checks if includes(row.id)),
+        dated_listings=tuple(row for row in data.dated_listings if includes(row.id)),
+        secondary_offers=tuple(row for row in data.secondary_offers if includes(row.id)),
+        dated_secondary_offers=tuple(row for row in data.dated_secondary_offers if includes(row.id)),
+    )
+
+
 def map_listings(data: DashboardData, *, date_filtered: bool = False) -> tuple[MapListing, ...]:
     """Return eligible A*–C listings, including those still waiting for a verified map point."""
     secondary_rows = (*data.secondary_offers, *data.dated_secondary_offers) if date_filtered else data.secondary_offers
@@ -189,7 +210,7 @@ def map_listings(data: DashboardData, *, date_filtered: bool = False) -> tuple[M
         listings[row.id] = MapListing(
             row.id, row.url, row.platform, title or "Mietangebot", tier, minutes, station, latitude, longitude,
             profile.rent_eur if profile else None, profile.rent_kind if profile else None,
-            profile.area_sqm if profile else None,
+            profile.area_sqm if profile else None, bool(profile and profile.is_commercial),
         )
     return tuple(listings.values())
 
@@ -411,15 +432,16 @@ def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[s
     photo_column = "photo_urls" if "photo_urls" in columns else "NULL"
     route_columns = "route_tier, route_minutes" if {"route_tier", "route_minutes"} <= columns else "NULL, NULL"
     location_columns = "latitude, longitude" if {"latitude", "longitude"} <= columns else "NULL, NULL"
+    commercial_column = "is_commercial" if "is_commercial" in columns else "NULL"
     available = _availability_filter(db, tables, "listing_profiles.id")
     rows = db.execute(f"""
         SELECT id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, {photo_column}, {route_columns},
-               {location_columns}, {available}
+               {location_columns}, {available}, {commercial_column}
         FROM listing_profiles WHERE id IN ({placeholders})
     """, tuple(ids))
     profiles = {}
     for (listing_id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photos_json, tier, minutes,
-         latitude, longitude, map_eligible) in rows:
+         latitude, longitude, map_eligible, is_commercial) in rows:
         try:
             photos = json.loads(photos_json) if photos_json else []
         except (ValueError, TypeError):
@@ -429,7 +451,7 @@ def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[s
         latitude, longitude = valid_listing_coordinates(latitude, longitude) or (None, None)
         profiles[listing_id] = ListingProfile(
             title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason, photo_urls, tier, minutes,
-            latitude, longitude, bool(map_eligible),
+            latitude, longitude, bool(map_eligible), is_commercial == 1,
         )
     return profiles
 

@@ -5,11 +5,12 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
-from dashboard_data import load_dashboard, map_listings, weekend_dates
+from dashboard_data import filter_listing_providers, load_dashboard, map_listings, weekend_dates
 from listing_profiles import record_listing_location, record_listing_profile, record_listing_route
 from munich_radar import _database
 from rental_availability import AVAILABILITY_POLICY_VERSION, record_listing_availability
@@ -136,6 +137,8 @@ class DashboardDataTest(unittest.TestCase):
         self.assertIsNone(data.listing_profiles["12"].route_minutes)
         self.assertIsNone(data.listing_profiles["12"].latitude)
         self.assertIsNone(data.listing_profiles["12"].longitude)
+        self.assertFalse(data.listing_profiles["12"].is_commercial)
+        self.assertFalse(filter_listing_providers(data, "commercial").matches)
         self.assertIsNone(data.wg_scan)
 
     def test_previous_availability_schema_filters_only_recorded_exclusions(self):
@@ -379,6 +382,37 @@ class DashboardDataTest(unittest.TestCase):
         historical, = map_listings(data, date_filtered=True)
         self.assertEqual((historical.id, historical.tier, historical.station, historical.longitude),
                          ("3", "c", "Hauptbahnhof", 11.53))
+
+    def test_commercial_filter_covers_current_dated_and_map_views(self):
+        stamp = NOW.timestamp()
+        with closing(_database(self.path)) as db, db:
+            for listing_id in ("1", "2", "3"):
+                url = f"https://www.wg-gesucht.de/{listing_id}.html"
+                record_listing_availability(db, listing_id, None)
+                if listing_id == "3":
+                    db.execute("INSERT INTO munich_secondary_offers VALUES (?, ?, 'Zimmer', ?, ?, 'b', 'Ostbahnhof', 43)",
+                               (listing_id, url, stamp, "veröffentlicht"))
+                    db.execute("""INSERT INTO wg_observations (id, url, first_seen_at, last_seen_at, published_at)
+                                  VALUES (?, ?, ?, ?, ?)""", (listing_id, url, stamp, stamp, stamp))
+                else:
+                    db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Hallo', 0)",
+                               (listing_id, url, stamp))
+                listing = Listing(listing_id, url, "Zimmer", "", NOW, "Beispielstraße 1, 80331 München")
+                record_listing_profile(db, replace(listing, is_commercial=listing_id != "2"),
+                                       route_tier="a" if listing_id != "3" else "b",
+                                       coordinates=(48.12, 11.55))
+                # A later alert without provider evidence must not erase a previously confirmed marker.
+                record_listing_profile(db, listing)
+
+        data = load_dashboard(self.path, now=NOW, posting_window=(NOW.date(), NOW.date()))
+        commercial = filter_listing_providers(data, "commercial")
+        self.assertEqual({row.id for row in commercial.matches}, {"1"})
+        self.assertEqual({row.id for row in commercial.secondary_offers}, {"3"})
+        self.assertEqual({row.id for row in commercial.dated_listings}, {"1", "3"})
+        self.assertEqual({(row.id, row.is_commercial) for row in map_listings(commercial)}, {("1", True), ("3", True)})
+        self.assertEqual({row.id for row in map_listings(commercial, date_filtered=True)}, {"1", "3"})
+        other = filter_listing_providers(data, "other")
+        self.assertEqual({(row.id, row.is_commercial) for row in map_listings(other)}, {("2", False)})
 
     def test_address_change_invalidates_a_saved_map_point(self):
         with closing(_database(self.path)) as db:

@@ -64,7 +64,12 @@ def _read_public_listing(body: object, item: ReviewedApplication) -> Listing:
         "title": 1024, "description": 65536, "address": 512, "wanted": 1024, "wg_type": 1024, "resident_ages": 1024,
     }
     days = {"published_day", "available_from", "available_until"}
-    fields = _read_fields(body, {"published_at", *text_limits, *days})
+    required = {"published_at", *text_limits, *days}
+    optional = {"is_commercial"} if isinstance(body, dict) and "is_commercial" in body else set()
+    fields = _read_fields(body, required | optional)
+    is_commercial = fields.get("is_commercial", False)
+    if type(is_commercial) is not bool:
+        raise ValueError("Invalid public listing provider")
     values = {}
     for key, limit in text_limits.items():
         value = fields[key]
@@ -85,7 +90,7 @@ def _read_public_listing(body: object, item: ReviewedApplication) -> Listing:
     published_at = datetime.fromisoformat(value) if value else None
     if published_at is not None and published_at.tzinfo is None:
         raise ValueError("Publication time needs a time zone")
-    return Listing(id=item.id, url=item.url, published_at=published_at, **values)
+    return Listing(id=item.id, url=item.url, published_at=published_at, is_commercial=is_commercial, **values)
 
 
 class ReviewedDeliveryRelay:
@@ -166,10 +171,12 @@ class ReviewedDeliveryRelay:
         if not reuse:
             if not self.scanner.validate_reviewed_listing(db, item, listing, now, self.retry_after):
                 return {"ready": False}
+            provider_type = db.execute("SELECT is_commercial FROM listing_profiles WHERE id = ?", (item.id,)).fetchone()
             judgment = review_outgoing(
                 db, item.id, item.message, kind="application", context=listing.description,
                 provider=self.scanner.outgoing_provider, now=self.clock(),
-                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True),
+                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
+                                                commercial=listing.is_commercial or bool(provider_type and provider_type[0])),
             )
             if not judgment.approved:
                 fail_application_review(db, item, judgment.reason, self.clock())

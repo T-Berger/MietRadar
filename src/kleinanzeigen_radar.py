@@ -5,13 +5,13 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 from kleinanzeigen_source import extract_listings, normalize_munich_address
 from listing_profiles import ROUTE_FIT, record_listing_location, record_listing_profile, record_listing_route
-from llm_personalizer import personalise_message
-from munich_delivery import DeliveryQueue, save_application_draft
+from llm_personalizer import application_render_signature, personalise_message
+from munich_delivery import DeliveryQueue, FirstMessageReview, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer
 from munich_transit import MUNICH_TIME, PRIMARY_TIERS, TransitRouter
 from rental_availability import AVAILABILITY_POLICY_VERSION, availability_rejection, record_listing_availability
@@ -64,6 +64,14 @@ class KleinanzeigenRadar:
     delivery: DeliveryQueue | None = None
     outgoing_provider: str = "none"
     render_signature: str | None = None
+    applicant_intro: str = ""
+    applicant_answers: dict[str, str] = field(default_factory=dict)
+
+    def _signature(self, commercial: bool) -> str | None:
+        if commercial and self.render_signature:
+            return application_render_signature(self.template, self.provider, first_message=True,
+                                                applicant_answers=self.applicant_answers, commercial=True)
+        return self.render_signature
 
     def scan(
         self, db: sqlite3.Connection, inbox: AlertsInbox, now: datetime, cutoff: datetime,
@@ -76,17 +84,20 @@ class KleinanzeigenRadar:
             )""", ((now - min(now - cutoff, timedelta(days=1))).timestamp(),))
         counts: Counter = Counter()
         checked_routes = set()
+        commercial_context = {}
         today = now.astimezone(MUNICH_TIME).date()
         items = inbox.recent_items(cutoff, limit, extract_listings)
         for listing, received_at in items:
             record_listing_profile(db, listing)
             draft = db.execute("""SELECT d.fresh_at, d.done, s.state, o.address, d.basis, d.message, r.signature,
-                p.route_tier
+                p.route_tier, p.is_commercial
                 FROM drafts d LEFT JOIN delivery s ON s.id = d.id LEFT JOIN klein_origins o ON o.id = d.id
                 LEFT JOIN draft_render_signatures r ON r.id = d.id
                 LEFT JOIN listing_profiles p ON p.id = d.id WHERE d.id = ?
             """, (listing.id,)).fetchone()
-            refresh = bool(draft and self.render_signature and draft[5] and draft[6] != self.render_signature)
+            commercial = listing.is_commercial or bool(draft and draft[8])
+            signature = self._signature(commercial)
+            refresh = bool(draft and signature and draft[5] and draft[6] != signature)
             stamp = listing.published_at or received_at
             basis = "veröffentlicht" if listing.published_at else "Suchalarm erhalten"
             if stamp.tzinfo is None or stamp > now:
@@ -155,9 +166,12 @@ class KleinanzeigenRadar:
                                    coordinates=self.router.coordinates(address) if mapped else None)
             if tier in PRIMARY_TIERS:
                 checked_routes.add(listing.id)
+                if commercial:
+                    commercial_context[listing.id] = listing.description
                 if refresh:
                     if self._save(db, listing.id, listing.url, listing.description, listing.is_wg,
-                                  stamp.timestamp(), basis, address, now, title=listing.title, previous_message=draft[5]):
+                                  stamp.timestamp(), basis, address, now, title=listing.title,
+                                  previous_message=draft[5], commercial=commercial):
                         counts["Kleinanzeigen-Entwürfe aktualisiert"] += 1
                     retry_after[listing.id] = now + timedelta(minutes=1)
                 elif draft:
@@ -165,7 +179,7 @@ class KleinanzeigenRadar:
                         self._save_origin(db, listing.id, address)
                         remove_secondary_offer(db, listing.id)
                 elif self._save(db, listing.id, listing.url, listing.description, listing.is_wg,
-                                stamp.timestamp(), basis, address, now, title=listing.title):
+                                stamp.timestamp(), basis, address, now, title=listing.title, commercial=commercial):
                     counts["neue Kleinanzeigen-Entwürfe"] += 1
                 continue
             if tier in _SECONDARY_STATIONS and minutes is not None:
@@ -199,7 +213,7 @@ class KleinanzeigenRadar:
                 """, (listing.id, listing.url, listing.title[:240], listing.description[:1200], listing.is_wg,
                       stamp.timestamp(), basis, pending_reason))
         if self.delivery and not self.delivery.paused:
-            counts.update(self._send_ready(db, now, cutoff, checked_routes, retry_after))
+            counts.update(self._send_ready(db, now, cutoff, checked_routes, retry_after, commercial_context))
         self._backfill_locations(db, now, cutoff, limit)
         return counts
 
@@ -220,21 +234,22 @@ class KleinanzeigenRadar:
                 with db:
                     record_listing_location(db, listing_id, coordinates, address=address)
 
-    def _send_ready(self, db, now, cutoff, checked_routes, retry_after) -> Counter:
+    def _send_ready(self, db, now, cutoff, checked_routes, retry_after, commercial_context) -> Counter:
         counts: Counter = Counter()
         send_window = min(now - cutoff, timedelta(hours=24))
-        rows = db.execute("""SELECT d.id, d.url, d.message, d.fresh_at, o.address FROM drafts d
+        rows = db.execute("""SELECT d.id, d.url, d.message, d.fresh_at, o.address, p.is_commercial, p.title FROM drafts d
             JOIN klein_origins o ON o.id = d.id
             JOIN listing_availability a ON a.id = d.id AND a.reason IS NULL AND a.policy_version = ?
             LEFT JOIN delivery s ON s.id = d.id
+            LEFT JOIN listing_profiles p ON p.id = d.id
             WHERE d.done = 0 AND d.message IS NOT NULL AND d.fresh_at BETWEEN ? AND ? AND s.id IS NULL
               AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o2 WHERE o2.id = d.id)
             ORDER BY d.fresh_at DESC, d.id DESC
         """, (AVAILABILITY_POLICY_VERSION, (now - send_window).timestamp(), now.timestamp()))
-        for listing_id, url, message, fresh_at, address in rows.fetchall():
+        for listing_id, url, message, fresh_at, address, commercial, title in rows.fetchall():
             if self.delivery.paused:
                 break
-            if listing_id in retry_after:
+            if listing_id in retry_after or commercial and listing_id not in commercial_context:
                 continue
             if listing_id not in checked_routes:
                 tier, minutes = self.router.classify(address, now)
@@ -245,7 +260,14 @@ class KleinanzeigenRadar:
                         record_listing_location(db, listing_id, coordinates, address=address)
                 if tier not in PRIMARY_TIERS:
                     continue
-            result = self.delivery.deliver(db, listing_id, url, message, datetime.fromtimestamp(fresh_at, timezone.utc), send_window)
+            if commercial:
+                result = self.delivery.deliver(
+                    db, listing_id, url, message, datetime.fromtimestamp(fresh_at, timezone.utc), send_window,
+                    context=commercial_context[listing_id], first_message=self._commercial_review(title),
+                )
+            else:
+                result = self.delivery.deliver(db, listing_id, url, message,
+                                               datetime.fromtimestamp(fresh_at, timezone.utc), send_window)
             if result:
                 counts[f"Kleinanzeigen: {result}"] += 1
         return counts
@@ -270,11 +292,13 @@ class KleinanzeigenRadar:
         if not origin:
             return False, "Bitte eine veröffentlichte Münchner Adresse mit Straße, Hausnummer und PLZ angeben."
         row = db.execute("""
-            SELECT url, title, excerpt, is_wg, fresh_at, basis FROM klein_review WHERE id = ? AND fresh_at BETWEEN ? AND ?
+            SELECT k.url, k.title, k.excerpt, k.is_wg, k.fresh_at, k.basis, p.is_commercial
+            FROM klein_review k LEFT JOIN listing_profiles p ON p.id = k.id
+            WHERE k.id = ? AND k.fresh_at BETWEEN ? AND ?
         """, (listing_id, cutoff.timestamp(), now.timestamp())).fetchone()
         if row is None:
             return False, "Kein aktueller Kleinanzeigen-Treffer mit dieser ID zur Ortsprüfung vorhanden."
-        url, title, excerpt, is_wg, fresh_at, basis = row
+        url, title, excerpt, is_wg, fresh_at, basis, commercial = row
         prior = db.execute("SELECT reason FROM listing_availability WHERE id = ?", (listing_id,)).fetchone()
         availability = (prior and prior[0]) or availability_rejection(title, excerpt, now.astimezone(MUNICH_TIME).date())
         with db:
@@ -298,21 +322,27 @@ class KleinanzeigenRadar:
             return True, f"In Liste {tier.upper()} gespeichert. Ab {_SECONDARY_STATIONS[tier]} dauert es {minutes} Minuten mit dem ÖPNV."
         if tier not in PRIMARY_TIERS:
             return False, "Die ÖPNV-Fahrt konnte nicht geprüft werden." if tier is None else "Keine passende ÖPNV-Verbindung gefunden."
-        saved = self._save(db, listing_id, url, excerpt, bool(is_wg), fresh_at, basis, origin, now, title=title)
+        saved = self._save(db, listing_id, url, excerpt, bool(is_wg), fresh_at, basis, origin, now,
+                           title=title, commercial=bool(commercial))
         return saved, "Entwurf gespeichert. Der Versandstatus steht unter delivery." if saved else "Der Treffer wurde bereits verarbeitet."
+
+    def _commercial_review(self, title: str) -> FirstMessageReview:
+        return FirstMessageReview(title, self.applicant_intro, (), self.applicant_answers, commercial=True)
 
     def _save(
         self, db: sqlite3.Connection, listing_id: str, url: str, excerpt: str, is_wg: bool, fresh_at: float, basis: str,
-        address: str, now: datetime, *, title: str = "", previous_message: str | None = None,
+        address: str, now: datetime, *, title: str = "", previous_message: str | None = None, commercial: bool = False,
     ) -> bool:
         message = personalise_message(
             self.template, excerpt, listing_url=url, provider=self.provider, listing_type="wg" if is_wg else "wohnung",
-            listing_title=title,
+            listing_title=title, commercial=commercial, applicant_intro=self.applicant_intro,
+            applicant_answers=self.applicant_answers,
         )
         with db:
             saved = save_application_draft(
                 db, listing_id, url, fresh_at, basis, message, context=excerpt,
-                provider=self.outgoing_provider, now=now, signature=self.render_signature, previous_message=previous_message,
+                provider=self.outgoing_provider, now=now, signature=self._signature(commercial),
+                previous_message=previous_message, first_message=self._commercial_review(title) if commercial else None,
             )
             db.execute("DELETE FROM klein_review WHERE id = ?", (listing_id,))
             remove_secondary_offer(db, listing_id)

@@ -101,6 +101,27 @@ class WGDraftStructureTest(unittest.TestCase):
                 )
                 self.assertEqual(message, f"Hi zusammen,\n\n{INTRO}\n\n{QUESTION}\n\nViele Grüße\nAlex")
 
+    def test_commercial_inquiry_keeps_supplied_profile_and_move_in_without_wg_hobbies(self):
+        intro = "Ich bin Alex Neumann, 31, und arbeite als Architekt. In meiner Freizeit koche ich gern."
+        draft = personalise_message(
+            "Hi {name},\n\n{LLM_TEXT}\n\nIch kann ab 1. Dezember einziehen und würde euch gern kennenlernen.\n\n"
+            "Viele Grüße\nAlex Neumann",
+            "Wir kochen jeden Freitag gemeinsam. Einzug ab 1. Februar. Bitte sagen Sie, ob Sie Haustiere haben.",
+            poster_name="Hausverwaltung Nord", provider="none", listing_type="wg", commercial=True,
+            applicant_intro=intro, applicant_answers={"haustiere": "Ich habe keine Haustiere."},
+        )
+        self.assertEqual(draft, (
+            "Guten Tag,\n\nmein Name ist Alex Neumann. Ich arbeite als Architekt.\n\n"
+            "Ich interessiere mich für Ihr Zimmer.\n\nIch kann ab 1. Dezember einziehen. Ich habe keine Haustiere."
+            "\n\nKönnten Sie mir einen Besichtigungstermin vorschlagen?\n\nMit freundlichen Grüßen\nAlex Neumann"
+        ))
+
+    def test_commercial_inquiry_does_not_treat_a_profession_as_a_name(self):
+        draft = personalise_message("Hallo!", "", provider="none", listing_type="wohnung", commercial=True,
+                                    applicant_intro="Ich bin Architekt.")
+        self.assertIn("ich interessiere mich für Ihre Wohnung.", draft)
+        self.assertNotIn("Name ist Architekt", draft)
+
 
 if __name__ == "__main__":
     unittest.main()

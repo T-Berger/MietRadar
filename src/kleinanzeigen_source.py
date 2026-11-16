@@ -41,6 +41,10 @@ _AVAILABILITY_FIELD = re.compile(
     r"^(?:(?:verfügbar|frei|bezugsfrei)\s+(?P<direction>ab|bis)|(?P<term>mietbeginn|mietende))"
     r"\b\s*:?\s*(?P<value>.*)$", re.I,
 )
+_PROVIDER_LABEL = re.compile(r"(?:anbieter(?:typ)?|konto(?:typ)?)\s*:?", re.I)
+_COMMERCIAL_LABEL = re.compile(
+    r"(?:anbieter(?:typ)?|konto(?:typ)?)\s*:\s*gewerblich|gewerblich(?:er anbieter|e anbieterin)", re.I,
+)
 _DAY_MONTH_YEAR = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})\.?")
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _MONTH_YEAR = re.compile(
@@ -200,6 +204,16 @@ def _alert_availability(lines: list[str]) -> tuple[list[str], date | None, date 
     return description, start, end
 
 
+def _commercial_provider(lines: list[str]) -> bool:
+    for index, line in enumerate(lines):
+        if _COMMERCIAL_LABEL.fullmatch(line):
+            return True
+        if (_PROVIDER_LABEL.fullmatch(line) and index + 1 < len(lines)
+                and lines[index + 1].casefold() == "gewerblich"):
+            return True
+    return False
+
+
 def _listing(ref: _Reference, title: str, lines: list[str], photo_urls: tuple[str, ...] = ()) -> Listing:
     address, address_lines = _line_address(lines)
     rent_eur, rent_kind, area_sqm = _alert_facts(lines, is_wg=ref.is_wg)
@@ -217,6 +231,7 @@ def _listing(ref: _Reference, title: str, lines: list[str], photo_urls: tuple[st
         published_at=None, address=address, district=area, is_wg=ref.is_wg,
         rent_eur=rent_eur, rent_kind=rent_kind, area_sqm=area_sqm, photo_urls=photo_urls,
         available_from=available_from, available_until=available_until,
+        is_commercial=_commercial_provider(lines),
     )
 
 
@@ -233,6 +248,7 @@ def _with_fallback_facts(primary: Listing, fallback: Listing) -> Listing:
         photo_urls=listing_photo_urls((*primary.photo_urls, *fallback.photo_urls), platform="ka"),
         available_from=primary.available_from or fallback.available_from,
         available_until=primary.available_until or fallback.available_until,
+        is_commercial=primary.is_commercial or fallback.is_commercial,
     )
 
 

@@ -338,6 +338,28 @@ class ScannerTest(unittest.TestCase):
         source.details.assert_called_once()
         delivery.deliver.assert_not_called()
 
+    def test_scan_saves_a_formal_company_draft_and_leaves_it_formal_on_refresh(self):
+        listing = replace(offer(1, 1), is_wg=True, is_commercial=True)
+        source, router = Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.return_value = [ref(listing)]
+        source.details.return_value = listing
+        router.classify.return_value = ("a", None)
+        router.coordinates.return_value = (48.128, 11.603)
+        intro = "Ich bin Alex Neumann und arbeite als Architekt. In meiner Freizeit koche ich gern."
+        template = "Hi zusammen!\n\n{LLM_TEXT}"
+        scanner = Scanner(source, router, template, "none", timedelta(hours=24), 12,
+                          render_signature="test", applicant_intro=intro)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            self.assertEqual(scanner.scan(db, NOW, {})["neue Entwürfe"], 1)
+            message, commercial = db.execute("SELECT message, is_commercial FROM drafts JOIN listing_profiles USING(id)").fetchone()
+            self.assertEqual(commercial, 1)
+            self.assertTrue(message.startswith("Guten Tag,"))
+            self.assertIn("Architekt", message)
+            self.assertNotIn("koche", message)
+            self.assertEqual(scanner.add_intro_to_current_drafts(db, NOW), 0)
+            self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Entwürfe aktualisiert"], 0)
+
     def test_offline_intro_repair_updates_only_current_unsent_drafts(self):
         now = NOW.timestamp()
         intro = "Ich bin Sam und arbeite als Architekt."

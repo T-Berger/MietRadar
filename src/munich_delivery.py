@@ -39,6 +39,7 @@ class FirstMessageReview:
     viewing_availability: tuple[datetime, ...]
     applicant_answers: dict[str, str]
     user_reviewed: bool = False
+    commercial: bool = False
 
     def slots(self, now: datetime) -> tuple[str, ...]:
         return viewing_slot_labels(self.viewing_availability, now)
@@ -47,7 +48,7 @@ class FirstMessageReview:
         return judge_outgoing(
             message, context=context, provider=provider, first_message=True, listing_title=self.listing_title,
             applicant_intro=self.applicant_intro, viewing_slots=self.slots(now),
-            applicant_answers=self.applicant_answers, user_reviewed=self.user_reviewed,
+            applicant_answers=self.applicant_answers, user_reviewed=self.user_reviewed, commercial=self.commercial,
         )
 
 
