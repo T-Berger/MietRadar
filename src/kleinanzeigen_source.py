@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
@@ -11,7 +11,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 from bs4 import BeautifulSoup, Tag
 
-from wg_source import Listing
+from wg_source import Listing, RentKind, parse_area_sqm, parse_rent_eur, rent_kind_for_label
 
 _HOSTS = {"www.kleinanzeigen.de", "kleinanzeigen.de"}
 _LISTING_PATH = re.compile(r"/s-anzeige/[\w-]+/(?P<id>[0-9]+)-(?P<category>[0-9]+)-[0-9]+")
@@ -29,6 +29,12 @@ _STREET_LABEL = re.compile(r"^(?:adresse|anschrift|standort)\s*:\s*", re.IGNOREC
 _STREET_END = re.compile(r"(?:straße|strasse|str\.|weg|allee|platz|ring|gasse|ufer|steig|damm|promenade|chaussee)$", re.I)
 _AREA = re.compile(rf"(?:{_MUNICH_POSTCODE}\s+)?{_MUNICH}(?:\s*[-–]\s*[\w -]{{2,45}})?", re.I)
 _GENERIC_LINK = {"anzeige ansehen", "zur anzeige", "angebot ansehen", "jetzt ansehen", "mehr erfahren", "kleinanzeigen"}
+_FACT_FIELD = re.compile(
+    r"^(?P<label>bruttowarmmiete|warmmiete|gesamtmiete|nettokaltmiete|kaltmiete|miete|"
+    r"preis(?:\s+pro\s+(?:m[²2]|qm|quadratmeter))?|zimmergröße|zimmerfläche|wohnungsgröße|wohnfläche|größe|"
+    r"(?:miet)?kaution|ablöse(?:vereinbarung)?|nebenkosten|betriebskosten|heizkosten|sonstige kosten)"
+    r"\b\s*:?\s*(?P<value>.*)$", re.I,
+)
 
 
 def _clean(value: str) -> str:
@@ -100,8 +106,46 @@ def _html_lines(link: Tag, ref: _Reference) -> list[str]:
     return lines
 
 
+def _alert_facts(lines: list[str], *, is_wg: bool) -> tuple[float | None, RentKind | None, float | None]:
+    rents: dict[RentKind, set[float]] = {}
+    labelled_areas: set[float] = set()
+    bare_areas: set[float] = set()
+    area_labels = {"größe", "zimmergröße", "zimmerfläche"} if is_wg else {"größe", "wohnfläche", "wohnungsgröße"}
+    pending_label = None
+
+    for line in lines:
+        for part in re.split(r"\s*[·•|]\s*", line):
+            if not part:
+                continue
+            field = _FACT_FIELD.fullmatch(part)
+            if field:
+                label = field["label"].lower()
+                value = field["value"]
+                pending_label = None if value else label
+                if not value:
+                    continue
+            else:
+                label, value = pending_label, part
+                pending_label = None
+
+            kind = rent_kind_for_label(label) if label else "unspecified"
+            if kind and (amount := parse_rent_eur(value)) is not None:
+                rents.setdefault(kind, set()).add(amount)
+            if (label is None or label in area_labels) and (area := parse_area_sqm(value)) is not None:
+                (bare_areas if label is None else labelled_areas).add(area)
+
+    areas = labelled_areas or bare_areas
+    area = next(iter(areas)) if len(areas) == 1 else None
+    for kind in ("warm", "total", "cold", "unspecified"):
+        amounts = rents.get(kind)
+        if amounts:
+            return (next(iter(amounts)), kind, area) if len(amounts) == 1 else (None, None, area)
+    return None, None, area
+
+
 def _listing(ref: _Reference, title: str, lines: list[str]) -> Listing:
     address, address_lines = _line_address(lines)
+    rent_eur, rent_kind, area_sqm = _alert_facts(lines, is_wg=ref.is_wg)
     area = None
     text = []
     for index, line in enumerate(lines):
@@ -113,6 +157,19 @@ def _listing(ref: _Reference, title: str, lines: list[str]) -> Listing:
     return Listing(
         id=ref.id, url=ref.url, title=title, description="\n".join(dict.fromkeys(text)),
         published_at=None, address=address, district=area, is_wg=ref.is_wg,
+        rent_eur=rent_eur, rent_kind=rent_kind, area_sqm=area_sqm,
+    )
+
+
+def _with_fallback_facts(primary: Listing, fallback: Listing) -> Listing:
+    use_fallback_rent = primary.rent_eur is None or (
+        primary.rent_eur == fallback.rent_eur and primary.rent_kind == "unspecified"
+    )
+    return replace(
+        primary, title=primary.title or fallback.title,
+        rent_eur=fallback.rent_eur if use_fallback_rent else primary.rent_eur,
+        rent_kind=fallback.rent_kind if use_fallback_rent else primary.rent_kind,
+        area_sqm=primary.area_sqm if primary.area_sqm is not None else fallback.area_sqm,
     )
 
 
@@ -147,8 +204,12 @@ def extract_listings(raw: bytes, sender: str) -> list[Listing]:
             title = ""
         listing = _listing(ref, title, _html_lines(link, ref))
         existing = results.get(ref.id)
-        if not existing or (bool(listing.address), bool(listing.title)) > (bool(existing.address), bool(existing.title)):
+        if not existing:
             results[ref.id] = listing
+        elif (bool(listing.address), bool(listing.title)) > (bool(existing.address), bool(existing.title)):
+            results[ref.id] = _with_fallback_facts(listing, existing)
+        else:
+            results[ref.id] = _with_fallback_facts(existing, listing)
 
     # Plain text often accompanies HTML and can contain a direct link when the
     # HTML version only contains a tracking redirect. No redirects are opened.
@@ -164,6 +225,10 @@ def extract_listings(raw: bytes, sender: str) -> list[Listing]:
         lines = [_clean(line) for line in block.splitlines() if line.strip()]
         listing = _listing(ref, "", lines[:24])
         existing = results.get(ref.id)
-        if not existing or (not existing.address and listing.address):
+        if not existing:
             results[ref.id] = listing
+        elif not existing.address and listing.address:
+            results[ref.id] = _with_fallback_facts(listing, existing)
+        else:
+            results[ref.id] = _with_fallback_facts(existing, listing)
     return list(results.values())

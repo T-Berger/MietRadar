@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from http.client import HTTPException
-from typing import Sequence
+from typing import Literal, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -34,6 +34,14 @@ _SEARCH_PATTERN = re.compile(
 )
 _BERLIN = ZoneInfo("Europe/Berlin")
 _LAYOUT_LIMIT = 4 * 1024 * 1024
+_NUMBER = r"(?:[0-9]{1,3}(?:[. ][0-9]{3})+(?:,[0-9]{1,2})?|[0-9]{1,7}(?:[,.][0-9]{1,2})?)"
+_RENT_VALUE = re.compile(rf"(?P<number>{_NUMBER})\s*(?:€|EUR|Euro)(?:\s*(?:/\s*Monat|monatlich))?(?:\s*VB)?", re.I)
+_AREA_VALUE = re.compile(rf"(?P<number>{_NUMBER})\s*(?:m(?:²|\^?2)|qm)", re.I)
+_RENT_KINDS = {
+    "warmmiete": "warm", "gesamtmiete": "total", "bruttowarmmiete": "warm",
+    "kaltmiete": "cold", "nettokaltmiete": "cold", "miete": "unspecified", "preis": "unspecified",
+}
+RentKind = Literal["warm", "total", "cold", "unspecified"]
 
 
 class WGSourceError(Exception):
@@ -91,6 +99,9 @@ class Listing:
     district: str | None = None
     is_wg: bool = False
     published_day: date | None = None
+    rent_eur: float | None = None
+    rent_kind: RentKind | None = None
+    area_sqm: float | None = None
 
 
 def _search_url(url):
@@ -128,6 +139,34 @@ def _clean(text):
 
 def _text(node):
     return _clean(node.get_text(" ", strip=True)) if node else ""
+
+
+def _positive_number(value: float, ceiling: int) -> float | None:
+    return value if 0 < value <= ceiling else None
+
+
+def _displayed_quantity(pattern: re.Pattern[str], text: str, ceiling: int) -> float | None:
+    match = pattern.fullmatch(_clean(text))
+    if not match:
+        return None
+    number = match["number"]
+    if "," in number:
+        number = number.replace(".", "").replace(" ", "").replace(",", ".")
+    elif re.fullmatch(r"[0-9]{1,3}(?:[. ][0-9]{3})+", number):
+        number = number.replace(".", "").replace(" ", "")
+    return _positive_number(float(number), ceiling)
+
+
+def parse_rent_eur(text: str) -> float | None:
+    return _displayed_quantity(_RENT_VALUE, text, 1_000_000)
+
+
+def parse_area_sqm(text: str) -> float | None:
+    return _displayed_quantity(_AREA_VALUE, text, 10_000)
+
+
+def rent_kind_for_label(label: str) -> RentKind | None:
+    return _RENT_KINDS.get(_clean(label).casefold().rstrip(" :"))
 
 
 def _publication(value) -> datetime | date | None:
@@ -173,6 +212,61 @@ def _structured_listings(soup):
                 yield entry
 
 
+def _structured_ad(soup, listing_id):
+    for item in _structured_listings(soup):
+        url = item.get("url")
+        ref = ListingRef.from_url(url) if isinstance(url, str) else None
+        if ref and ref.id == listing_id:
+            yield item
+
+
+def _machine_quantity(value, ceiling: int) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _positive_number(value, ceiling)
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,7}(?:\.[0-9]{1,2})?", value):
+        return _positive_number(float(value), ceiling)
+    return None
+
+
+def _detail_facts(soup, listing_id: str, *, is_wg: bool) -> tuple[float | None, RentKind | None, float | None]:
+    rent: dict[RentKind, float] = {}
+    area = None
+    area_labels = {"größe", "zimmergröße", "zimmerfläche"} if is_wg else {"größe", "wohnfläche", "wohnungsgröße"}
+    for label in soup.select(".key_fact_detail, .section_panel_detail"):
+        name = _text(label).lower().rstrip(" :")
+        kind = rent_kind_for_label(name)
+        if not kind and name not in area_labels:
+            continue
+        if "key_fact_detail" in label.get("class", []):
+            value = _text(label.parent.select_one(".key_fact_value"))
+        else:
+            next_column = label.parent.find_next_sibling()
+            value = _text(next_column.select_one(".section_panel_value")) if next_column else ""
+        if kind and (amount := parse_rent_eur(value)) is not None:
+            rent.setdefault(kind, amount)
+        if name in area_labels and area is None:
+            area = parse_area_sqm(value)
+
+    if not rent or area is None:
+        for ad in _structured_ad(soup, listing_id):
+            offers = ad.get("offers")
+            if not rent and isinstance(offers, dict) and offers.get("priceCurrency") == "EUR":
+                amount = _machine_quantity(offers.get("price"), 1_000_000)
+                if amount is not None:
+                    rent["unspecified"] = amount
+            entity = ad.get("mainEntity")
+            # A WG listing may advertise a room in a much larger apartment.
+            if area is None and isinstance(entity, dict) and (not is_wg or entity.get("@type") == "Room"):
+                size = entity.get("floorSize")
+                if isinstance(size, dict) and size.get("unitCode") == "MTK":
+                    area = _machine_quantity(size.get("value"), 10_000)
+
+    for kind in ("warm", "total", "cold", "unspecified"):
+        if kind in rent:
+            return rent[kind], kind, area
+    return None, None, area
+
+
 def _online_age(text):
     """The public update time is useful only as a tie-breaker for visiting ads."""
     match = re.fullmatch(
@@ -190,11 +284,8 @@ def _online_age(text):
 def _publication_fields(soup, listing_id):
     for element in soup.select('[itemprop="datePosted"], meta[property="article:published_time"]'):
         yield element.get("datetime") or element.get("content") or _text(element)
-    for item in _structured_listings(soup):
-        url = item.get("url")
-        ref = ListingRef.from_url(url) if isinstance(url, str) else None
-        if ref and ref.id == listing_id:
-            yield item.get("datePosted")
+    for item in _structured_ad(soup, listing_id):
+        yield item.get("datePosted")
     for label in soup.select("th, td"):
         if _text(label).casefold().rstrip(":") in {"veröffentlicht am", "inseriert am", "erstellt am"}:
             yield _text(label.find_next_sibling(["td", "th"]))
@@ -381,6 +472,8 @@ class WGSource:
             None,
         )
         published_at, published_day = _details_publication(soup, ref.id)
+        is_wg = bool(residents or wanted or urlsplit(listing_url).path.startswith("/wg-zimmer-"))
+        rent_eur, rent_kind, area_sqm = _detail_facts(soup, ref.id, is_wg=is_wg)
         return Listing(
             id=ref.id,
             url=listing_url,
@@ -392,6 +485,9 @@ class WGSource:
             resident_ages=resident_ages,
             wg_type=wg_type,
             district=district,
-            is_wg=bool(residents or wanted or urlsplit(listing_url).path.startswith("/wg-zimmer-")),
+            is_wg=is_wg,
             published_day=published_day,
+            rent_eur=rent_eur,
+            rent_kind=rent_kind,
+            area_sqm=area_sqm,
         )

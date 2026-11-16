@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import re
 from datetime import date, datetime, timezone
+from html import escape
+from math import isfinite
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -12,7 +14,10 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from dashboard_auth import logout_button, require_authentication
-from dashboard_data import BERLIN, RESULT_LIMIT, DateBasis, SecondaryListing, load_dashboard, weekend_dates
+from dashboard_data import (
+    BERLIN, RESULT_LIMIT, AddressCheck, DateBasis, DatedListing, ListingProfile, Match,
+    SecondaryListing, load_dashboard, weekend_dates,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,6 +27,8 @@ STATES = {
 }
 SMALL_WORDS = {"am", "an", "auf", "für", "im", "in", "mit", "und", "von", "zu", "zur"}
 WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
+RENT_LABELS = {"warm": "Warmmiete", "cold": "Kaltmiete", "total": "Gesamtmiete"}
+FIT_LABELS = {"strong": "Passt gut", "possible": "Könnte passen", "unclear": "Noch unklar"}
 INTRO = """
 <style>
   [data-testid="stMainBlockContainer"] { max-width: 64rem; padding-top: 2.75rem; }
@@ -30,6 +37,25 @@ INTRO = """
   .radar-heading p { color: #d0e9df; margin: 0; }
   .radar-heading .place { color: #9fdbbf; font-size: .82rem; font-weight: 700; letter-spacing: .085em; }
   .radar-heading h1 { color: #fff; padding: 0; margin: .3rem 0 .45rem; }
+  .radar-listing { display: grid; gap: .9rem; padding-block: .2rem; color: inherit; }
+  .radar-listing h3 { margin: .32rem 0 0; padding: 0; font-size: clamp(1.15rem, 2.5vw, 1.5rem);
+    line-height: 1.25; overflow-wrap: anywhere; }
+  .radar-listing p { margin: 0; overflow-wrap: anywhere; }
+  .radar-listing__meta { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem .65rem; font-size: .82rem; }
+  .radar-listing__source { font-weight: 650; }
+  .radar-listing__badge { padding: .15rem .55rem; border-radius: .45rem; font-size: .76rem; font-weight: 650;
+    background: #e1efed; color: #224a44; }
+  .radar-listing__facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(9rem, 100%), 1fr)); gap: .6rem; }
+  .radar-listing__fact { background: rgba(78, 133, 123, .12); border-radius: .6rem; padding: .55rem .75rem; }
+  .radar-listing__label { display: block; font-size: .78rem; opacity: .84; }
+  .radar-listing__value { display: block; font-size: 1.11rem; font-weight: 680; line-height: 1.4; }
+  .radar-listing__missing { font-size: .88rem; font-weight: 500; }
+  .radar-listing__section .radar-listing__label { font-weight: 650; opacity: 1; margin-bottom: .15rem; }
+  .radar-listing__section p { font-size: .92rem; line-height: 1.46; }
+  .radar-listing__section .radar-listing__badge { display: inline-block; margin: .05rem .4rem .15rem 0; }
+  .radar-listing__section .radar-fit-possible { background: #fcf1d7; color: #664713; }
+  .radar-listing__section .radar-fit-unclear { background: #efeaed; color: #51434e; }
+  .radar-listing .radar-listing__foot { font-size: .8rem; opacity: .86; }
 </style>
 <header class="radar-heading"><p class="place">MÜNCHEN</p><h1>MietRadar</h1>
 <p>Neue Mietangebote und deine Nachrichten.</p></header>
@@ -71,7 +97,58 @@ def _location_link(url: str | None, label: str = "Anzeige öffnen") -> None:
         st.link_button(label, url, icon=":material/open_in_new:")
 
 
-def _matches(rows, hours: int, wg_scan: tuple[float, int] | None) -> None:
+def _format_value(value: float | None, unit: str) -> str | None:
+    if not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
+        return None
+    precision = 0 if int(value) == value else 2
+    formatted = f"{value:,.{precision}f}".translate(str.maketrans(",.", ".,"))
+    if unit == "m²" and precision:
+        formatted = formatted.rstrip("0")
+    return f"{formatted} {unit}"
+
+
+def _fact(label: str, value: str | None) -> str:
+    missing = " radar-listing__missing" if value is None else ""
+    return (
+        f'<div class="radar-listing__fact"><span class="radar-listing__label">{escape(label)}</span>'
+        f'<strong class="radar-listing__value{missing}">{escape(value or "Keine Angabe")}</strong></div>'
+    )
+
+
+def _listing_card(
+    profile: ListingProfile | None, *, title: str, platform: str, status: str, date_label: str,
+    route: tuple[str, str] | None = None, note: str | None = None,
+) -> None:
+    if profile and profile.title:
+        title = profile.title
+    rent_label = RENT_LABELS.get(profile.rent_kind, "Miete") if profile else "Miete"
+    facts = _fact(rent_label, _format_value(profile.rent_eur, "€") if profile else None)
+    facts += _fact("Fläche", _format_value(profile.area_sqm, "m²") if profile else None)
+    if route:
+        facts += _fact(*route)
+    sections = []
+    if profile and profile.summary:
+        sections.append('<section class="radar-listing__section"><span class="radar-listing__label">Kurz &amp; knapp</span>'
+                        f'<p>{escape(profile.summary)}</p></section>')
+    if profile and (profile.fit or profile.fit_reason):
+        fit = profile.fit if profile.fit in FIT_LABELS else "unclear"
+        reason = f"<p>{escape(profile.fit_reason)}</p>" if profile.fit_reason else ""
+        sections.append('<section class="radar-listing__section"><span class="radar-listing__label">Einschätzung</span>'
+                        f'<span class="radar-listing__badge radar-fit-{fit}">{FIT_LABELS[fit]}</span>{reason}</section>')
+    if note:
+        sections.append(f'<p class="radar-listing__foot">{escape(note)}</p>')
+    badge = f'<span class="radar-listing__badge">{escape(status)}</span>' if status else ""
+    st.html(
+        '<article class="radar-listing"><header>'
+        f'<div class="radar-listing__meta"><span class="radar-listing__source">{escape(platform)}</span>{badge}</div>'
+        f'<h3>{escape(title)}</h3></header><div class="radar-listing__facts">{facts}</div>'
+        f'{"".join(sections)}<p class="radar-listing__foot">{escape(date_label)}</p></article>'
+    )
+
+
+def _matches(
+    rows: tuple[Match, ...], hours: int, wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile],
+) -> None:
     st.subheader("Neue Mietangebote", anchor=False)
     _scan_status(wg_scan)
     platforms = sorted({row.platform for row in rows})
@@ -83,18 +160,23 @@ def _matches(rows, hours: int, wg_scan: tuple[float, int] | None) -> None:
         if platform != "Alle" and row.platform != platform:
             continue
         with st.container(border=True):
-            st.subheader(_headline(row.url), anchor=False)
-            st.caption(f"{row.platform} · {row.id} · {STATES.get(row.state, 'Entwurf')}")
-            st.caption(f"{row.basis.capitalize()}: {_date(row.fresh_at)}")
+            date_label = f"{row.basis.capitalize()} · {_date(row.fresh_at)}"
             if row.basis == "zuerst gesehen":
                 posting = _posting_day(row.published_day) if row.published_day else "Veröffentlichungsdatum unbekannt"
-                st.caption(f"{posting} · nur als Entwurf")
-            if row.review_reason:
-                st.caption(row.review_reason)
+                date_label = f"{date_label} · {posting} · nur als Entwurf"
+            _listing_card(
+                profiles.get(row.id), title=_headline(row.url), platform=row.platform,
+                status=f"A · {STATES.get(row.state, 'Entwurf')}", date_label=f"{date_label} · {row.id}",
+                route=("Zum Hbf oder Ostbahnhof", "Bis zu 30 Min."),
+            )
             _location_link(row.url)
             if row.message:
                 with st.expander("Bewerbung anzeigen"):
                     st.code(row.message, language=None, wrap_lines=True)
+                    if row.review_reason:
+                        st.text(row.review_reason)
+            elif row.review_reason:
+                st.text(row.review_reason)
 
 
 def _scan_status(wg_scan: tuple[float, int] | None) -> None:
@@ -119,7 +201,10 @@ def _date_filter(today: date) -> tuple[DateBasis | None, tuple[date, date] | Non
     return basis, days if isinstance(days, tuple) and len(days) == 2 else None
 
 
-def _dated_offers(rows, days: tuple[date, date] | None, basis: DateBasis, wg_scan: tuple[float, int] | None) -> None:
+def _dated_offers(
+    rows: tuple[DatedListing, ...], days: tuple[date, date] | None, basis: DateBasis,
+    wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile],
+) -> None:
     sightings = basis == "first_seen"
     st.subheader("Zuerst erfasste Mietangebote" if sightings else "Veröffentlichte Mietangebote", anchor=False)
     _scan_status(wg_scan)
@@ -138,31 +223,30 @@ def _dated_offers(rows, days: tuple[date, date] | None, basis: DateBasis, wg_sca
         st.caption(f"Anzeige auf {RESULT_LIMIT} Ergebnisse begrenzt.")
     for row in rows:
         with st.container(border=True):
-            st.subheader(_headline(row.url), anchor=False)
-            status = "Filter erfüllt" if row.matched else "Erfasst"
-            st.caption(f"{row.platform} · {row.id} · {status}")
             if sightings:
-                st.caption(f"Zuerst gesehen am {WEEKDAYS[row.day.weekday()]}, {row.day:%d.%m.%Y}")
-                st.caption("Veröffentlichungsdatum unbekannt")
+                date_label = (f"Zuerst gesehen am {WEEKDAYS[row.day.weekday()]}, {row.day:%d.%m.%Y}"
+                              " · Veröffentlichungsdatum unbekannt")
             else:
-                st.caption(_posting_day(row.day))
+                date_label = _posting_day(row.day)
+            _listing_card(profiles.get(row.id), title=_headline(row.url), platform=row.platform,
+                          status="Filter erfüllt" if row.matched else "Erfasst", date_label=date_label)
             _location_link(row.url)
 
 
-def _addresses(rows) -> None:
+def _addresses(rows: tuple[AddressCheck, ...], profiles: dict[str, ListingProfile]) -> None:
     st.subheader("Adresse prüfen", anchor=False)
     if not rows:
         st.info("Keine Kleinanzeigen-Angebote zur Ortsprüfung.")
         return
     for row in rows:
         with st.container(border=True):
-            st.text(row.title or _headline(row.url))
-            st.caption(f"Kleinanzeigen · {row.id} · {_date(row.fresh_at)}")
-            st.text(row.reason)
+            _listing_card(profiles.get(row.id), title=row.title or _headline(row.url), platform="Kleinanzeigen",
+                          status="Adresse prüfen", date_label=f"{_date(row.fresh_at)} · {row.id}",
+                          note=row.reason)
             _location_link(row.url)
 
 
-def _secondary_offers(rows: tuple[SecondaryListing, ...], hours: int) -> None:
+def _secondary_offers(rows: tuple[SecondaryListing, ...], hours: int, profiles: dict[str, ListingProfile]) -> None:
     st.caption("Bis zu 45 Min. mit dem ÖPNV ab Ostbahnhof für B oder ab Hauptbahnhof für C. Passt beides, gilt B.")
     if not rows:
         st.info(f"Keine Angebote der Kategorie B oder C in den letzten {hours} Stunden.")
@@ -175,9 +259,9 @@ def _secondary_offers(rows: tuple[SecondaryListing, ...], hours: int) -> None:
         for row in offers:
             station = "Hauptbahnhof" if row.station == "Hbf" else row.station
             with st.container(border=True):
-                st.text(row.title or _headline(row.url))
-                st.caption(f"{row.platform} · {row.minutes} Min. mit dem ÖPNV ab {station}")
-                st.caption(f"{row.basis.capitalize()}: {_date(row.fresh_at)}")
+                _listing_card(profiles.get(row.id), title=row.title or _headline(row.url), platform=row.platform,
+                              status="", date_label=f"{row.basis.capitalize()} · {_date(row.fresh_at)}",
+                              route=(f"Ab {station}", f"{row.minutes} Min."))
                 _location_link(row.url)
 
 
@@ -255,13 +339,13 @@ def main() -> None:
     )
     with offers:
         if date_basis:
-            _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan)
+            _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan, data.listing_profiles)
         else:
-            _matches(data.matches, hours, data.wg_scan)
+            _matches(data.matches, hours, data.wg_scan, data.listing_profiles)
     with secondary:
-        _secondary_offers(data.secondary_offers, hours)
+        _secondary_offers(data.secondary_offers, hours, data.listing_profiles)
     with address:
-        _addresses(data.address_checks)
+        _addresses(data.address_checks, data.listing_profiles)
     with replies:
         _replies(data.replies)
     with activity:

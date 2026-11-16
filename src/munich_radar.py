@@ -19,14 +19,15 @@ from dotenv import load_dotenv
 from kleinanzeigen_activity import EmailNotifier, install_activity, record_activity, record_replies
 from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
-from llm_personalizer import personalise_message
+from listing_profiles import ROUTE_FIT, install_listing_profiles, record_listing_profile
+from llm_personalizer import application_render_signature, personalise_message, with_applicant_intro
 from munich_delivery import DeliveryQueue, install_schema, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import TransitRouter
 from wg_alerts import AlertsError, AlertsInbox
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
 from wg_preferences import rejection_reason
-from wg_source import DEFAULT_SEARCH_URLS, WGListingGone, WGSource, WGSourceError
+from wg_source import DEFAULT_SEARCH_URLS, ListingRef, WGListingGone, WGSource, WGSourceError
 
 ROOT = Path(__file__).resolve().parent.parent
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -71,6 +72,7 @@ def _database(path: Path) -> sqlite3.Connection:
     install_activity(db)
     install_reply_queue(db)
     install_observations(db)
+    install_listing_profiles(db)
     return db
 
 
@@ -89,6 +91,7 @@ class Scanner:
     klein_alerts: AlertsInbox | None = None
     klein_delivery: DeliveryQueue | None = None
     outgoing_provider: str = "none"
+    render_signature: str | None = None
 
     def scan(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         cutoff = now - self.max_age
@@ -107,6 +110,7 @@ class Scanner:
             klein = KleinanzeigenRadar(
                 self.router, self.template, self.provider, self.age, self.age_gap, self.klein_delivery,
                 outgoing_provider=self.outgoing_provider,
+                render_signature=self.render_signature,
             )
             try:
                 counts.update(klein.scan(db, self.klein_alerts, now, cutoff, self.limit, retry_after))
@@ -129,16 +133,33 @@ class Scanner:
             )
             refs = [(ref, None) for ref in candidates]
 
+        if self.render_signature:
+            older_drafts = db.execute("""
+                SELECT d.url FROM drafts d LEFT JOIN draft_render_signatures s ON s.id = d.id
+                WHERE d.id NOT LIKE 'ka-%' AND d.done = 0 AND d.message IS NOT NULL
+                  AND d.fresh_at BETWEEN ? AND ? AND COALESCE(s.signature, '') != ?
+                  AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
+                ORDER BY d.fresh_at DESC LIMIT ?
+            """, (cutoff.timestamp(), now.timestamp(), self.render_signature, self.limit)).fetchall()
+            refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
+            seen = {ref.id for ref, _ in refs}
+            refs.extend((ref, stamp) for ref, stamp in refresh_refs if ref.id not in seen)
+            prioritized = {ref.id for ref, _ in refresh_refs}
+            refs.sort(key=lambda row: row[0].id not in prioritized)
+
         eligible = []
         detail_reads = 0
         for ref, received_at in refs:
             if ref.id in retry_after:
                 continue
             draft = db.execute(
-                """SELECT d.fresh_at, d.message, d.done, s.state FROM drafts d
-                   LEFT JOIN delivery s ON s.id = d.id WHERE d.id = ?""", (ref.id,),
+                """SELECT d.fresh_at, d.message, d.done, s.state, d.basis, r.signature FROM drafts d
+                   LEFT JOIN delivery s ON s.id = d.id LEFT JOIN draft_render_signatures r ON r.id = d.id
+                   WHERE d.id = ?""", (ref.id,),
             ).fetchone()
-            if draft and (not self.delivery or self.delivery.paused or not draft[1] or draft[2] or draft[3]):
+            refresh_draft = bool(draft and self.render_signature and draft[5] != self.render_signature)
+            if draft and (not draft[1] or draft[2] or draft[3] or
+                          (not refresh_draft and (not self.delivery or self.delivery.paused))):
                 continue
             if detail_reads >= self.limit:
                 break
@@ -151,6 +172,7 @@ class Scanner:
                 counts["nicht mehr verfügbar"] += 1
                 retry_after[ref.id] = now + self.max_age
                 continue
+            record_listing_profile(db, listing)
 
             published_at = listing.published_at
             published_day = listing.published_day
@@ -171,6 +193,9 @@ class Scanner:
             else:
                 fresh_at = observation.recent_first_seen(cutoff) if observation else None
                 basis = FIRST_SEEN_BASIS
+            refresh_only = fresh_at is None and refresh_draft
+            if refresh_only:
+                fresh_at, basis = datetime.fromtimestamp(draft[0], timezone.utc), draft[4]
             if fresh_at is None or fresh_at.tzinfo is None:
                 counts["kein Veröffentlichungsdatum"] += 1
                 retry_after[ref.id] = now + timedelta(minutes=15)
@@ -194,6 +219,7 @@ class Scanner:
                 resident_ages=listing.resident_ages or "", age=self.age, age_gap=self.age_gap,
             )
             if reason:
+                record_listing_profile(db, listing, fit="unclear", reason=f"Suchfilter: {reason}.")
                 with db:
                     remove_secondary_offer(db, ref.id)
                 counts[reason] += 1
@@ -202,17 +228,21 @@ class Scanner:
             if draft:
                 # A new alert may not extend an existing listing's window.
                 fresh_at = min(fresh_at, datetime.fromtimestamp(draft[0], timezone.utc))
-            may_deliver = basis != FIRST_SEEN_BASIS and (published_at is not None or published_day is None)
-            eligible.append((fresh_at, listing, basis, draft, may_deliver))
+            may_deliver = not refresh_only and basis != FIRST_SEEN_BASIS and (published_at is not None or published_day is None)
+            eligible.append((fresh_at, listing, basis, draft, may_deliver, refresh_draft))
 
-        for fresh_at, listing, basis, draft, may_deliver in sorted(eligible, key=lambda item: item[0], reverse=True):
+        for fresh_at, listing, basis, draft, may_deliver, refresh_draft in sorted(eligible, key=lambda item: item[0], reverse=True):
             if not listing.address:
+                record_listing_profile(db, listing, fit="unclear", reason="Die genaue Adresse fehlt.")
                 with db:
                     remove_secondary_offer(db, listing.id)
                 counts["keine prüfbare Adresse"] += 1
                 retry_after[listing.id] = now + timedelta(minutes=30)
                 continue
             tier, minutes = self.router.classify(listing.address, now)
+            fit, fit_reason = ROUTE_FIT.get(tier, ("unclear", "Die ÖPNV-Verbindung konnte nicht geprüft werden."))
+            record_listing_profile(db, listing, fit=fit, reason=fit_reason,
+                                   provider=self.provider if tier in {"a", "b", "c"} else "none")
             if tier in {"b", "c"} and minutes is not None:
                 with db:
                     save_secondary_offer(db, listing.id, listing.url, listing.title, fresh_at, basis,
@@ -226,23 +256,27 @@ class Scanner:
                 counts["ÖPNV über 45 Minuten" if tier == "outside" else "ÖPNV nicht prüfbar"] += 1
                 retry_after[listing.id] = now + (self.max_age if tier == "outside" else timedelta(minutes=10))
                 continue
-            if draft:
+            if draft and not refresh_draft:
                 with db:
                     remove_secondary_offer(db, listing.id)
                 message = draft[1]
             else:
                 message = personalise_message(
-                    self.template, listing.description, listing_url=listing.url, provider=self.provider,
+                    self.template, listing.description, listing_url=listing.url, listing_title=listing.title,
+                    provider=self.provider, listing_type="wg" if listing.is_wg else "wohnung",
                 )
                 with db:
                     saved = save_application_draft(
                         db, listing.id, listing.url, fresh_at.timestamp(), basis, message,
                         context=listing.description, provider=self.outgoing_provider, now=now,
+                        signature=self.render_signature, previous_message=draft[1] if draft else None,
                     )
                     remove_secondary_offer(db, listing.id)
                 if not saved:
                     continue
-                counts["neue Entwürfe"] += 1
+                counts["Entwürfe aktualisiert" if draft else "neue Entwürfe"] += 1
+                if draft:
+                    continue  # A refreshed personal draft first appears for review.
             if self.delivery and may_deliver:
                 result = self.delivery.deliver(db, listing.id, listing.url, message, fresh_at, self.max_age,
                                                context=listing.description)
@@ -302,7 +336,7 @@ def _draft_settings() -> tuple[str, str]:
         raise ValueError("Die Bewerbungsvorlage braucht eigenen Text")
     if provider == "mistral" and "{LLM_TEXT}" not in template:
         raise ValueError("Für Mistral muss die Bewerbungsvorlage {LLM_TEXT} enthalten")
-    return template, provider
+    return with_applicant_intro(template, os.getenv("MUNICH_APPLICANT_INTRO", "")), provider
 
 
 def _scanner(max_age: timedelta) -> Scanner:
@@ -323,6 +357,7 @@ def _scanner(max_age: timedelta) -> Scanner:
         template, provider, max_age, limit, alerts,
         _number("MUNICH_APPLICANT_AGE", 28, 18, 100), _number("MUNICH_MAX_AGE_GAP", 7, 0, 100),
         klein_alerts=klein_alerts, outgoing_provider=_outgoing_provider(),
+        render_signature=application_render_signature(template, provider),
     )
 
 
@@ -402,6 +437,7 @@ def main() -> int:
                 klein = KleinanzeigenRadar(
                     TransitRouter(os.getenv("MUNICH_TRANSIT_API_URL")), template, provider,
                     outgoing_provider=_outgoing_provider(),
+                    render_signature=application_render_signature(template, provider),
                 )
                 saved, message = klein.check_address(db, args.id, args.address, now, now - max_age)
                 print(message)

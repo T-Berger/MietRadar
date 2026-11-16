@@ -136,6 +136,37 @@ class PublicPageTests(unittest.TestCase):
         self.assertEqual(listing.published_at, datetime(2026, 11, 15, 9, 25, tzinfo=timezone.utc))
         self.assertIsNone(listing.address)
 
+    def test_reads_headline_rent_and_room_area_without_using_deposits_or_apartment_size(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/wg-zimmer-in-Muenchen.123.html")
+        self.stub_pages({ref.url: """
+            <h1 class="detailed-view-title">Zimmer</h1>
+            <div><span class="key_fact_detail">Zimmergröße</span><b class="key_fact_value">17,5m²</b></div>
+            <div><span class="key_fact_detail">Wohnfläche</span><b class="key_fact_value">75 m²</b></div>
+            <div><span class="key_fact_detail">Gesamtmiete</span><b class="key_fact_value">1.234,50 €</b></div>
+            <div><div><span class="section_panel_detail">Miete:</span></div>
+            <div><span class="section_panel_value">950 €</span></div></div>
+            <div><div><span class="section_panel_detail">Kaution:</span></div>
+            <div><span class="section_panel_value">2.500 €</span></div></div>
+        """})
+        listing = self.source.details(ref)
+        self.assertEqual((listing.rent_eur, listing.rent_kind, listing.area_sqm), (1234.50, "total", 17.5))
+
+    def test_exact_ad_metadata_supplies_untyped_rent_and_square_meters(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/wohnungen-in-Muenchen.123.html")
+        metadata = json.dumps([
+            {"@type": "RealEstateListing", "url": f"{BASE_URL}/121.html",
+             "offers": {"price": 1, "priceCurrency": "EUR"}},
+            {"@type": "RealEstateListing", "url": ref.url,
+             "offers": {"price": "1500.50", "priceCurrency": "EUR"},
+             "mainEntity": {"floorSize": {"value": 54, "unitCode": "MTK"}}},
+        ])
+        self.stub_pages({ref.url: f"""
+            <h1 class="detailed-view-title">Wohnung</h1>
+            <script type="application/ld+json">{metadata}</script>
+        """})
+        listing = self.source.details(ref)
+        self.assertEqual((listing.rent_eur, listing.rent_kind, listing.area_sqm), (1500.50, "unspecified", 54))
+
     def test_missing_or_blocked_response_is_explicit(self):
         ref = ListingRef.from_url(f"{BASE_URL}/123.html")
         error_cases = (

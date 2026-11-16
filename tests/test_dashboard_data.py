@@ -75,6 +75,7 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.matches[0].url, "https://www.wg-gesucht.de/12.html")
         self.assertEqual(data.address_checks, ())
         self.assertEqual(data.secondary_offers, ())
+        self.assertEqual(data.listing_profiles, {})
         self.assertIsNone(data.wg_scan)
 
     def test_current_secondary_offers_are_separate_from_primary_matches(self):
@@ -112,6 +113,33 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(offers, [("12", "WG-Gesucht", "b", "Ostbahnhof", 45),
                                   ("ka-77", "Kleinanzeigen", "c", "Hbf", 28)])
         self.assertEqual(data.secondary_offers[0].url, "https://www.wg-gesucht.de/12.html")
+
+    def test_loads_listing_profiles_for_visible_cards_only(self):
+        with closing(_database(self.path)) as db, db:
+            db.execute("""CREATE TABLE IF NOT EXISTS listing_profiles (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, rent_eur REAL, rent_kind TEXT,
+                area_sqm REAL, summary TEXT, fit TEXT, fit_reason TEXT
+            )""")
+            db.execute("INSERT INTO drafts VALUES (?, ?, ?, ?, ?, ?)",
+                       ("12", "https://www.wg-gesucht.de/12.html", NOW.timestamp(), "veröffentlicht", "Hallo", 0))
+            db.execute("INSERT INTO munich_secondary_offers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                       ("ka-77", "https://www.kleinanzeigen.de/s-anzeige/wohnung/77-203-650", "Wohnung",
+                        NOW.timestamp(), "zuerst gesehen", "b", "Ostbahnhof", 44))
+            db.executemany("""INSERT INTO listing_profiles
+                (id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", [
+                ("12", "Zimmer am Park", 780.5, "warm", 18.5, "Das Zimmer ist möbliert.", "strong", "Nah am Ostbahnhof."),
+                ("ka-77", "Zwei Zimmer", None, None, 44, None, "unclear", "Miete offen."),
+                ("999", "Unbekannte Anzeige", None, None, None, None, None, None),
+            ])
+
+        data = load_dashboard(self.path, now=NOW)
+        self.assertEqual(set(data.listing_profiles), {"12", "ka-77"})
+        profile = data.listing_profiles["12"]
+        self.assertEqual((profile.title, profile.rent_eur, profile.rent_kind, profile.area_sqm),
+                         ("Zimmer am Park", 780.5, "warm", 18.5))
+        self.assertEqual((profile.summary, profile.fit, profile.fit_reason),
+                         ("Das Zimmer ist möbliert.", "strong", "Nah am Ostbahnhof."))
+        self.assertIsNone(data.listing_profiles["ka-77"].rent_eur)
 
     def test_shows_latest_public_inventory_count_even_without_matches(self):
         current = NOW.timestamp()

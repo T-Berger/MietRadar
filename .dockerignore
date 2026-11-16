@@ -6,6 +6,7 @@
 !src/munich_radar.py
 !src/munich_transit.py
 !src/munich_tiers.py
+!src/listing_profiles.py
 !src/munich_delivery.py
 !src/wg_source.py
 !src/wg_observations.py

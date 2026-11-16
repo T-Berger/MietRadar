@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -22,11 +22,23 @@ _TABLE_COLUMNS = {
     "wg_inventory_scan": {"id", "scanned_at"},
     "wg_observations": {"last_seen_at"},
     "munich_secondary_offers": {"id", "url", "title", "fresh_at", "basis", "tier", "station", "minutes"},
+    "listing_profiles": {"id", "title", "rent_eur", "rent_kind", "area_sqm", "summary", "fit", "fit_reason"},
 }
 _PLATFORM_HOSTS = {"www.wg-gesucht.de", "wg-gesucht.de", "www.kleinanzeigen.de", "kleinanzeigen.de"}
 RESULT_LIMIT = 100
 BERLIN = ZoneInfo("Europe/Berlin")
 DateBasis = Literal["published", "first_seen"]
+
+
+@dataclass(frozen=True)
+class ListingProfile:
+    title: str
+    rent_eur: float | None
+    rent_kind: str | None
+    area_sqm: float | None
+    summary: str | None
+    fit: str | None
+    fit_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -105,6 +117,7 @@ class DashboardData:
     wg_scan: tuple[float, int] | None = None
     dated_listings: tuple[DatedListing, ...] = ()
     secondary_offers: tuple[SecondaryListing, ...] = ()
+    listing_profiles: dict[str, ListingProfile] = field(default_factory=dict)
 
 
 def _platform_url(url: str) -> str | None:
@@ -232,6 +245,17 @@ def _wg_scan(db: sqlite3.Connection, tables: set[str]) -> tuple[float, int] | No
     """).fetchone()
 
 
+def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[str, ListingProfile]:
+    if "listing_profiles" not in tables or not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    rows = db.execute(f"""
+        SELECT id, title, rent_eur, rent_kind, area_sqm, summary, fit, fit_reason
+        FROM listing_profiles WHERE id IN ({placeholders})
+    """, tuple(ids))
+    return {listing_id: ListingProfile(*profile) for listing_id, *profile in rows}
+
+
 def _dated_listings(
     db: sqlite3.Connection, tables: set[str], window: tuple[date, date], now: datetime, basis: DateBasis,
 ) -> tuple[DatedListing, ...]:
@@ -324,15 +348,21 @@ def load_dashboard(
         with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2)) as db:
             db.execute("BEGIN")
             tables = _available_tables(db)
+            matches = _matches(db, tables, cutoff, until)
+            address_checks = _address_checks(db, cutoff, until) if "klein_review" in tables else ()
+            dated_listings = _dated_listings(db, tables, posting_window, now, date_basis) if posting_window else ()
+            secondary_offers = _secondary_offers(db, cutoff, until) if "munich_secondary_offers" in tables else ()
+            visible_ids = {row.id for group in (matches, address_checks, dated_listings, secondary_offers) for row in group}
             return DashboardData(
                 "ready",
-                matches=_matches(db, tables, cutoff, until),
-                address_checks=_address_checks(db, cutoff, until) if "klein_review" in tables else (),
+                matches=matches,
+                address_checks=address_checks,
                 replies=_replies(db, tables, history_cutoff, until) if "klein_reply_drafts" in tables else (),
                 activity=_activity(db, history_cutoff, until) if "klein_activity" in tables else (),
                 wg_scan=_wg_scan(db, tables),
-                dated_listings=_dated_listings(db, tables, posting_window, now, date_basis) if posting_window else (),
-                secondary_offers=_secondary_offers(db, cutoff, until) if "munich_secondary_offers" in tables else (),
+                dated_listings=dated_listings,
+                secondary_offers=secondary_offers,
+                listing_profiles=_profiles(db, tables, visible_ids),
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")
