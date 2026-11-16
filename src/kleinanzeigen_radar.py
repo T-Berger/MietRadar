@@ -5,11 +5,11 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from kleinanzeigen_source import extract_listings, normalize_munich_address
-from listing_profiles import ROUTE_FIT, record_listing_profile, record_listing_route
+from listing_profiles import ROUTE_FIT, record_listing_location, record_listing_profile, record_listing_route
 from llm_personalizer import personalise_message
 from munich_delivery import DeliveryQueue, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer
@@ -51,6 +51,7 @@ def _remove_candidates(db: sqlite3.Connection, listing_id: str) -> None:
     db.execute("DELETE FROM klein_review WHERE id = ?", (listing_id,))
     db.execute("DELETE FROM klein_origins WHERE id = ?", (listing_id,))
     remove_secondary_offer(db, listing_id)
+    record_listing_location(db, listing_id, None)
 
 
 @dataclass
@@ -119,8 +120,16 @@ class KleinanzeigenRadar:
             if availability:
                 counts[f"Kleinanzeigen: {availability}"] += 1
                 continue
+            address_changed = bool(draft and draft[3] and listing.address
+                                   and draft[3].casefold() != listing.address.casefold())
+            if address_changed:
+                # A previously saved origin must not be reused after the ad supplies a different address.
+                with db:
+                    db.execute("DELETE FROM klein_origins WHERE id = ?", (listing.id,))
+                    record_listing_location(db, listing.id, None)
             if listing.id in retry_after or (draft and (
-                draft[1] or draft[2] or (draft[7] is not None and not refresh and (not self.delivery or self.delivery.paused))
+                draft[1] or draft[2] or (draft[7] is not None and not (refresh or address_changed)
+                                        and (not self.delivery or self.delivery.paused))
             )):
                 continue
             reason = "Wohnungsgesuch" if _WANTED_AD.search(listing.title) else rejection_reason(
@@ -139,9 +148,11 @@ class KleinanzeigenRadar:
             tier, minutes = self.router.classify(address, now) if address else (None, None)
             fit, fit_reason = ROUTE_FIT.get(tier, ("unclear", "Die ÖPNV-Verbindung konnte nicht geprüft werden."
                                                   if address else "Die genaue Adresse fehlt."))
-            record_listing_profile(db, listing, fit=fit, reason=fit_reason,
+            mapped = tier in PRIMARY_TIERS or tier in _SECONDARY_STATIONS
+            record_listing_profile(db, replace(listing, address=address), fit=fit, reason=fit_reason,
                                    provider=self.provider if tier != "outside" else "none",
-                                   route_tier=tier, route_minutes=minutes)
+                                   route_tier=tier, route_minutes=minutes,
+                                   coordinates=self.router.coordinates(address) if mapped else None)
             if tier in PRIMARY_TIERS:
                 checked_routes.add(listing.id)
                 if refresh:
@@ -189,7 +200,25 @@ class KleinanzeigenRadar:
                       stamp.timestamp(), basis, pending_reason))
         if self.delivery and not self.delivery.paused:
             counts.update(self._send_ready(db, now, cutoff, checked_routes, retry_after))
+        self._backfill_locations(db, now, cutoff, limit)
         return counts
+
+    def _backfill_locations(self, db: sqlite3.Connection, now: datetime, cutoff: datetime, limit: int) -> None:
+        # Older primary drafts already have the exact address used for their route check.
+        rows = db.execute("""
+            SELECT d.id, o.address FROM drafts d
+            JOIN klein_origins o ON o.id = d.id
+            JOIN listing_profiles p ON p.id = d.id
+            JOIN listing_availability a ON a.id = d.id AND a.reason IS NULL AND a.policy_version = ?
+            WHERE d.done = 0 AND d.message IS NOT NULL AND d.fresh_at BETWEEN ? AND ?
+              AND p.route_tier IN ('a*', 'a') AND (p.latitude IS NULL OR p.longitude IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers m WHERE m.id = d.id)
+            ORDER BY d.fresh_at DESC LIMIT ?
+        """, (AVAILABILITY_POLICY_VERSION, cutoff.timestamp(), now.timestamp(), min(limit, 5))).fetchall()
+        for listing_id, address in rows:
+            if (coordinates := self.router.coordinates(address)) is not None:
+                with db:
+                    record_listing_location(db, listing_id, coordinates, address=address)
 
     def _send_ready(self, db, now, cutoff, checked_routes, retry_after) -> Counter:
         counts: Counter = Counter()
@@ -209,8 +238,11 @@ class KleinanzeigenRadar:
                 continue
             if listing_id not in checked_routes:
                 tier, minutes = self.router.classify(address, now)
+                coordinates = self.router.coordinates(address) if tier in PRIMARY_TIERS else None
                 with db:
                     record_listing_route(db, listing_id, tier, minutes)
+                    if coordinates is not None or tier == "outside":
+                        record_listing_location(db, listing_id, coordinates, address=address)
                 if tier not in PRIMARY_TIERS:
                     continue
             result = self.delivery.deliver(db, listing_id, url, message, datetime.fromtimestamp(fresh_at, timezone.utc), send_window)
@@ -253,9 +285,13 @@ class KleinanzeigenRadar:
             return False, availability
         tier, minutes = self.router.classify(origin, now)
         fit, reason = ROUTE_FIT.get(tier, ("unclear", "Die ÖPNV-Verbindung konnte nicht geprüft werden."))
+        mapped = tier in PRIMARY_TIERS or tier in _SECONDARY_STATIONS
+        coordinates = self.router.coordinates(origin) if mapped else None
         with db:
             db.execute("UPDATE listing_profiles SET fit = ?, fit_reason = ? WHERE id = ?", (fit, reason, listing_id))
             record_listing_route(db, listing_id, tier, minutes)
+            if coordinates is not None or tier == "outside":
+                record_listing_location(db, listing_id, coordinates, address=origin)
         if tier in _SECONDARY_STATIONS and minutes is not None:
             self._save_secondary_offer(db, listing_id, url, title, datetime.fromtimestamp(fresh_at, timezone.utc),
                                        basis, tier, minutes)

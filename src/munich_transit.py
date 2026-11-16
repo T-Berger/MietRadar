@@ -168,6 +168,14 @@ class TransitRouter:
             incomplete |= result is None
         return None if incomplete else False
 
+    def coordinates(self, origin: str) -> tuple[float, float] | None:
+        """Get the exact Munich address point, using the same cache as routing."""
+        coordinates = self._coordinates(origin)
+        if coordinates is None:
+            return None
+        latitude, longitude = coordinates.split(",", 1)
+        return float(latitude), float(longitude)
+
     def classify(self, origin: str, now: datetime) -> tuple[CommuteTier | None, int | None]:
         """Classify the commute. A* and B/C measure from the station to the listing."""
         coordinates = self._coordinates(origin)

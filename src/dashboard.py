@@ -8,7 +8,7 @@ import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from html import escape
-from math import isfinite
+from math import isfinite, log2
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -17,9 +17,10 @@ from dotenv import load_dotenv
 
 from dashboard_auth import logout_button, require_authentication
 from dashboard_data import (
-    BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, ListingProfile, Match, Reply,
-    SecondaryListing, load_dashboard, weekend_dates,
+    BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, ListingProfile, MapListing, Match,
+    Reply, SecondaryListing, load_dashboard, map_listings, weekend_dates,
 )
+from munich_transit import HAUPTBAHNHOF, OSTBAHNHOF
 from reviewed_applications import (
     MAX_APPLICATION_ATTACHMENT_BYTES, ApplicationAttachmentInfo, ApplicationReviewError,
     cancel_application_review, load_application_attachment, remove_application_attachment,
@@ -38,6 +39,13 @@ SMALL_WORDS = {"am", "an", "auf", "für", "im", "in", "mit", "und", "von", "zu",
 WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
 RENT_LABELS = {"warm": "Warmmiete", "cold": "Kaltmiete", "total": "Gesamtmiete"}
 FIT_LABELS = {"strong": "Passt gut", "possible": "Könnte passen", "unclear": "Noch unklar"}
+MAP_TIERS = {
+    "a*": ("A* · bis 20 Min.", "#087660", "ab Hbf oder Ostbahnhof"),
+    "a": ("A · bis 30 Min.", "#2557a5", "zum Hbf oder Ostbahnhof"),
+    "b": ("B · bis 45 Min.", "#a44d08", "ab Ostbahnhof"),
+    "c": ("C · bis 45 Min.", "#884498", "ab Hauptbahnhof"),
+}
+OSM_COPYRIGHT = '[© OpenStreetMap-Mitwirkende](https://www.openstreetmap.org/copyright)'
 INTRO = """
 <style>
   [data-testid="stMainBlockContainer"] { max-width: 64rem; padding-top: 2.75rem; }
@@ -144,6 +152,84 @@ def _primary_route(profile: ListingProfile | None) -> tuple[str, tuple[str, str]
     minutes = profile.route_minutes if profile else None
     duration = f"{minutes} Min." if isinstance(minutes, int) and 0 <= minutes <= limit else f"Bis zu {limit} Min."
     return category, (direction, duration)
+
+
+def _map_facts(row: MapListing) -> str:
+    tier, _, direction = MAP_TIERS[row.tier]
+    route = f"{row.tier.upper()} · {row.minutes} Min." if row.minutes is not None else tier
+    if row.station:
+        direction = f"ab {row.station}"
+    rent = _format_value(row.rent_eur, "€")
+    if rent and (rent_kind := RENT_LABELS.get(row.rent_kind)):
+        rent = f"{rent} {rent_kind}"
+    area = _format_value(row.area_sqm, "m²")
+    return " · ".join(filter(None, (row.platform, f"{route} {direction}", rent, area)))
+
+
+def _listing_map(rows: tuple[MapListing, ...]) -> None:
+    import plotly.graph_objects as go
+
+    st.subheader("Angebote auf der Karte", anchor=False)
+    pins = {row.id: row for row in rows if row.latitude is not None and row.longitude is not None}
+    if not pins:
+        st.info("Für die Angebote im gewählten Zeitraum liegen noch keine geprüften Koordinaten vor." if rows
+                else "Für den gewählten Zeitraum gibt es keine passenden Angebote.")
+    elif missing := len(rows) - len(pins):
+        st.caption(f"{len(pins)} von {len(rows)} Angeboten auf der Karte. Bei {missing} fehlt ein geprüfter Standort.")
+
+    stations = [tuple(map(float, value.split(","))) for value in (HAUPTBAHNHOF, OSTBAHNHOF)]
+    latitudes, longitudes = map(list, zip(*stations))
+    latitudes.extend(row.latitude for row in pins.values())
+    longitudes.extend(row.longitude for row in pins.values())
+    extent = max((max(latitudes) - min(latitudes)) / 0.67, max(longitudes) - min(longitudes), 0.11)
+    fig = go.Figure(go.Scattermap(
+        lat=latitudes[:2], lon=longitudes[:2], mode="markers", name="Bahnhöfe", legendrank=20,
+        marker={"size": 13, "color": "#243849"}, text=["München Hauptbahnhof", "München Ostbahnhof"],
+        unselected={"marker": {"opacity": 1}},
+        hovertemplate="<b>%{text}</b><extra></extra>",
+    ))
+    for rank, (tier, (label, color, _)) in enumerate(MAP_TIERS.items()):
+        tier_pins = [row for row in pins.values() if row.tier == tier]
+        if not tier_pins:
+            continue
+        fig.add_trace(go.Scattermap(
+            lat=[row.latitude for row in tier_pins], lon=[row.longitude for row in tier_pins],
+            mode="markers", name=label, legendrank=rank, marker={"size": 17, "color": color, "opacity": 0.9},
+            selected={"marker": {"size": 21}}, unselected={"marker": {"opacity": 0.9}},
+            text=[escape(row.title) for row in tier_pins],
+            customdata=[(row.id, escape(_map_facts(row))) for row in tier_pins],
+            hovertemplate="<b>%{text}</b><br>%{customdata[1]}<extra></extra>",
+        ))
+    fig.update_layout(
+        height=510, margin={"l": 0, "r": 0, "t": 52, "b": 0}, uirevision="munich-map",
+        clickmode="event+select", legend={"orientation": "h", "x": 0, "y": 1.02},
+        map={
+            "style": "white-bg",
+            "center": {"lat": (min(latitudes) + max(latitudes)) / 2, "lon": (min(longitudes) + max(longitudes)) / 2},
+            "zoom": min(11.4, log2(360 / extent) - 0.7),
+            "layers": [{"sourcetype": "raster", "source": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+                        "below": "traces", "sourceattribution": "© OpenStreetMap contributors"}],
+        },
+    )
+    event = st.plotly_chart(
+        fig, key="mietradar_offers_map", on_select="rerun", selection_mode="points",
+        config={"displaylogo": False, "modeBarButtonsToRemove": ["toImage"]},
+    )
+    st.caption(OSM_COPYRIGHT)
+    if not pins:
+        return
+    selected = event.selection.points[-1].get("customdata") if event.selection.points else None
+    selected_id = selected[0] if selected and selected[0] in pins else None
+    choices = list(pins)
+    chosen = st.selectbox(
+        "Angebot auswählen", choices, index=choices.index(selected_id) if selected_id else None,
+        format_func=lambda item: f"{pins[item].tier.upper()} · {pins[item].title}",
+        placeholder="Wähle einen Punkt auf der Karte oder ein Angebot aus der Liste",
+        key=f"map_listing_{selected_id or 'list'}",
+    )
+    if chosen:
+        st.caption(_map_facts(pins[chosen]))
+        _location_link(pins[chosen].url)
 
 
 def _listing_photos(photo_urls: tuple[str, ...]) -> str:
@@ -534,8 +620,9 @@ def main() -> None:
         matches.metric("Neue Angebote", len(data.matches), border=True)
     drafts.metric("Bewerbungsentwürfe", sum(bool(row.message) for row in data.matches), border=True)
     pending.metric("Adressen zur Prüfung", len(data.address_checks), border=True)
-    offers, secondary, address, replies, activity = st.tabs(
-        ["Angebote", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf"]
+    offers, map_tab, secondary, address, replies, activity = st.tabs(
+        ["Angebote", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf"],
+        key="mietradar_tab", on_change="rerun",
     )
     with offers:
         attachment = None
@@ -554,6 +641,9 @@ def main() -> None:
             _matches(data.matches, hours, data.wg_scan, data.listing_profiles, db_path,
                      review_available=data.application_reviews_available,
                      reviewed_send=reviewed_send, attachment=attachment)
+    if map_tab.open:
+        with map_tab:
+            _listing_map(map_listings(data, date_filtered=date_basis is not None))
     with secondary:
         _secondary_offers(data.secondary_offers, hours, data.listing_profiles)
     with address:

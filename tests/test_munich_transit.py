@@ -134,6 +134,7 @@ class TransitRouterTest(unittest.TestCase):
         router = TransitRouter()
         self.assertEqual(router.classify(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), ("a", None))
         self.assertIs(router.qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), True)
+        self.assertEqual(router.coordinates(ORIGIN), (48.128, 11.603))
         self.assertEqual(urlopen.call_count, 4)
 
     @patch("src.munich_transit.urlopen")

@@ -21,7 +21,9 @@ from dotenv import load_dotenv
 from kleinanzeigen_activity import EmailNotifier, install_activity, record_activity, record_replies
 from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
-from listing_profiles import ROUTE_FIT, install_listing_profiles, record_listing_profile, record_listing_route
+from listing_profiles import (
+    ROUTE_FIT, install_listing_profiles, record_listing_location, record_listing_profile, record_listing_route,
+)
 from llm_personalizer import (
     applicant_intro_from_template, application_render_signature, personalise_message,
     revise_first_message_draft, with_applicant_intro,
@@ -113,6 +115,7 @@ class Scanner:
     viewing_availability: tuple[datetime, ...] = ()
     applicant_answers: dict[str, str] = field(default_factory=dict)
     reviewed_startup_problem: Callable[[], str | None] | None = None
+    _location_retry_after: dict[str, datetime] = field(default_factory=dict, init=False, repr=False)
 
     def add_intro_to_current_drafts(self, db: sqlite3.Connection, now: datetime) -> int:
         """Clean up recent unedited drafts using the cached listing title."""
@@ -155,6 +158,7 @@ class Scanner:
             if reason:
                 remove_secondary_offer(db, listing.id)
                 reject_unavailable_approval(db, listing.id, reason, now)
+                record_listing_location(db, listing.id, None)
         return reason
 
     def _recheck_while_browser_is_blocked(
@@ -208,16 +212,24 @@ class Scanner:
             return False
         tier, minutes = self.router.classify(listing.address, now) if listing.address else (None, None)
         if tier is None:
+            if not listing.address:
+                with db:
+                    record_listing_location(db, item.id, None)
             set_application_wait_reason(
                 db, item, "Die ÖPNV-Fahrzeit konnte gerade nicht bestätigt werden. MietRadar prüft sie erneut.",
             )
             retry_after[item.id] = now + timedelta(minutes=5)
             return False
         if tier not in PRIMARY_TIERS:
-            fail_application_review(db, item, "Die Fahrt dauert inzwischen länger als 30 Minuten.", now)
+            with db:
+                record_listing_location(db, item.id, None)
+                fail_application_review(db, item, "Die Fahrt dauert inzwischen länger als 30 Minuten.", now)
             return False
+        coordinates = self.router.coordinates(listing.address)
         with db:
             record_listing_route(db, item.id, tier, minutes)
+            if coordinates is not None:
+                record_listing_location(db, item.id, coordinates, address=listing.address)
         return True
 
     def send_reviewed(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
@@ -311,6 +323,9 @@ class Scanner:
         for listing_id, retry in list(retry_after.items()):
             if retry <= now:
                 del retry_after[listing_id]
+        for listing_id, retry in list(self._location_retry_after.items()):
+            if retry <= now:
+                del self._location_retry_after[listing_id]
 
         counts: Counter = Counter()
         if self.klein_alerts:
@@ -363,36 +378,45 @@ class Scanner:
 
         metadata_backfill = db.execute("""
             SELECT f.url, p.photo_urls IS NULL, MAX(f.check_route) AND p.route_tier IS NULL,
-                   a.policy_version IS NOT ? AS availability_outdated
+                   a.policy_version IS NOT ? AS availability_outdated,
+                   (p.latitude IS NULL OR p.longitude IS NULL)
+                       AND (MAX(f.is_secondary) OR p.route_tier IN ('a*', 'a')) AS location_missing
             FROM (
                 SELECT id, url, fresh_at,
-                       NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id) AS check_route
+                       NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id) AS check_route,
+                       0 AS is_secondary
                 FROM drafts d WHERE done = 0 AND message IS NOT NULL
                 UNION ALL
-                SELECT id, url, fresh_at, 0 FROM munich_secondary_offers
+                SELECT id, url, fresh_at, 0, 1 FROM munich_secondary_offers
             ) f LEFT JOIN listing_profiles p ON p.id = f.id
                 LEFT JOIN listing_availability a ON a.id = f.id
             WHERE f.id NOT LIKE 'ka-%' AND f.fresh_at BETWEEN ? AND ?
-              AND (p.photo_urls IS NULL OR (f.check_route AND p.route_tier IS NULL) OR a.policy_version IS NOT ?)
-            GROUP BY f.id ORDER BY availability_outdated DESC, p.photo_urls IS NOT NULL, MAX(f.fresh_at) DESC
-        """, (AVAILABILITY_POLICY_VERSION, cutoff.timestamp(), now.timestamp(), AVAILABILITY_POLICY_VERSION))
+            GROUP BY f.id
+            HAVING p.photo_urls IS NULL OR (MAX(f.check_route) AND p.route_tier IS NULL)
+                OR availability_outdated OR (location_missing AND a.reason IS NULL)
+            ORDER BY availability_outdated DESC, p.photo_urls IS NOT NULL, MAX(f.fresh_at) DESC
+        """, (AVAILABILITY_POLICY_VERSION, cutoff.timestamp(), now.timestamp()))
         metadata_limit = self.limit if inventory_error is not None else (self.limit + 1) // 2
         metadata_refs = []
-        for url, photos, route, availability in metadata_backfill:
+        for url, photos, route, availability, location in metadata_backfill:
             ref = ListingRef.from_url(url)
             if ref is not None and ref.id not in retry_after:
-                metadata_refs.append((ref, photos, route, availability))
+                location = location and ref.id not in self._location_retry_after
+                if not (photos or route or availability or location):
+                    continue
+                metadata_refs.append((ref, photos, route, availability, location))
                 if len(metadata_refs) >= metadata_limit:
                     break
         metadata_backfill.close()
-        photo_ids = {ref.id for ref, photos, _, _ in metadata_refs if photos}
-        route_ids = {ref.id for ref, _, route, _ in metadata_refs if route}
-        availability_ids = {ref.id for ref, _, _, availability in metadata_refs if availability}
-        metadata_ids = {ref.id for ref, _, _, _ in metadata_refs}
+        photo_ids = {ref.id for ref, photos, _, _, _ in metadata_refs if photos}
+        route_ids = {ref.id for ref, _, route, _, _ in metadata_refs if route}
+        availability_ids = {ref.id for ref, _, _, availability, _ in metadata_refs if availability}
+        location_ids = {ref.id for ref, _, _, _, location in metadata_refs if location}
+        metadata_ids = {ref.id for ref, *_ in metadata_refs}
         original_ids = {ref.id for ref, _ in refs}
         refresh_ids = {ref.id for ref, _ in refresh_refs}
         queued_ids = original_ids.copy()
-        for ref in [ref for ref, _ in refresh_refs] + [ref for ref, _, _, _ in metadata_refs]:
+        for ref in [ref for ref, _ in refresh_refs] + [ref for ref, *_ in metadata_refs]:
             if ref.id not in queued_ids:
                 refs.append((ref, None))
                 queued_ids.add(ref.id)
@@ -428,6 +452,7 @@ class Scanner:
                     record_listing_availability(db, ref.id, reason)
                     remove_secondary_offer(db, ref.id)
                     reject_unavailable_approval(db, ref.id, reason, now)
+                    record_listing_location(db, ref.id, None)
                     if ref.id in photo_ids:
                         db.execute("""INSERT INTO listing_profiles(id, title, photo_urls) VALUES (?, '', '[]')
                                       ON CONFLICT(id) DO UPDATE SET photo_urls = excluded.photo_urls""", (ref.id,))
@@ -447,14 +472,24 @@ class Scanner:
                 counts[reason] += 1
                 retry_after[listing.id] = now + self.max_age
                 continue
+            if not listing.address:
+                with db:
+                    record_listing_location(db, ref.id, None)
             if ref.id in photo_ids and listing.photo_urls:
                 counts["Inserate mit Fotos ergänzt"] += 1
             if ref.id in metadata_ids and (skip_draft or (ref.id not in original_ids and not refresh_draft)):
+                needs_location = ref.id in location_ids
                 if ref.id in route_ids and listing.address:
                     tier, minutes = self.router.classify(listing.address, now)
                     if tier in PRIMARY_TIERS:
+                        needs_location = True
                         with db:
                             record_listing_route(db, listing.id, tier, minutes)
+                if needs_location:
+                    self._location_retry_after[listing.id] = now + timedelta(hours=1)
+                    if listing.address and (coordinates := self.router.coordinates(listing.address)):
+                        with db:
+                            record_listing_location(db, listing.id, coordinates, address=listing.address)
                 continue
 
             published_at = listing.published_at
@@ -505,6 +540,7 @@ class Scanner:
                 record_listing_profile(db, listing, fit="unclear", reason=f"Suchfilter: {reason}.")
                 with db:
                     remove_secondary_offer(db, ref.id)
+                    record_listing_location(db, ref.id, None)
                 counts[reason] += 1
                 retry_after[ref.id] = now + self.max_age
                 continue
@@ -524,9 +560,11 @@ class Scanner:
                 continue
             tier, minutes = self.router.classify(listing.address, now)
             fit, fit_reason = ROUTE_FIT.get(tier, ("unclear", "Die ÖPNV-Verbindung konnte nicht geprüft werden."))
+            mapped = tier in PRIMARY_TIERS or tier in {"b", "c"}
             record_listing_profile(db, listing, fit=fit, reason=fit_reason,
-                                   provider=self.provider if tier in PRIMARY_TIERS or tier in {"b", "c"} else "none",
-                                   route_tier=tier, route_minutes=minutes)
+                                   provider=self.provider if mapped else "none",
+                                   route_tier=tier, route_minutes=minutes,
+                                   coordinates=self.router.coordinates(listing.address) if mapped else None)
             if tier in {"b", "c"} and minutes is not None:
                 with db:
                     save_secondary_offer(db, listing.id, listing.url, listing.title, fresh_at, basis,

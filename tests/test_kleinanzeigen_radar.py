@@ -104,6 +104,8 @@ class KleinanzeigenRadarTest(unittest.TestCase):
         recent = NOW - timedelta(minutes=30)
         router, inbox, delivery = Mock(), Mock(), Mock(paused=False)
         router.classify.side_effect = lambda address, _: ("b", 38) if address == east.address else ("c", 45)
+        points = {east.address: (48.128, 11.603), central.address: (48.14, 11.558)}
+        router.coordinates.side_effect = points.get
         inbox.recent_items.side_effect = [[(east, initial), (central, recent)], [(east, recent)]]
         radar = KleinanzeigenRadar(router, "Hallo!", "none", delivery=delivery)
         cutoff = NOW - timedelta(days=1)
@@ -117,6 +119,8 @@ class KleinanzeigenRadarTest(unittest.TestCase):
             self.assertEqual(rows, [
                 (east.id, "b", "Ostbahnhof", 38, initial.timestamp()), (central.id, "c", "Hbf", 45, recent.timestamp()),
             ])
+            self.assertEqual(db.execute("SELECT latitude, longitude FROM listing_profiles ORDER BY id").fetchall(),
+                             [points[east.address], points[central.address]])
             self.assertEqual(db.execute("SELECT COUNT(*) FROM drafts").fetchone(), (0,))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_origins").fetchone(), (0,))
         delivery.deliver.assert_not_called()
@@ -136,6 +140,25 @@ class KleinanzeigenRadarTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT id, tier, minutes FROM munich_secondary_offers").fetchall(),
                              [(listing.id, "b", 43)])
             self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_review").fetchone(), (0,))
+        router.classify.assert_called_once()
+
+    def test_saved_exact_address_backfills_without_a_new_alert_or_route(self):
+        listing = klein_offer(1)
+        router, inbox = Mock(), Mock()
+        router.classify.return_value = ("a*", 17)
+        router.coordinates.return_value = None
+        inbox.recent_items.side_effect = [[(listing, NOW - timedelta(minutes=30))], []]
+        radar = KleinanzeigenRadar(router, "Hallo!", "none")
+        cutoff = NOW - timedelta(days=1)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            router.coordinates.return_value = (48.128, 11.603)
+
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+
+            self.assertEqual(db.execute("SELECT latitude, longitude, route_tier, route_minutes FROM listing_profiles")
+                             .fetchall(), [(48.128, 11.603, "a*", 17)])
+            self.assertEqual(db.execute("SELECT message FROM drafts").fetchall(), [("Hallo!",)])
         router.classify.assert_called_once()
 
     def test_move_in_and_short_tenancy_exclusions_are_decided_before_routes_and_drafts(self):
