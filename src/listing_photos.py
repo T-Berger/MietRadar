@@ -5,7 +5,8 @@ from collections.abc import Iterable
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 
-MAX_LISTING_PHOTOS = 5
+PHOTO_GALLERY_VERSION = 1
+LEGACY_PHOTO_GALLERY_LIMIT = 5
 _WG_HOST = "img.wg-gesucht.de"
 _KLEIN_HOST = "img.kleinanzeigen.de"
 _WG_PATH = re.compile(r"/media/up/(?:[\w-]+/)*[^/\\?#;]+\.(?:jpe?g|png|webp|gif|avif)", re.I)
@@ -54,6 +55,4 @@ def listing_photo_urls(values: Iterable[object], *, platform: str | None = None)
         if key not in seen:
             seen.add(key)
             results.append(urlunsplit(("https", host, quote(path, safe="/"), query, "")))
-            if len(results) == MAX_LISTING_PHOTOS:
-                break
     return tuple(results)
