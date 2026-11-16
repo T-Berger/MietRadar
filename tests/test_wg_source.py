@@ -155,6 +155,50 @@ class PublicPageTests(unittest.TestCase):
         listing = self.source.details(ref)
         self.assertEqual(listing.published_day, date(2026, 11, 14))
         self.assertIsNone(listing.published_at)
+        self.assertIsNone(listing.available_from)
+        self.assertIsNone(listing.available_until)
+
+    def test_availability_reads_only_dates_from_the_availability_panel(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/123.html")
+        self.stub_pages({ref.url: """
+            <h1 class="detailed-view-title">Zimmer</h1>
+            <meta itemprop="datePosted" content="2026-11-15">
+            <div>
+                <h2 class="section_panel_title mb10 m0">Verfügbarkeit</h2>
+                <div class="row">
+                    <div class="col-xs-6"><span class="section_panel_detail">frei ab:</span></div>
+                    <div class="col-xs-6"><span class="section_panel_value">01.01.2027</span></div>
+                </div>
+                <div class="row">
+                    <div class="col-xs-6"><span class="section_panel_detail">frei bis:</span></div>
+                    <div class="col-xs-6"><span class="section_panel_value">28.02.2027</span></div>
+                </div>
+                <div class="row">
+                    <div class="col-xs-6"><span class="section_panel_detail">Online:</span></div>
+                    <div class="col-xs-6"><b>45 Minuten</b></div>
+                </div>
+            </div>
+        """})
+        listing = self.source.details(ref)
+        self.assertEqual(listing.available_from, date(2027, 1, 1))
+        self.assertEqual(listing.available_until, date(2027, 2, 28))
+        self.assertEqual(listing.published_day, date(2026, 11, 15))
+
+    def test_availability_without_an_exact_calendar_date_remains_unknown(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/123.html")
+        self.stub_pages({ref.url: """
+            <h1 class="detailed-view-title">Zimmer</h1>
+            <div>
+                <h2 class="section_panel_title">Verfügbarkeit</h2>
+                <div><div><span class="section_panel_detail">frei ab:</span></div>
+                <div><span class="section_panel_value">nach Absprache</span></div></div>
+                <div><div><span class="section_panel_detail">frei bis:</span></div>
+                <div><span class="section_panel_value">31.02.2027</span></div></div>
+            </div>
+        """})
+        listing = self.source.details(ref)
+        self.assertIsNone(listing.available_from)
+        self.assertIsNone(listing.available_until)
 
     def test_explicit_publication_and_incomplete_address(self):
         ref = ListingRef.from_url(f"{BASE_URL}/123.html")

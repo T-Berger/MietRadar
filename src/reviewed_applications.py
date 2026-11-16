@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from rental_availability import install_listing_availability
 from wg_source import ListingRef
 
 
@@ -52,6 +53,7 @@ _PENDING = """
       AND r.attachment_digest IS (SELECT digest FROM application_attachment WHERE id = 1)
       AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
       AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id)
+      AND NOT EXISTS (SELECT 1 FROM listing_availability WHERE id = d.id AND reason IS NOT NULL)
 """
 _EXACT_APPROVAL = """
     WHERE id = ? AND state = 'queued' AND message_hash = ? AND updated_at = ? AND attachment_digest IS ?
@@ -60,6 +62,7 @@ _EXACT_APPROVAL = """
 
 
 def install_application_reviews(db: sqlite3.Connection) -> None:
+    install_listing_availability(db)
     db.execute("""
         CREATE TABLE IF NOT EXISTS application_reviews (
             id TEXT PRIMARY KEY REFERENCES drafts(id),
@@ -186,6 +189,7 @@ def _current_draft(
         WHERE d.id = ? AND d.done = 0 AND d.message IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
           AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id)
+          AND NOT EXISTS (SELECT 1 FROM listing_availability WHERE id = d.id AND reason IS NOT NULL)
     """, (listing_id,)).fetchone()
     if row is None or not _wg_listing(listing_id, row[0]):
         raise ApplicationReviewError("Der Entwurf ist nicht mehr für diese Aktion verfügbar.")
@@ -294,3 +298,11 @@ def fail_application_review(db: sqlite3.Connection, row: ReviewedApplication, re
     with db:
         db.execute("UPDATE application_reviews SET state = 'failed', reason = ?, updated_at = ?" + _EXACT_APPROVAL,
                    (reason, now.timestamp(), row.id, row.message_hash, row.updated_at, row.attachment_digest))
+
+
+def reject_unavailable_approval(db: sqlite3.Connection, listing_id: str, reason: str, now: datetime) -> None:
+    """Stop an unclaimed approval when the listing's availability fails the filter."""
+    db.execute("""
+        UPDATE application_reviews SET state = 'failed', reason = ?, updated_at = ?
+        WHERE id = ? AND state = 'queued' AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = ?)
+    """, (reason, now.timestamp(), listing_id, listing_id))

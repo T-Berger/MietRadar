@@ -13,7 +13,8 @@ from listing_profiles import ROUTE_FIT, record_listing_profile, record_listing_r
 from llm_personalizer import personalise_message
 from munich_delivery import DeliveryQueue, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer
-from munich_transit import PRIMARY_TIERS, TransitRouter
+from munich_transit import MUNICH_TIME, PRIMARY_TIERS, TransitRouter
+from rental_availability import availability_rejection, record_listing_availability
 from wg_alerts import AlertsInbox
 from wg_preferences import rejection_reason
 
@@ -46,6 +47,12 @@ _WANTED_AD = re.compile(
 _SECONDARY_STATIONS = {"b": "Ostbahnhof", "c": "Hbf"}
 
 
+def _remove_candidates(db: sqlite3.Connection, listing_id: str) -> None:
+    db.execute("DELETE FROM klein_review WHERE id = ?", (listing_id,))
+    db.execute("DELETE FROM klein_origins WHERE id = ?", (listing_id,))
+    remove_secondary_offer(db, listing_id)
+
+
 @dataclass
 class KleinanzeigenRadar:
     router: TransitRouter
@@ -68,11 +75,10 @@ class KleinanzeigenRadar:
             )""", ((now - min(now - cutoff, timedelta(days=1))).timestamp(),))
         counts: Counter = Counter()
         checked_routes = set()
+        today = now.astimezone(MUNICH_TIME).date()
         items = inbox.recent_items(cutoff, limit, extract_listings)
         for listing, received_at in items:
             record_listing_profile(db, listing)
-            if listing.id in retry_after:
-                continue
             draft = db.execute("""SELECT d.fresh_at, d.done, s.state, o.address, d.basis, d.message, r.signature,
                 p.route_tier
                 FROM drafts d LEFT JOIN delivery s ON s.id = d.id LEFT JOIN klein_origins o ON o.id = d.id
@@ -80,14 +86,11 @@ class KleinanzeigenRadar:
                 LEFT JOIN listing_profiles p ON p.id = d.id WHERE d.id = ?
             """, (listing.id,)).fetchone()
             refresh = bool(draft and self.render_signature and draft[5] and draft[6] != self.render_signature)
-            if draft and (draft[1] or draft[2] or
-                          (draft[7] is not None and not refresh and (not self.delivery or self.delivery.paused))):
-                continue
             stamp = listing.published_at or received_at
             basis = "veröffentlicht" if listing.published_at else "Suchalarm erhalten"
             if stamp.tzinfo is None or stamp > now:
                 continue
-            if draft and stamp.timestamp() < draft[0]:
+            if draft and not (draft[1] or draft[2]) and stamp.timestamp() < draft[0]:
                 with db:
                     db.execute("UPDATE drafts SET fresh_at = ?, basis = ? WHERE id = ?", (stamp.timestamp(), basis, listing.id))
             if draft and draft[0] < stamp.timestamp():
@@ -105,6 +108,21 @@ class KleinanzeigenRadar:
                     with db:
                         save_secondary_offer(db, listing.id, listing.url, listing.title, stamp, basis, tier, station, minutes)
                 continue
+            availability = availability_rejection(
+                listing.title, listing.description, today,
+                available_from=listing.available_from, available_until=listing.available_until,
+            )
+            with db:
+                record_listing_availability(db, listing.id, availability)
+                if availability:
+                    _remove_candidates(db, listing.id)
+            if availability:
+                counts[f"Kleinanzeigen: {availability}"] += 1
+                continue
+            if listing.id in retry_after or (draft and (
+                draft[1] or draft[2] or (draft[7] is not None and not refresh and (not self.delivery or self.delivery.paused))
+            )):
+                continue
             reason = "Wohnungsgesuch" if _WANTED_AD.search(listing.title) else rejection_reason(
                 listing.title, listing.description, wanted=listing.wanted or "", wg_type=listing.wg_type or "",
                 resident_ages=listing.resident_ages or "", age=self.age, age_gap=self.age_gap,
@@ -114,9 +132,7 @@ class KleinanzeigenRadar:
                 counts[f"Kleinanzeigen: {reason}"] += 1
                 retry_after[listing.id] = now + (now - cutoff)
                 with db:
-                    db.execute("DELETE FROM klein_review WHERE id = ?", (listing.id,))
-                    db.execute("DELETE FROM klein_origins WHERE id = ?", (listing.id,))
-                    remove_secondary_offer(db, listing.id)
+                    _remove_candidates(db, listing.id)
                 continue
 
             address = listing.address or (draft[3] if draft else None)
@@ -150,9 +166,7 @@ class KleinanzeigenRadar:
                 counts["Kleinanzeigen: ÖPNV außerhalb der Suchgrenzen"] += 1
                 retry_after[listing.id] = now + (now - cutoff)
                 with db:
-                    db.execute("DELETE FROM klein_review WHERE id = ?", (listing.id,))
-                    db.execute("DELETE FROM klein_origins WHERE id = ?", (listing.id,))
-                    remove_secondary_offer(db, listing.id)
+                    _remove_candidates(db, listing.id)
                 continue
 
             if draft or secondary:
@@ -181,7 +195,9 @@ class KleinanzeigenRadar:
         counts: Counter = Counter()
         send_window = min(now - cutoff, timedelta(hours=24))
         rows = db.execute("""SELECT d.id, d.url, d.message, d.fresh_at, o.address FROM drafts d
-            JOIN klein_origins o ON o.id = d.id LEFT JOIN delivery s ON s.id = d.id
+            JOIN klein_origins o ON o.id = d.id
+            JOIN listing_availability a ON a.id = d.id AND a.reason IS NULL
+            LEFT JOIN delivery s ON s.id = d.id
             WHERE d.done = 0 AND d.message IS NOT NULL AND d.fresh_at BETWEEN ? AND ? AND s.id IS NULL
               AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o2 WHERE o2.id = d.id)
             ORDER BY d.fresh_at DESC, d.id DESC
@@ -227,6 +243,14 @@ class KleinanzeigenRadar:
         if row is None:
             return False, "Kein aktueller Kleinanzeigen-Treffer mit dieser ID zur Ortsprüfung vorhanden."
         url, title, excerpt, is_wg, fresh_at, basis = row
+        prior = db.execute("SELECT reason FROM listing_availability WHERE id = ?", (listing_id,)).fetchone()
+        availability = (prior and prior[0]) or availability_rejection(title, excerpt, now.astimezone(MUNICH_TIME).date())
+        with db:
+            record_listing_availability(db, listing_id, availability)
+            if availability:
+                _remove_candidates(db, listing_id)
+        if availability:
+            return False, availability
         tier, minutes = self.router.classify(origin, now)
         fit, reason = ROUTE_FIT.get(tier, ("unclear", "Die ÖPNV-Verbindung konnte nicht geprüft werden."))
         with db:

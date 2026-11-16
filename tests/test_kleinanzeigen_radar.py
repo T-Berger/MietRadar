@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import replace
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -137,6 +137,41 @@ class KleinanzeigenRadarTest(unittest.TestCase):
                              [(listing.id, "b", 43)])
             self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_review").fetchone(), (0,))
         router.classify.assert_called_once()
+
+    def test_move_in_and_short_tenancy_exclusions_are_decided_before_routes_and_drafts(self):
+        late = klein_offer(1, available_from=date(NOW.year + 1, 1, 1))
+        short = klein_offer(2, available_from=date(NOW.year, 12, 1), available_until=date(NOW.year + 1, 2, 28))
+        four_months = klein_offer(3, available_from=date(NOW.year, 12, 1),
+                                  available_until=date(NOW.year + 1, 3, 31))
+        router, inbox = Mock(), Mock()
+        router.classify.return_value = ("a*", 20)
+        inbox.recent_items.return_value = [(listing, NOW - timedelta(minutes=30))
+                                            for listing in (late, short, four_months)]
+        radar = KleinanzeigenRadar(router, "Hallo!", "none")
+        cutoff = NOW - timedelta(days=1)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            self.assertEqual(db.execute("SELECT id FROM drafts").fetchall(), [(four_months.id,)])
+            self.assertEqual(db.execute("SELECT id FROM listing_availability WHERE reason IS NOT NULL ORDER BY id")
+                             .fetchall(), [(late.id,), (short.id,)])
+        router.classify.assert_called_once_with(four_months.address, NOW)
+
+    def test_manual_address_check_filters_legacy_excerpt_before_routing(self):
+        listing = klein_offer(1, address=None)
+        router = Mock()
+        radar = KleinanzeigenRadar(router, "Hallo!", "none")
+        cutoff = NOW - timedelta(days=1)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                db.execute("INSERT INTO klein_review VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+                           (listing.id, listing.url, listing.title, "Zwischenmiete für 3 Monate.",
+                            (NOW - timedelta(minutes=30)).timestamp(), "Suchalarm erhalten", "Adresse fehlt."))
+            saved, _ = radar.check_address(db, listing.id, "Musterstraße 12, 81667 München", NOW, cutoff)
+            self.assertFalse(saved)
+            self.assertEqual(db.execute("SELECT id FROM listing_availability WHERE reason IS NOT NULL").fetchall(),
+                             [(listing.id,)])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_review").fetchone(), (0,))
+        router.classify.assert_not_called()
 
 
 if __name__ == "__main__":

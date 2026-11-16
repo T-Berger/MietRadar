@@ -29,6 +29,7 @@ _TABLE_COLUMNS = {
     "wg_inventory_scan": {"id", "scanned_at"},
     "wg_observations": {"last_seen_at"},
     "munich_secondary_offers": {"id", "url", "title", "fresh_at", "basis", "tier", "station", "minutes"},
+    "listing_availability": {"id", "reason"},
     "listing_profiles": {"id", "title", "rent_eur", "rent_kind", "area_sqm", "summary", "fit", "fit_reason"},
 }
 _PLATFORM_HOSTS = {"www.wg-gesucht.de", "wg-gesucht.de", "www.kleinanzeigen.de", "kleinanzeigen.de"}
@@ -192,6 +193,15 @@ def _parse_day(raw: str | None) -> date | None:
         return None
 
 
+def _availability_filter(tables: set[str], listing_id: str) -> str:
+    if "listing_availability" not in tables:
+        return "1"
+    return f"""NOT EXISTS (
+        SELECT 1 FROM listing_availability availability
+        WHERE availability.id = {listing_id} AND availability.reason IS NOT NULL
+    )"""
+
+
 def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: float) -> tuple[Match, ...]:
     if "drafts" not in tables:
         return ()
@@ -209,6 +219,7 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     observations = _columns(db, "wg_observations") if "wg_observations" in tables else set()
     observation_join = "LEFT JOIN wg_observations o ON o.id = d.id" if {"id", "published_day"} <= observations else ""
     day = "o.published_day" if observation_join else "NULL"
+    available = _availability_filter(tables, "d.id")
     secondary_filter = ""
     parameters = [cutoff, until]
     if "munich_secondary_offers" in tables:
@@ -224,6 +235,7 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
         FROM drafts d {delivery_join} {check_join} {observation_join} {review_join}
         WHERE d.fresh_at BETWEEN ? AND ?
           AND ((d.done = 0 AND d.message IS NOT NULL) OR {state} IS NOT NULL)
+          AND ({available} OR {state} IN ('sent', 'already_contacted', 'unconfirmed'))
           {secondary_filter}
         ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
     """, parameters)
@@ -248,20 +260,24 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     return tuple(matches)
 
 
-def _address_checks(db: sqlite3.Connection, cutoff: float, until: float) -> tuple[AddressCheck, ...]:
-    rows = db.execute("""
-        SELECT id, url, title, fresh_at, basis, reason FROM klein_review
-        WHERE fresh_at BETWEEN ? AND ? ORDER BY fresh_at DESC, id DESC LIMIT ?
+def _address_checks(db: sqlite3.Connection, tables: set[str], cutoff: float, until: float) -> tuple[AddressCheck, ...]:
+    available = _availability_filter(tables, "r.id")
+    rows = db.execute(f"""
+        SELECT r.id, r.url, r.title, r.fresh_at, r.basis, r.reason FROM klein_review r
+        WHERE r.fresh_at BETWEEN ? AND ? AND {available} ORDER BY r.fresh_at DESC, r.id DESC LIMIT ?
     """, (cutoff, until, RESULT_LIMIT))
     return tuple(AddressCheck(item, _platform_url(url), title, stamp, basis, reason)
                  for item, url, title, stamp, basis, reason in rows)
 
 
-def _secondary_offers(db: sqlite3.Connection, cutoff: float, until: float) -> tuple[SecondaryListing, ...]:
-    rows = db.execute("""
-        SELECT id, url, title, fresh_at, basis, tier, station, minutes FROM munich_secondary_offers
-        WHERE fresh_at BETWEEN ? AND ? AND minutes BETWEEN 1 AND 45
-        ORDER BY fresh_at DESC, id DESC LIMIT ?
+def _secondary_offers(
+    db: sqlite3.Connection, tables: set[str], cutoff: float, until: float,
+) -> tuple[SecondaryListing, ...]:
+    available = _availability_filter(tables, "m.id")
+    rows = db.execute(f"""
+        SELECT m.id, m.url, m.title, m.fresh_at, m.basis, m.tier, m.station, m.minutes FROM munich_secondary_offers m
+        WHERE m.fresh_at BETWEEN ? AND ? AND m.minutes BETWEEN 1 AND 45 AND {available}
+        ORDER BY m.fresh_at DESC, m.id DESC LIMIT ?
     """, (cutoff, until, RESULT_LIMIT))
     return tuple(
         SecondaryListing(item, "Kleinanzeigen" if item.startswith("ka-") else "WG-Gesucht",
@@ -361,6 +377,7 @@ def _dated_listings(
     has_observations = {"id", "url", "published_at"} <= observation_columns
     has_observation_day = "published_day" in observation_columns
     matched = "EXISTS (SELECT 1 FROM drafts d WHERE d.id = o.id)" if has_drafts else "0"
+    observations_filter = _availability_filter(tables, "o.id")
 
     if basis == "first_seen":
         if not has_observations or "first_seen_at" not in observation_columns:
@@ -373,7 +390,7 @@ def _dated_listings(
             SELECT o.id, o.url, o.first_seen_at, {matched}
             FROM wg_observations o
             WHERE o.first_seen_at >= ? AND o.first_seen_at < ? AND o.first_seen_at <= ?
-            AND o.published_at IS NULL {unknown_day} {unknown_draft}
+            AND o.published_at IS NULL AND {observations_filter} {unknown_day} {unknown_draft}
             ORDER BY o.first_seen_at DESC, o.id DESC LIMIT ?
         """, timestamp_params)
         return tuple(DatedListing(item, "WG-Gesucht", _platform_url(url), datetime.fromtimestamp(stamp, BERLIN).date(), bool(is_match))
@@ -384,6 +401,7 @@ def _dated_listings(
         for item, url, stamp, is_match in db.execute(f"""
             SELECT o.id, o.url, o.published_at, {matched}
             FROM wg_observations o WHERE o.published_at >= ? AND o.published_at < ? AND o.published_at <= ?
+            AND {observations_filter}
             ORDER BY o.published_at DESC, o.id DESC LIMIT ?
         """, timestamp_params):
             day = datetime.fromtimestamp(stamp, BERLIN).date()
@@ -393,6 +411,7 @@ def _dated_listings(
             for item, url, day_string, is_match in db.execute(f"""
                 SELECT o.id, o.url, o.published_day, {matched}
                 FROM wg_observations o WHERE o.published_at IS NULL AND o.published_day BETWEEN ? AND ?
+                AND {observations_filter}
                 ORDER BY o.published_day DESC, o.id DESC LIMIT ?
             """, (start_day.isoformat(), end_day.isoformat(), RESULT_LIMIT)):
                 if day := _parse_day(day_string):
@@ -400,6 +419,7 @@ def _dated_listings(
 
     if has_drafts:
         fallback = ""
+        drafts_filter = _availability_filter(tables, "d.id")
         if has_observations:
             day_clause = " OR o.published_day IS NOT NULL" if has_observation_day else ""
             fallback = f"""AND NOT EXISTS (SELECT 1 FROM wg_observations o WHERE o.id = d.id
@@ -407,7 +427,7 @@ def _dated_listings(
         for item, url, stamp in db.execute(f"""
             SELECT d.id, d.url, d.fresh_at FROM drafts d
             WHERE lower(d.basis) = 'veröffentlicht' AND d.fresh_at >= ? AND d.fresh_at < ? AND d.fresh_at <= ?
-            {fallback} ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
+            AND {drafts_filter} {fallback} ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
         """, timestamp_params):
             day = datetime.fromtimestamp(stamp, BERLIN).date()
             platform = "Kleinanzeigen" if item.startswith("ka-") else "WG-Gesucht"
@@ -438,9 +458,9 @@ def load_dashboard(
             db.execute("BEGIN")
             tables = _available_tables(db)
             matches = _matches(db, tables, cutoff, until)
-            address_checks = _address_checks(db, cutoff, until) if "klein_review" in tables else ()
+            address_checks = _address_checks(db, tables, cutoff, until) if "klein_review" in tables else ()
             dated_listings = _dated_listings(db, tables, posting_window, now, date_basis) if posting_window else ()
-            secondary_offers = _secondary_offers(db, cutoff, until) if "munich_secondary_offers" in tables else ()
+            secondary_offers = _secondary_offers(db, tables, cutoff, until) if "munich_secondary_offers" in tables else ()
             visible_ids = {row.id for group in (matches, address_checks, dated_listings, secondary_offers) for row in group}
             return DashboardData(
                 "ready",

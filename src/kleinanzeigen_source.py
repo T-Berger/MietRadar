@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
+from datetime import date
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
@@ -35,6 +36,15 @@ _FACT_FIELD = re.compile(
     r"preis(?:\s+pro\s+(?:m[²2]|qm|quadratmeter))?|zimmergröße|zimmerfläche|wohnungsgröße|wohnfläche|größe|"
     r"(?:miet)?kaution|ablöse(?:vereinbarung)?|nebenkosten|betriebskosten|heizkosten|sonstige kosten)"
     r"\b\s*:?\s*(?P<value>.*)$", re.I,
+)
+_AVAILABILITY_FIELD = re.compile(
+    r"^(?:(?:verfügbar|frei|bezugsfrei)\s+(?P<direction>ab|bis)|(?P<term>mietbeginn|mietende))"
+    r"\b\s*:?\s*(?P<value>.*)$", re.I,
+)
+_DAY_MONTH_YEAR = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})\.?")
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_MONTH_YEAR = re.compile(
+    r"(?:januar|februar|märz|maerz|april|mai|juni|juli|august|september|oktober|november|dezember)\s+\d{4}", re.I,
 )
 
 
@@ -152,6 +162,44 @@ def _alert_facts(lines: list[str], *, is_wg: bool) -> tuple[float | None, RentKi
     return None, None, area
 
 
+def _exact_availability_date(text: str) -> date | None:
+    try:
+        if match := _DAY_MONTH_YEAR.fullmatch(text):
+            day, month, year = map(int, match.groups())
+            return date(year, month, day)
+        if _ISO_DATE.fullmatch(text):
+            return date.fromisoformat(text)
+    except ValueError:
+        return None
+    return None
+
+
+def _alert_availability(lines: list[str]) -> tuple[list[str], date | None, date | None]:
+    """Read card-local date labels and keep month-only values as text."""
+    dates: dict[str, set[date]] = {"ab": set(), "bis": set()}
+    description = []
+    index = 0
+    while index < len(lines):
+        text = lines[index]
+        index += 1
+        label = _AVAILABILITY_FIELD.fullmatch(text)
+        if label:
+            value = label["value"]
+            if not value and index < len(lines):
+                following = lines[index]
+                if _exact_availability_date(following) or _MONTH_YEAR.fullmatch(following):
+                    value = following
+                    text = f"{text} {following}"
+                    index += 1
+            if day := _exact_availability_date(value):
+                direction = (label["direction"] or ("ab" if label["term"].lower() == "mietbeginn" else "bis")).lower()
+                dates[direction].add(day)
+        description.append(text)
+    start = next(iter(dates["ab"])) if len(dates["ab"]) == 1 else None
+    end = next(iter(dates["bis"])) if len(dates["bis"]) == 1 else None
+    return description, start, end
+
+
 def _listing(ref: _Reference, title: str, lines: list[str], photo_urls: tuple[str, ...] = ()) -> Listing:
     address, address_lines = _line_address(lines)
     rent_eur, rent_kind, area_sqm = _alert_facts(lines, is_wg=ref.is_wg)
@@ -163,10 +211,12 @@ def _listing(ref: _Reference, title: str, lines: list[str], photo_urls: tuple[st
             area = area or area_line
         elif index not in address_lines and line.casefold() not in _GENERIC_LINK and not _URL.search(line):
             text.append(line)
+    text, available_from, available_until = _alert_availability(text)
     return Listing(
         id=ref.id, url=ref.url, title=title, description="\n".join(dict.fromkeys(text)),
         published_at=None, address=address, district=area, is_wg=ref.is_wg,
         rent_eur=rent_eur, rent_kind=rent_kind, area_sqm=area_sqm, photo_urls=photo_urls,
+        available_from=available_from, available_until=available_until,
     )
 
 
@@ -180,6 +230,8 @@ def _with_fallback_facts(primary: Listing, fallback: Listing) -> Listing:
         rent_kind=fallback.rent_kind if use_fallback_rent else primary.rent_kind,
         area_sqm=primary.area_sqm if primary.area_sqm is not None else fallback.area_sqm,
         photo_urls=listing_photo_urls((*primary.photo_urls, *fallback.photo_urls), platform="ka"),
+        available_from=primary.available_from or fallback.available_from,
+        available_until=primary.available_until or fallback.available_until,
     )
 
 

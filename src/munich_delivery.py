@@ -145,7 +145,9 @@ class DeliveryQueue:
                    WHERE d.id = ? AND d.done = 0 AND d.message IS NOT NULL AND s.id IS NULL
                      AND d.basis != 'zuerst gesehen'
                      AND NOT EXISTS (SELECT 1 FROM application_reviews r WHERE r.id = d.id)
-                     AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = d.id)""",
+                     AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = d.id)
+                     AND NOT EXISTS (SELECT 1 FROM listing_availability a WHERE a.id = d.id AND a.reason IS NOT NULL)
+                     AND (d.id NOT LIKE 'ka-%' OR EXISTS (SELECT 1 FROM listing_availability a WHERE a.id = d.id))""",
                 (listing_id,),
             ).fetchone()
             if info is None or not cutoff.timestamp() <= info[0] <= now.timestamp():
