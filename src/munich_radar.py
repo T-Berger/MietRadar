@@ -403,6 +403,7 @@ class Scanner:
                     wg_template, listing.description, listing_url=listing.url, listing_title=listing.title,
                     provider=self.provider, listing_type="wg" if listing.is_wg else "wohnung", first_message=True,
                     viewing_slots=viewing_slots, applicant_answers=self.applicant_answers,
+                    applicant_intro=self.applicant_intro,
                 )
                 with db:
                     saved = save_application_draft(
