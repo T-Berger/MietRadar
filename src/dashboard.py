@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from dashboard_auth import logout_button, require_authentication
 from dashboard_data import (
     BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, HiddenListing, ListingProfile,
-    MapListing, Match, ProviderFilter, Reply, SecondaryListing, filter_listing_providers, load_dashboard,
+    MapListing, Match, ProviderFilter, Reply, SecondaryListing, SentApplication, filter_listing_providers, load_dashboard,
     map_listings, set_listing_hidden, weekend_dates,
 )
 from listing_profiles import valid_listing_coordinates
@@ -644,6 +644,21 @@ def _hidden_offers(rows: tuple[HiddenListing, ...], db_path: Path) -> None:
             _offer_actions(db_path, row.id, row.title, row.url, view="hidden", hidden=True)
 
 
+def _sent_applications(rows: tuple[SentApplication, ...]) -> None:
+    st.subheader("Gesendete Bewerbungen", anchor=False)
+    if not rows:
+        st.info("MietRadar hat noch keinen bestätigten Versand erfasst.")
+        return
+    for row in rows:
+        with st.container(border=True):
+            title = row.title or _headline(row.url)
+            if title == "Mietangebot":
+                title = f"Mietangebot {row.id.removeprefix('ka-')}"
+            st.text(title)
+            st.caption(f"{row.platform} · Gesendet am {_date(row.sent_at)}")
+            _location_link(row.url)
+
+
 def _replies(rows: tuple[Reply, ...], *, wg_enabled: bool, wg_status: tuple[float, bool] | None) -> None:
     st.subheader("Antwortentwürfe", anchor=False)
     if wg_enabled:
@@ -738,8 +753,8 @@ def main() -> None:
         matches.metric("Neue Angebote", len(data.matches), border=True)
     drafts.metric("Bewerbungsentwürfe", sum(bool(row.message) for row in data.matches), border=True)
     pending.metric("Adressen zur Prüfung", len(data.address_checks), border=True)
-    offers, map_tab, secondary, address, replies, activity, hidden = st.tabs(
-        ["Angebote", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf", "Ausgeblendet"],
+    offers, applications, map_tab, secondary, address, replies, activity, hidden = st.tabs(
+        ["Angebote", "Bewerbungen", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf", "Ausgeblendet"],
         key="mietradar_tab", on_change="rerun",
     )
     with offers:
@@ -760,6 +775,9 @@ def main() -> None:
             _matches(data.matches, hours, data.wg_scan, data.listing_profiles, db_path,
                      review_available=data.application_reviews_available,
                      reviewed_send=reviewed_send, attachment=attachment, show_maps=bool(offers.open))
+    if applications.open:
+        with applications:
+            _sent_applications(data.sent_applications)
     if map_tab.open:
         with map_tab:
             _listing_map(map_listings(data, date_filtered=date_basis is not None), db_path)

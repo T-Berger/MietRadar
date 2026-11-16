@@ -142,6 +142,15 @@ class HiddenListing:
 
 
 @dataclass(frozen=True)
+class SentApplication:
+    id: str
+    platform: str
+    url: str | None
+    title: str | None
+    sent_at: float
+
+
+@dataclass(frozen=True)
 class Reply:
     id: str
     listing_id: str | None
@@ -180,6 +189,7 @@ class DashboardData:
     wg_inbox_status: tuple[float, bool] | None = None
     dated_secondary_offers: tuple[SecondaryListing, ...] = ()
     hidden_listings: tuple[HiddenListing, ...] = ()
+    sent_applications: tuple[SentApplication, ...] = ()
 
 
 def filter_listing_providers(data: DashboardData, provider: ProviderFilter) -> DashboardData:
@@ -332,6 +342,28 @@ def _not_hidden(tables: set[str], listing_id: str) -> str:
     if "dashboard_hidden_listings" not in tables:
         return "1"
     return f"NOT EXISTS (SELECT 1 FROM dashboard_hidden_listings hidden WHERE hidden.id = {listing_id})"
+
+
+def _sent_applications(db: sqlite3.Connection, tables: set[str], until: float) -> tuple[SentApplication, ...]:
+    if "delivery" not in tables or "recorded_at" not in _columns(db, "delivery"):
+        return ()
+    draft_join = "LEFT JOIN drafts d ON d.id = s.id" if "drafts" in tables else ""
+    draft_url = "d.url" if draft_join else "NULL"
+    observation_join = ""
+    if "wg_observations" in tables and {"id", "url"} <= _columns(db, "wg_observations"):
+        observation_join = "LEFT JOIN wg_observations o ON o.id = s.id"
+    observation_url = "o.url" if observation_join else "NULL"
+    profile_join = "LEFT JOIN listing_profiles p ON p.id = s.id" if "listing_profiles" in tables else ""
+    title = "NULLIF(TRIM(p.title), '')" if profile_join else "NULL"
+    rows = db.execute(f"""
+        SELECT s.id, s.recorded_at, {draft_url}, {observation_url}, {title}
+        FROM delivery s {draft_join} {observation_join} {profile_join}
+        WHERE s.state = 'sent' AND s.recorded_at BETWEEN 0 AND ?
+        ORDER BY s.recorded_at DESC, s.id DESC
+    """, (until,))
+    return tuple(SentApplication(listing_id, "Kleinanzeigen" if listing_id.startswith("ka-") else "WG-Gesucht",
+                                 _platform_url(url) or _platform_url(observed_url), name, sent_at)
+                 for listing_id, sent_at, url, observed_url, name in rows)
 
 
 def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: float) -> tuple[Match, ...]:
@@ -593,7 +625,7 @@ def load_dashboard(
     db_path: Path | str, *, now: datetime | None = None, max_age_hours: int = 24,
     posting_window: tuple[date, date] | None = None, date_basis: DateBasis = "published",
 ) -> DashboardData:
-    """Read current matches and up to 30 days of replies and activity."""
+    """Read current matches, confirmed applications, and recent replies and activity."""
     if not 1 <= max_age_hours <= 72:
         raise ValueError("max_age_hours must be between 1 and 72")
     now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
@@ -631,6 +663,7 @@ def load_dashboard(
                 wg_inbox_status=_wg_inbox_status(db, tables),
                 dated_secondary_offers=dated_secondary_offers,
                 hidden_listings=_hidden_listings(db, tables),
+                sent_applications=_sent_applications(db, tables, until),
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")

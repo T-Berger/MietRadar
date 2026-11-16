@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
-from dashboard_data import filter_listing_providers, load_dashboard, map_listings, weekend_dates
+from dashboard_data import filter_listing_providers, load_dashboard, map_listings, set_listing_hidden, weekend_dates
 from listing_profiles import record_listing_location, record_listing_profile, record_listing_route
 from munich_radar import _database
 from rental_availability import AVAILABILITY_POLICY_VERSION, record_listing_availability
@@ -70,6 +70,40 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.replies[0].url, "https://www.kleinanzeigen.de/m-nachrichten.html#test")
         self.assertIsNone(data.activity[0].url)
         self.assertEqual(self.path.read_bytes(), original)
+
+    def test_keeps_confirmed_applications_independent_of_offer_filters(self):
+        now = NOW.timestamp()
+        older = (NOW - timedelta(days=90)).timestamp()
+        wg_url = "https://www.wg-gesucht.de/12.html"
+        klein_url = "https://www.kleinanzeigen.de/s-anzeige/wohnung/55-203-650"
+        with closing(_database(self.path)) as db, db:
+            db.executemany("INSERT INTO drafts VALUES (?, ?, ?, 'Veröffentlicht', NULL, 1)", [
+                ("12", f"{wg_url}?ref=search", older), ("ka-55", klein_url, now),
+                ("13", "https://www.wg-gesucht.de/13.html", now),
+                ("14", "https://www.wg-gesucht.de/14.html", now),
+                ("15", "https://www.wg-gesucht.de/15.html", now),
+            ])
+            db.executemany("INSERT INTO delivery VALUES (?, ?, ?, ?)", [
+                ("12", "sent", older, older), ("ka-55", "sent", now, now),
+                ("13", "already_contacted", now, None), ("14", "unconfirmed", now, now),
+                ("16", "sent", older - 100, older - 100),
+            ])
+            db.execute("INSERT INTO application_reviews VALUES ('15', 'hash', 'queued', NULL, ?, NULL)", (now,))
+            db.execute("INSERT INTO listing_profiles(id, title) VALUES ('12', 'Zimmer am Park')")
+            db.execute("INSERT INTO listing_availability(id, reason) VALUES ('12', 'Anzeige nicht mehr verfügbar')")
+            db.execute("""INSERT INTO wg_observations(id, url, first_seen_at, last_seen_at)
+                          VALUES ('16', 'https://www.wg-gesucht.de/16.html', ?, ?)""", (older, older))
+            db.execute("""INSERT INTO klein_reply_drafts VALUES ('reply', 'ka-56', ?, 'Danke', '', ?, 1, 'sent', ?)""",
+                       ("https://www.kleinanzeigen.de/m-nachrichten.html#conversation", now, now))
+        set_listing_hidden(self.path, "12", True, title="Zimmer am Park", url=wg_url)
+
+        data = load_dashboard(self.path, now=NOW, posting_window=(NOW.date(), NOW.date()))
+        data = filter_listing_providers(data, "commercial")
+        self.assertEqual([(row.id, row.platform, row.url, row.title, row.sent_at) for row in data.sent_applications], [
+            ("ka-55", "Kleinanzeigen", klein_url, None, now),
+            ("12", "WG-Gesucht", wg_url, "Zimmer am Park", older),
+            ("16", "WG-Gesucht", "https://www.wg-gesucht.de/16.html", None, older - 100),
+        ])
 
     def test_shows_exact_queued_text_verdict_separately_from_browser_delay(self):
         now = NOW.timestamp()
