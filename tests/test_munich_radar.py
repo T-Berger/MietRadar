@@ -7,6 +7,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
+from llm_personalizer import application_render_signature
 from munich_radar import Scanner, _database
 from wg_alerts import AlertsInbox, ListingAlert, extract_refs
 from wg_preferences import rejection_reason
@@ -212,7 +213,8 @@ class ScannerTest(unittest.TestCase):
             self.assertIn("Ich bin Sam", db.execute("SELECT message FROM drafts").fetchone()[0])
             self.assertEqual(db.execute("SELECT rent_eur, rent_kind, area_sqm, fit FROM listing_profiles").fetchone(),
                              (720, "warm", 18, "strong"))
-            self.assertEqual(db.execute("SELECT signature FROM draft_render_signatures").fetchone(), ("new-template",))
+            signature = application_render_signature(template, "none", first_message=True)
+            self.assertEqual(db.execute("SELECT signature FROM draft_render_signatures").fetchone(), (signature,))
             self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Entwürfe aktualisiert"], 0)
         source.details.assert_called_once()
         delivery.deliver.assert_not_called()

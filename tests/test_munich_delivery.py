@@ -1,14 +1,17 @@
 import tempfile
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from munich_delivery import DeliveryOutcome, DeliveryQueue
+from munich_delivery import DeliveryOutcome, DeliveryQueue, FirstMessageReview
 from munich_radar import Scanner, _database
 from munich_tiers import save_secondary_offer
+from outgoing_judge import OutgoingJudgment
 from test_munich_radar import NOW, offer, ref
+from wg_first_message import viewing_slot_labels
 
 
 class RecordingSender:
@@ -99,6 +102,7 @@ class DeliveryTest(unittest.TestCase):
 
     def test_scanner_sends_newest_then_leaves_other_drafts_and_respects_manual_done(self):
         older, newest, done, stale, nonmatch = offer(1, 5), offer(2, 1), offer(3, 0), offer(4, 25), offer(5, 2)
+        newest = replace(newest, title="WG-Zimmer mit Balkon", is_wg=True)
         self.draft(done, done=1)
         by_id = {item.id: item for item in (older, newest, done, stale, nonmatch)}
         source, router = Mock(), Mock()
@@ -108,12 +112,47 @@ class DeliveryTest(unittest.TestCase):
         router.classify.side_effect = lambda address, now: ("outside", None) if address == nonmatch.address else ("a", None)
         sender = RecordingSender()
         queue = DeliveryQueue(sender, limit=1, clock=lambda: NOW)
-        scanner = Scanner(source, router, "Hi, ich bin 28.", "none", timedelta(hours=24), 12, delivery=queue)
-        counts = scanner.scan(self.db, NOW, {})
+        template = "Hi zusammen,\n\n{LLM_TEXT}\n\nKann ich zur Besichtigung vorbeikommen?\n\nLiebe Grüße\nSam"
+        intro = "Ich bin Sam, 28, und arbeite als Architekt."
+        availability = (NOW + timedelta(hours=5), NOW + timedelta(days=1, hours=6))
+        scanner = Scanner(source, router, template, "none", timedelta(hours=24), 12, delivery=queue,
+                          applicant_intro=intro, viewing_availability=availability)
+        with patch("munich_delivery.judge_outgoing", return_value=OutgoingJudgment(True, "ok")) as judge:
+            counts = scanner.scan(self.db, NOW, {})
         self.assertEqual(counts["Bewerbung gesendet"], 1)
-        self.assertEqual(sender.attempts, [(newest.url, "Hi, ich bin 28.")])
+        self.assertEqual(len(sender.attempts), 1)
+        url, message = sender.attempts[0]
+        self.assertEqual(url, newest.url)
+        self.assertTrue(message.startswith(f"Hi zusammen,\n\n{intro}"))
+        self.assertIn("Balkon", message)
+        for slot in viewing_slot_labels(availability, NOW):
+            self.assertIn(slot, message)
+        newest_checks = [call for call in judge.call_args_list if call.kwargs.get("listing_title") == newest.title]
+        self.assertEqual(len(newest_checks), 2)
+        self.assertTrue(all(call.args == (message,) and call.kwargs["first_message"] for call in newest_checks))
         self.assertEqual(self.db.execute("SELECT state FROM delivery").fetchone(), ("sent",))
         self.assertEqual(self.db.execute("SELECT id FROM drafts WHERE done = 0").fetchall(), [(older.id,)])
+
+    def test_viewing_slot_that_expires_after_judging_prevents_submit(self):
+        listing = offer(1, 1)
+        self.draft(listing)
+        checked_at = NOW
+        sender = Mock()
+
+        def send(url, message, before_submit):
+            nonlocal checked_at
+            checked_at += timedelta(minutes=2)
+            self.assertFalse(before_submit())
+            return DeliveryOutcome.SKIPPED
+
+        sender.send.side_effect = send
+        queue = DeliveryQueue(sender, clock=lambda: checked_at)
+        review = FirstMessageReview(listing.title, "", (NOW + timedelta(minutes=1),), {})
+        with patch("munich_delivery.judge_outgoing", return_value=OutgoingJudgment(True, "ok")):
+            queue.deliver(self.db, listing.id, listing.url, "Hi!", listing.published_at,
+                          timedelta(hours=24), first_message=review)
+        sender.send.assert_called_once()
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM delivery").fetchone(), (0,))
 
 
 if __name__ == "__main__":

@@ -67,3 +67,62 @@ class OutgoingJudgeTest(unittest.TestCase):
             result = judge_outgoing(text, provider="mistral")
             self.assertFalse(result.approved)
             self.assertIn("Mistral", result.reason)
+
+    def test_first_message_checks_opening_and_real_slots_before_model(self):
+        intro = "Ich bin Alex, 29, und arbeite als Webentwickler."
+        slots = ("Mittwoch, 18.11., um 18:00 Uhr", "Donnerstag, 19.11., um 19:30 Uhr")
+        draft = (
+            f"Hi zusammen,\n\n{intro}\n\nIch würde gern mal mit euch kochen.\n\n"
+            f"Ich könnte am {slots[0]} oder am {slots[1]} zur Besichtigung kommen."
+        )
+        with patch("outgoing_judge._generate_via_mistral") as complete:
+            self.assertTrue(judge_outgoing(draft, first_message=True, applicant_intro=intro, viewing_slots=slots).approved)
+            for bad_draft, reason in (
+                (draft.replace(intro, f"Danke fürs Inserat.\n\n{intro}"), "Vorstellung"),
+                (draft.replace("19:30", "19:00"), "Besichtigungstermine"),
+                (draft.replace(f" oder am {slots[1]}", ""), "Besichtigungstermine"),
+                (draft.replace(" zur Besichtigung", " oder Samstag um 18 Uhr zur Besichtigung"), "Besichtigungstermine"),
+            ):
+                with self.subTest(reason=reason):
+                    verdict = judge_outgoing(
+                        bad_draft, first_message=True, applicant_intro=intro, viewing_slots=slots, provider="mistral",
+                    )
+                    self.assertFalse(verdict.approved)
+                    self.assertIn(reason, verdict.reason)
+            complete.assert_not_called()
+
+    def test_first_message_distinguishes_an_open_viewing_request_from_a_proposed_time(self):
+        head = "Hi, ich bin Alex, 29, und arbeite als Webentwickler.\n\n"
+        open_draft = head + (
+            "Zum 1. Dezember könnte ich einziehen und würde mir das Zimmer gern anschauen. "
+            "Wann passt euch eine Besichtigung?"
+        )
+        self.assertTrue(judge_outgoing(open_draft, first_message=True).approved)
+        result = judge_outgoing(head + "Kann ich Samstag um 18 Uhr zur Besichtigung kommen?", first_message=True)
+        self.assertFalse(result.approved)
+        self.assertIn("Besichtigungstermine", result.reason)
+
+    def test_first_message_model_gets_listing_and_only_confirmed_answers_used(self):
+        draft = (
+            "Hi, ich bin Alex, 29, und arbeite als Webentwickler.\n\n"
+            "Mit euch zu kochen klingt gut. Ich rauche nicht.\n\n"
+            "Wann passt euch eine Besichtigung?"
+        )
+        with patch("outgoing_judge._generate_via_mistral", return_value='{"approved":false,"reason":"rueckfragen"}') as complete:
+            verdict = judge_outgoing(
+                draft, provider="mistral", first_message=True,
+                listing_title="WG am Park", context="Wir kochen gemeinsam. Rauchst du? Hast du Haustiere?",
+                applicant_answers={"rauchen": "Ich rauche nicht.", "haustiere": "Ich habe einen Hund."},
+            )
+        self.assertFalse(verdict.approved)
+        self.assertIn("Eine Frage aus der Anzeige", verdict.reason)
+        system, raw_payload, _ = complete.call_args.args
+        payload = json.loads(raw_payload)
+        self.assertIn("anzeigendetail", system)
+        self.assertEqual(payload["nachricht"], draft)
+        self.assertEqual(payload["titel"], "WG am Park")
+        self.assertIn("Hast du Haustiere?", payload["kontext"])
+        self.assertEqual(payload["besichtigungszeiten"], [])
+        self.assertEqual(payload["antwortthemen"], ["haustiere", "rauchen"])
+        self.assertEqual(payload["verwendete_antworten"], {"rauchen": "Ich rauche nicht."})
+        self.assertNotIn("Hund", raw_payload)

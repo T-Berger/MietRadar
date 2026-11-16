@@ -96,3 +96,74 @@ class MistralProviderTest(unittest.TestCase):
         self.assertEqual(llm_personalizer.personalise_message(
             prepared, "", provider="mistral", listing_type="wohnung", listing_title="Wohnung mit Garten gesucht",
         ), f"Hallo,\n\n{intro}\n\nKann ich vorbeikommen?")
+
+    @patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=True)
+    @patch.object(llm_personalizer, "urlopen")
+    def test_first_message_uses_only_grounded_details_and_private_local_answers(self, open_url):
+        ad = "Wir kochen freitags zusammen. Wann kannst du einziehen?"
+        paragraph = "Euer gemeinsames Kochen am Freitag klingt gut."
+        open_url.return_value = response(json.dumps({
+            "detail": {"text": paragraph, "evidence": "Wir kochen freitags zusammen."},
+            "questions": {"einzug": "Wann kannst du einziehen?", "haustiere": "Bringst du Haustiere mit?"},
+        }))
+        intro = "Ich bin Lea, 31, und arbeite im Theater."
+        template = llm_personalizer.with_applicant_intro(
+            f"Hi {{name}},\n\n{{LLM_TEXT}}\n\n{intro}\n\nWann kann ich das Zimmer anschauen?\n\nLiebe Grüße\nLea",
+            intro, first_message=True,
+        )
+        slots = ("Mittwoch, 18.11., um 18:00 Uhr", "Donnerstag, 19.11., um 19:00 Uhr")
+        answer = "Ich kann ab 1. Dezember einziehen."
+
+        message = llm_personalizer.personalise_message(
+            template, ad, provider="mistral", first_message=True, viewing_slots=slots,
+            applicant_answers={"einzug": answer, "haustiere": "Ich habe eine Katze."},
+        )
+
+        self.assertTrue(message.startswith(f"Hi zusammen,\n\n{intro}\n\n{paragraph}\n\n{answer}"))
+        self.assertEqual(message.count(intro), 1)
+        self.assertNotIn("Katze", message)
+        self.assertNotIn("anschauen?", message)
+        self.assertIn(f"am {slots[0]} oder am {slots[1]}", message)
+        payload = open_url.call_args.args[0].data.decode()
+        for private in (intro, answer, *slots):
+            self.assertNotIn(private, payload)
+
+    def test_first_message_keeps_move_in_fact_and_uses_only_supplied_viewing_slots(self):
+        template = (
+            "Hi zusammen,\n\nich bin Lea und arbeite im Theater.\n\n{LLM_TEXT}\n\n"
+            "Ich könnte zum 1. Dezember einziehen und würde mir das Zimmer gerne anschauen.\n\nLiebe Grüße\nLea"
+        )
+        first = "Mittwoch, 18.11., um 18:00 Uhr"
+        message = llm_personalizer.personalise_message(
+            template, "Wann kannst du einziehen?", provider="none", listing_title="Zimmer mit Balkon",
+            first_message=True, viewing_slots=(first,),
+        )
+        self.assertIn("Das Zimmer mit Balkon interessiert mich.", message)
+        self.assertIn("zum 1. Dezember einziehen", message)
+        self.assertIn(f"am {first} zur Besichtigung", message)
+        self.assertNotIn(" oder ", message)
+
+    def test_first_message_replaces_outdated_template_slots_with_an_open_question(self):
+        template = (
+            "Hi zusammen,\n\nich bin Lea und arbeite im Theater.\n\n"
+            "Ich könnte zum 1. Dezember einziehen und würde mir am 17.11. um 18 Uhr das Zimmer anschauen. "
+            "Passt euch das?\n\nLiebe Grüße\nLea"
+        )
+        message = llm_personalizer.personalise_message(template, "", provider="none", first_message=True)
+
+        self.assertIn("Ich könnte zum 1. Dezember einziehen. Wann passt euch eine Besichtigung?", message)
+        self.assertNotIn("17.11.", message)
+        self.assertNotIn("18 Uhr", message)
+
+    @patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=True)
+    @patch.object(llm_personalizer, "urlopen")
+    def test_first_message_skips_model_detail_without_evidence_and_asks_for_times(self, open_url):
+        open_url.return_value = response(json.dumps({
+            "detail": {"text": "Euer Schrebergarten gefällt mir.", "evidence": "Wir haben einen Schrebergarten."},
+            "questions": {},
+        }))
+        message = llm_personalizer.personalise_message(
+            "Hi,\n\nich bin Lea.\n\n{LLM_TEXT}\n\nViele Grüße\nLea",
+            "Die Wohnung ist ab Dezember frei.", provider="mistral", first_message=True, listing_type="wohnung",
+        )
+        self.assertEqual(message, "Hi,\n\nich bin Lea.\n\nWann wäre eine Besichtigung möglich?\n\nViele Grüße\nLea")

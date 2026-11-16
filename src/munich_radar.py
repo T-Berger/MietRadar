@@ -9,7 +9,7 @@ import sqlite3
 import time
 from collections import Counter
 from contextlib import ExitStack, closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -21,10 +21,11 @@ from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
 from listing_profiles import ROUTE_FIT, install_listing_profiles, record_listing_profile
 from llm_personalizer import application_render_signature, personalise_message, with_applicant_intro
-from munich_delivery import DeliveryQueue, install_schema, save_application_draft
+from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
 from munich_transit import TransitRouter
 from wg_alerts import AlertsError, AlertsInbox
+from wg_first_message import applicant_answers, viewing_availability, viewing_slot_labels
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
 from wg_preferences import rejection_reason
 from wg_source import DEFAULT_SEARCH_URLS, ListingRef, WGListingGone, WGSource, WGSourceError
@@ -93,6 +94,8 @@ class Scanner:
     outgoing_provider: str = "none"
     render_signature: str | None = None
     applicant_intro: str = ""
+    viewing_availability: tuple[datetime, ...] = ()
+    applicant_answers: dict[str, str] = field(default_factory=dict)
 
     def add_intro_to_current_drafts(self, db: sqlite3.Connection, now: datetime) -> int:
         """Repair introductions when the listing source cannot be rechecked."""
@@ -116,6 +119,12 @@ class Scanner:
 
     def scan(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         cutoff = now - self.max_age
+        viewing_slots = viewing_slot_labels(self.viewing_availability, now)
+        wg_template = with_applicant_intro(self.template, self.applicant_intro, first_message=True)
+        wg_signature = self.render_signature and application_render_signature(
+            wg_template, self.provider, first_message=True, viewing_slots=viewing_slots,
+            applicant_answers=self.applicant_answers,
+        )
         first_eligible_day = cutoff.astimezone(BERLIN).date()
         current_day = now.astimezone(BERLIN).date()
         with db:
@@ -155,14 +164,16 @@ class Scanner:
             refs = [(ref, None) for ref in candidates]
 
         refresh_refs = []
-        if self.render_signature:
+        if wg_signature:
+            # Keep part of the detail budget available for newly seen offers when slots change.
+            refresh_limit = max(1, self.limit // 3)
             older_drafts = db.execute("""
                 SELECT d.url FROM drafts d LEFT JOIN draft_render_signatures s ON s.id = d.id
                 WHERE d.id NOT LIKE 'ka-%' AND d.done = 0 AND d.message IS NOT NULL
                   AND d.fresh_at BETWEEN ? AND ? AND COALESCE(s.signature, '') != ?
                   AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
                 ORDER BY d.fresh_at DESC LIMIT ?
-            """, (cutoff.timestamp(), now.timestamp(), self.render_signature, self.limit)).fetchall()
+            """, (cutoff.timestamp(), now.timestamp(), wg_signature, refresh_limit)).fetchall()
             refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
 
         photo_backfill = db.execute("""
@@ -195,7 +206,7 @@ class Scanner:
                    LEFT JOIN delivery s ON s.id = d.id LEFT JOIN draft_render_signatures r ON r.id = d.id
                    WHERE d.id = ?""", (ref.id,),
             ).fetchone()
-            refresh_draft = bool(draft and self.render_signature and draft[5] != self.render_signature)
+            refresh_draft = bool(draft and wg_signature and draft[5] != wg_signature)
             skip_draft = bool(draft and (not draft[1] or draft[2] or draft[3] or
                                        (not refresh_draft and (not self.delivery or self.delivery.paused))))
             if skip_draft and ref.id not in photo_ids:
@@ -303,20 +314,24 @@ class Scanner:
                 counts["ÖPNV über 45 Minuten" if tier == "outside" else "ÖPNV nicht prüfbar"] += 1
                 retry_after[listing.id] = now + (self.max_age if tier == "outside" else timedelta(minutes=10))
                 continue
+            first_message = FirstMessageReview(listing.title, self.applicant_intro, self.viewing_availability,
+                                               self.applicant_answers)
             if draft and not refresh_draft:
                 with db:
                     remove_secondary_offer(db, listing.id)
                 message = draft[1]
             else:
                 message = personalise_message(
-                    self.template, listing.description, listing_url=listing.url, listing_title=listing.title,
-                    provider=self.provider, listing_type="wg" if listing.is_wg else "wohnung",
+                    wg_template, listing.description, listing_url=listing.url, listing_title=listing.title,
+                    provider=self.provider, listing_type="wg" if listing.is_wg else "wohnung", first_message=True,
+                    viewing_slots=viewing_slots, applicant_answers=self.applicant_answers,
                 )
                 with db:
                     saved = save_application_draft(
                         db, listing.id, listing.url, fresh_at.timestamp(), basis, message,
                         context=listing.description, provider=self.outgoing_provider, now=now,
-                        signature=self.render_signature, previous_message=draft[1] if draft else None,
+                        signature=wg_signature, previous_message=draft[1] if draft else None,
+                        first_message=first_message,
                     )
                     remove_secondary_offer(db, listing.id)
                 if not saved:
@@ -326,7 +341,7 @@ class Scanner:
                     continue  # A refreshed personal draft first appears for review.
             if self.delivery and may_deliver:
                 result = self.delivery.deliver(db, listing.id, listing.url, message, fresh_at, self.max_age,
-                                               context=listing.description)
+                                               context=listing.description, first_message=first_message)
                 if result:
                     counts[result] += 1
         return counts
@@ -406,6 +421,8 @@ def _scanner(max_age: timedelta) -> Scanner:
         klein_alerts=klein_alerts, outgoing_provider=_outgoing_provider(),
         render_signature=application_render_signature(template, provider),
         applicant_intro=os.getenv("MUNICH_APPLICANT_INTRO", "").strip(),
+        viewing_availability=viewing_availability(os.getenv("MUNICH_VIEWING_SLOTS", "")),
+        applicant_answers=applicant_answers(os.getenv("MUNICH_APPLICANT_ANSWERS", "")),
     )
 
 

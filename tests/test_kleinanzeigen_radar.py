@@ -27,9 +27,9 @@ class KleinanzeigenRadarTest(unittest.TestCase):
         source.details.return_value = wg
         router.classify.return_value = ("a", None)
         inbox.recent_items.return_value = [(klein, NOW - timedelta(minutes=20))]
-        scanner = Scanner(source, router, "Hallo, ich würde mir das Zimmer gerne ansehen!", "none",
+        scanner = Scanner(source, router, "Hi zusammen,\n\nIch bin Alex. Wann passt euch eine Besichtigung?", "none",
                           timedelta(days=1), 10, klein_alerts=inbox, outgoing_provider="mistral")
-        verdicts = ['{"approved": true, "reason": "ok"}', '{"approved": false, "reason": "bezug"}']
+        verdicts = ['{"approved": true, "reason": "ok"}', '{"approved": false, "reason": "anzeigendetail"}']
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "radar.sqlite3"
             with closing(_database(path)) as db, patch("outgoing_judge._generate_via_mistral", side_effect=verdicts) as judge:
