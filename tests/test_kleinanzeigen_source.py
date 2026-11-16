@@ -80,3 +80,25 @@ Wohnfläche: 75 m²
         for invalid in ("Haidhausen", "81667 München", "Musterstraße, 81667 München",
                         "Musterstraße 1, 86150 Augsburg", "Musterstraße 1, 85521 München"):
             self.assertIsNone(normalize_munich_address(invalid), invalid)
+
+    def test_photos_stay_with_their_own_email_card(self):
+        email = EmailMessage()
+        email["From"] = SENDER
+        cdn = "https://img.kleinanzeigen.de/api/v1/prod-ads/images/"
+        room = f"{cdn}aa/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        flat = f"{cdn}bb/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        unrelated = f"{cdn}cc/cccccccc-cccc-cccc-cccc-cccccccccccc"
+        email.set_content(f"{ROOM}\n{FLAT}")
+        email.add_alternative(f"""<body><img src="{unrelated}?rule=$_59.AUTO">
+          <article>
+            <a href="{ROOM}"><img src="{room}?rule=$_59.AUTO&amp;tracking=private#preview"></a>
+            <a href="{ROOM}">WG-Zimmer am Isartor</a>
+            <img src="{unrelated}" width="1">
+            <img src="https://img.kleinanzeigen.de.evil.test/api/v1/prod-ads/images/aa/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">
+          </article>
+          <table><tr><td><a href="{FLAT}">Wohnung in Haidhausen</a>
+            <img data-src="{flat}?rule=$_2.JPG">
+          </td></tr></table></body>""", subtype="html")
+        room_ad, flat_ad = extract_listings(email.as_bytes(), SENDER)
+        self.assertEqual(room_ad.photo_urls, (f"{room}?rule=%24_59.AUTO",))
+        self.assertEqual(flat_ad.photo_urls, (f"{flat}?rule=%24_2.JPG",))

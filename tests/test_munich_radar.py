@@ -237,6 +237,26 @@ class ScannerTest(unittest.TestCase):
             self.assertTrue(all(messages[key] == plain for key in ("done", "expired", "sending")))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM draft_render_signatures").fetchone(), (0,))
 
+    def test_photo_backfill_keeps_existing_draft_and_does_not_recheck_its_route(self):
+        photo = "https://img.wg-gesucht.de/media/up/2026/46/room.sized.JPEG"
+        listing = replace(offer(1, 1), photo_urls=(photo,))
+        source, router = Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.return_value = []
+        source.details.return_value = listing
+        scanner = Scanner(source, router, "Hi!", "none", timedelta(hours=24), 12)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Vorhandener Entwurf', 0)",
+                           (listing.id, listing.url, listing.published_at.timestamp()))
+                db.execute("INSERT INTO listing_profiles(id, title) VALUES (?, ?)", (listing.id, listing.title))
+            self.assertEqual(scanner.scan(db, NOW, {})["Inserate mit Fotos ergänzt"], 1)
+            self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Inserate mit Fotos ergänzt"], 0)
+            self.assertEqual(db.execute("SELECT photo_urls FROM listing_profiles").fetchone(), (f'["{photo}"]',))
+            self.assertEqual(db.execute("SELECT message FROM drafts").fetchone(), ("Vorhandener Entwurf",))
+        source.details.assert_called_once_with(ref(listing))
+        router.classify.assert_not_called()
+
 
 class AlertParsingTest(unittest.TestCase):
     def test_extracts_only_canonical_listing_links_from_configured_sender(self):

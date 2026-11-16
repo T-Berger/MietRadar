@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
+from listing_photos import listing_photo_urls
+
 
 BASE_URL = "https://www.wg-gesucht.de"
 DEFAULT_SEARCH_URLS = (
@@ -102,6 +104,7 @@ class Listing:
     rent_eur: float | None = None
     rent_kind: RentKind | None = None
     area_sqm: float | None = None
+    photo_urls: tuple[str, ...] = ()
 
 
 def _search_url(url):
@@ -218,6 +221,28 @@ def _structured_ad(soup, listing_id):
         ref = ListingRef.from_url(url) if isinstance(url, str) else None
         if ref and ref.id == listing_id:
             yield item
+
+
+def _detail_photos(soup, listing_id: str) -> tuple[str, ...]:
+    urls = []
+    for image in soup.select("#WG-Pictures #gallery_slides .sp-slide img.sp-image"):
+        variants = listing_photo_urls((image.get(key) for key in ("data-medium", "data-src", "data-large", "src")),
+                                      platform="wg")
+        if variants:
+            urls.append(variants[0])
+    if urls:
+        return listing_photo_urls(urls, platform="wg")
+
+    # Machine-readable photos belong to this specific listing or its page preview.
+    for ad in _structured_ad(soup, listing_id):
+        images = ad.get("image")
+        for image in images if isinstance(images, list) else [images]:
+            if isinstance(image, dict):
+                urls.extend((image.get("contentUrl"), image.get("url")))
+            else:
+                urls.append(image)
+    urls.extend(meta.get("content") for meta in soup.select('meta[property="og:image"]'))
+    return listing_photo_urls(urls, platform="wg")
 
 
 def _machine_quantity(value, ceiling: int) -> float | None:
@@ -490,4 +515,5 @@ class WGSource:
             rent_eur=rent_eur,
             rent_kind=rent_kind,
             area_sqm=area_sqm,
+            photo_urls=_detail_photos(soup, ref.id),
         )
