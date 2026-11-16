@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from listing_photos import listing_photo_urls
@@ -22,6 +22,8 @@ _TABLE_COLUMNS = {
     "outgoing_checks": {"id", "kind", "approved", "reason"},
     "klein_review": {"id", "url", "title", "fresh_at", "basis", "reason"},
     "klein_reply_drafts": {"id", "listing_id", "url", "message", "received_at", "state"},
+    "wg_reply_drafts": {"id", "url", "message", "received_at", "state", "label", "summary", "review_reason"},
+    "wg_reply_inbox_status": {"id", "checked_at", "available"},
     "klein_activity": {"kind", "listing_id", "url", "subject", "summary", "occurred_at"},
     "wg_inventory_scan": {"id", "scanned_at"},
     "wg_observations": {"last_seen_at"},
@@ -29,6 +31,7 @@ _TABLE_COLUMNS = {
     "listing_profiles": {"id", "title", "rent_eur", "rent_kind", "area_sqm", "summary", "fit", "fit_reason"},
 }
 _PLATFORM_HOSTS = {"www.wg-gesucht.de", "wg-gesucht.de", "www.kleinanzeigen.de", "kleinanzeigen.de"}
+WG_REPLY_INBOX = "https://www.wg-gesucht.de/nachrichten.html"
 RESULT_LIMIT = 100
 BERLIN = ZoneInfo("Europe/Berlin")
 DateBasis = Literal["published", "first_seen"]
@@ -101,6 +104,9 @@ class Reply:
     received_at: float
     state: str
     review_reason: str | None
+    platform: str = "Kleinanzeigen"
+    label: str | None = None
+    summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +131,7 @@ class DashboardData:
     secondary_offers: tuple[SecondaryListing, ...] = ()
     listing_profiles: dict[str, ListingProfile] = field(default_factory=dict)
     application_reviews_available: bool = False
+    wg_inbox_status: tuple[float, bool] | None = None
 
 
 def _platform_url(url: str) -> str | None:
@@ -137,6 +144,23 @@ def _platform_url(url: str) -> str | None:
     if parts.scheme != "https" or parts.netloc.lower() not in _PLATFORM_HOSTS:
         return None
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
+
+
+def _wg_reply_url(url: str) -> str:
+    if not url or any(character.isspace() or ord(character) < 32 for character in url):
+        return WG_REPLY_INBOX
+    try:
+        parts = urlsplit(url)
+        ids = parse_qs(parts.query, keep_blank_values=True, max_num_fields=16).get("nachrichten-id", [])
+    except ValueError:
+        return WG_REPLY_INBOX
+    if (parts.scheme != "https" or parts.netloc.lower() not in {"www.wg-gesucht.de", "wg-gesucht.de"}
+            or parts.path != "/nachricht.html" or len(ids) != 1):
+        return WG_REPLY_INBOX
+    conversation_id = ids[0]
+    if not (1 <= len(conversation_id) <= 20 and conversation_id.isascii() and conversation_id.isdecimal()):
+        return WG_REPLY_INBOX
+    return f"https://www.wg-gesucht.de/nachricht.html?nachrichten-id={conversation_id}"
 
 
 def _available_tables(db: sqlite3.Connection) -> set[str]:
@@ -230,16 +254,35 @@ def _secondary_offers(db: sqlite3.Connection, cutoff: float, until: float) -> tu
 
 
 def _replies(db: sqlite3.Connection, tables: set[str], cutoff: float, until: float) -> tuple[Reply, ...]:
-    check_join = "LEFT JOIN outgoing_checks c ON c.id = d.id AND c.kind = 'reply'" if "outgoing_checks" in tables else ""
-    reason = "c.reason" if check_join else "NULL"
-    rows = db.execute(f"""
-        SELECT d.id, d.listing_id, d.url, d.message, d.received_at, d.state, {reason}
-        FROM klein_reply_drafts d {check_join}
-        WHERE d.received_at BETWEEN ? AND ? ORDER BY d.received_at DESC, d.id DESC LIMIT ?
-    """, (cutoff, until, RESULT_LIMIT))
-    return tuple(Reply(item, listing_id, _platform_url(url), message if state in {"draft", "held"} else None,
-                       stamp, state, reason)
-                 for item, listing_id, url, message, stamp, state, reason in rows)
+    replies = []
+    if "klein_reply_drafts" in tables:
+        check_join = "LEFT JOIN outgoing_checks c ON c.id = d.id AND c.kind = 'reply'" if "outgoing_checks" in tables else ""
+        reason = "c.reason" if check_join else "NULL"
+        rows = db.execute(f"""
+            SELECT d.id, d.listing_id, d.url, d.message, d.received_at, d.state, {reason}
+            FROM klein_reply_drafts d {check_join}
+            WHERE d.received_at BETWEEN ? AND ? ORDER BY d.received_at DESC, d.id DESC LIMIT ?
+        """, (cutoff, until, RESULT_LIMIT))
+        replies.extend(Reply(item, listing_id, _platform_url(url), message if state in {"draft", "held"} else None,
+                             stamp, state, reason)
+                       for item, listing_id, url, message, stamp, state, reason in rows)
+    if "wg_reply_drafts" in tables:
+        rows = db.execute("""
+            SELECT id, url, message, received_at, state, review_reason, label, summary
+            FROM wg_reply_drafts
+            WHERE received_at BETWEEN ? AND ? ORDER BY received_at DESC, id DESC LIMIT ?
+        """, (cutoff, until, RESULT_LIMIT))
+        replies.extend(Reply(item, None, _wg_reply_url(url), message if state in {"draft", "held"} else None,
+                             stamp, state, reason, "WG-Gesucht", label, summary)
+                       for item, url, message, stamp, state, reason, label, summary in rows)
+    return tuple(sorted(replies, key=lambda row: (row.received_at, row.id), reverse=True)[:RESULT_LIMIT])
+
+
+def _wg_inbox_status(db: sqlite3.Connection, tables: set[str]) -> tuple[float, bool] | None:
+    if "wg_reply_inbox_status" not in tables:
+        return None
+    row = db.execute("SELECT checked_at, available FROM wg_reply_inbox_status WHERE id = 1").fetchone()
+    return (row[0], bool(row[1])) if row else None
 
 
 def _activity(db: sqlite3.Connection, cutoff: float, until: float) -> tuple[Activity, ...]:
@@ -382,13 +425,14 @@ def load_dashboard(
                 "ready",
                 matches=matches,
                 address_checks=address_checks,
-                replies=_replies(db, tables, history_cutoff, until) if "klein_reply_drafts" in tables else (),
+                replies=_replies(db, tables, history_cutoff, until),
                 activity=_activity(db, history_cutoff, until) if "klein_activity" in tables else (),
                 wg_scan=_wg_scan(db, tables),
                 dated_listings=dated_listings,
                 secondary_offers=secondary_offers,
                 listing_profiles=_profiles(db, tables, visible_ids),
                 application_reviews_available="application_reviews" in tables,
+                wg_inbox_status=_wg_inbox_status(db, tables),
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")

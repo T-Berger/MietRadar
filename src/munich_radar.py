@@ -8,10 +8,12 @@ import os
 import sqlite3
 import time
 from collections import Counter
+from collections.abc import Callable
 from contextlib import ExitStack, closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -32,7 +34,11 @@ from wg_alerts import AlertsError, AlertsInbox
 from wg_first_message import applicant_answers, viewing_availability, viewing_slot_labels
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
 from wg_preferences import rejection_reason
+from wg_reply_drafts import install_wg_reply_drafts, sync_wg_reply_drafts
 from wg_source import DEFAULT_SEARCH_URLS, ListingRef, WGListingGone, WGSource, WGSourceError
+
+if TYPE_CHECKING:
+    from wg_reply_inbox import WGInboxEntry
 
 ROOT = Path(__file__).resolve().parent.parent
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -76,6 +82,7 @@ def _database(path: Path) -> sqlite3.Connection:
     install_klein_review(db)
     install_activity(db)
     install_reply_queue(db)
+    install_wg_reply_drafts(db)
     install_observations(db)
     install_listing_profiles(db)
     return db
@@ -636,9 +643,12 @@ def main() -> int:
                 raise ValueError("Für automatische Antworten zuerst Kleinanzeigen-Antwortmails einrichten")
             limit = _number("MUNICH_DAILY_SEND_LIMIT", 3, 1, 5)
             reply_dispatcher = None
+            wg_reply_reader = None
             with ExitStack() as sessions:
                 reviewed_send = _switch("MUNICH_REVIEWED_SEND", False)
-                if reviewed_send or _switch("MUNICH_AUTOSEND", False):
+                auto_send = not reviewed_send and _switch("MUNICH_AUTOSEND", False)
+                wg_reply_drafts = _switch("MUNICH_WG_REPLY_DRAFTS", False)
+                if reviewed_send or auto_send or wg_reply_drafts:
                     try:
                         from wg_delivery import BrowserSender
                     except ModuleNotFoundError as exc:
@@ -652,8 +662,17 @@ def main() -> int:
                     queue = DeliveryQueue(sender, limit, judge_provider=outgoing_provider)
                     if reviewed_send:
                         scanner.reviewed_delivery = queue
-                    else:
+                    elif auto_send:
                         scanner.delivery = queue
+                    if wg_reply_drafts:
+                        from wg_reply_inbox import WGInboxError, recent_wg_messages
+
+                        def wg_reply_reader():
+                            try:
+                                return recent_wg_messages(sender)
+                            except WGInboxError as exc:
+                                LOG.warning("WG-Gesucht-Postfach nicht erreichbar: %s", exc)
+                                return None
                 klein_autosend = _switch("KLEINANZEIGEN_AUTOSEND", False)
                 if klein_autosend or reply_mode == "auto":
                     if klein_autosend and scanner.klein_alerts is None:
@@ -673,7 +692,8 @@ def main() -> int:
                 interval = _number("MUNICH_POLL_SECONDS", 3600, 60, 3600)
                 return _poll(scanner, db, interval, once=args.command == "scan",
                              reply_inbox=reply_inbox, judge_provider=judge_provider, notifier=notifier,
-                             outgoing_provider=outgoing_provider, reply_dispatcher=reply_dispatcher)
+                             outgoing_provider=outgoing_provider, reply_dispatcher=reply_dispatcher,
+                             wg_reply_reader=wg_reply_reader)
     except (OSError, sqlite3.Error, ValueError) as exc:
         LOG.error("Start fehlgeschlagen: %s", exc)
         return 1
@@ -692,6 +712,7 @@ def _poll(
     scanner: Scanner, db: sqlite3.Connection, interval: int, *, once: bool,
     reply_inbox: AlertsInbox | None = None, judge_provider: str = "none", notifier: EmailNotifier | None = None,
     outgoing_provider: str = "none", reply_dispatcher: ReplyDispatcher | None = None,
+    wg_reply_reader: Callable[[], tuple[WGInboxEntry, ...] | None] | None = None,
 ) -> int:
     delay = interval
     retry_after: dict[str, datetime] = {}
@@ -712,6 +733,11 @@ def _poll(
         if updated:
             counts["gespeicherte Entwürfe sprachlich überarbeitet"] += updated
         counts.update(scanner.send_reviewed(db, now, review_retry_after))
+        if wg_reply_reader is not None:
+            drafted = sync_wg_reply_drafts(db, wg_reply_reader(), datetime.now(timezone.utc),
+                                           provider=outgoing_provider, outgoing_provider=outgoing_provider)
+            if drafted:
+                counts["WG-Gesucht-Rückentwürfe"] += drafted
         klein_paused = scanner.klein_delivery is not None and scanner.klein_delivery.paused
         if reply_inbox:
             try:

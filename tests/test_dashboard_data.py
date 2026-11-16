@@ -85,6 +85,36 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.listing_profiles["12"].photo_urls, ())
         self.assertIsNone(data.wg_scan)
 
+    def test_wg_reply_drafts_merge_with_kleinanzeigen_and_keep_only_safe_conversation_links(self):
+        now = NOW.timestamp()
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TABLE klein_reply_drafts (id TEXT, listing_id TEXT, url TEXT, message TEXT, "
+                       "received_at REAL, state TEXT)")
+            db.execute("CREATE TABLE wg_reply_drafts (id TEXT, message_id TEXT, url TEXT, received_at REAL, label TEXT, "
+                       "summary TEXT, message TEXT, state TEXT, review_reason TEXT)")
+            db.execute("CREATE TABLE wg_reply_inbox_status (id INTEGER, checked_at REAL, available INTEGER)")
+            db.execute("INSERT INTO wg_reply_inbox_status VALUES (1, ?, 0)", (now,))
+            db.execute("INSERT INTO klein_reply_drafts VALUES (?, ?, ?, ?, ?, ?)",
+                       ("ka:example", "ka-55", "https://www.kleinanzeigen.de/m-nachrichten.html#example",
+                        "Danke!", now - 1, "draft"))
+            db.executemany("INSERT INTO wg_reply_drafts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                ("123", "789", "https://www.wg-gesucht.de/nachricht.html?nachrichten-id=123&list=1#some-id",
+                 now, "Besichtigung", "Ein Termin wurde angeboten.", "Danke für die Einladung!", "draft", None),
+                ("456", "987", "https://www.wg-gesucht.de/nachricht.html?nachrichten-id=456&nachrichten-id=987",
+                 now - 3, "Vorsicht", "Die Nachricht bittet um Vorauszahlung.", None, "held", "Verlauf prüfen"),
+                ("789", "654", "https://www.wg-gesucht.de/nachricht.html?nachrichten-id=789",
+                 now - 31 * 86400, "Absage", "Das Zimmer ist vergeben.", "Danke!", "draft", None),
+            ])
+
+        data = load_dashboard(self.path, now=NOW)
+        self.assertEqual([row.platform for row in data.replies], ["WG-Gesucht", "Kleinanzeigen", "WG-Gesucht"])
+        self.assertEqual(data.replies[0].url, "https://www.wg-gesucht.de/nachricht.html?nachrichten-id=123")
+        self.assertEqual((data.replies[0].label, data.replies[0].summary, data.replies[0].message),
+                         ("Besichtigung", "Ein Termin wurde angeboten.", "Danke für die Einladung!"))
+        self.assertEqual(data.replies[2].url, "https://www.wg-gesucht.de/nachrichten.html")
+        self.assertEqual(data.replies[2].review_reason, "Verlauf prüfen")
+        self.assertEqual(data.wg_inbox_status, (now, False))
+
     def test_current_secondary_offers_are_separate_from_primary_matches(self):
         recent = (NOW - timedelta(hours=1)).timestamp()
         older = (NOW - timedelta(hours=23)).timestamp()
