@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -16,6 +17,28 @@ from kleinanzeigen_judge import judge_reply
 from kleinanzeigen_reply_queue import save_reply_draft
 from kleinanzeigen_replies import extract_replies
 from wg_alerts import AlertsInbox
+
+
+LOG = logging.getLogger(__name__)
+
+
+def _rejection_hint(provider: str, status: int, code: object, message: str) -> str:
+    if provider == "brevo":
+        if "unrecognised ip address" in message or "unrecognized ip address" in message:
+            return "Ausgehende IP-Adresse in Brevo nicht zugelassen"
+        if code == "permission_denied" or "access denied for resource" in message:
+            return "API-Schlüssel braucht Rechte für transaktionale E-Mails"
+        if any(phrase in message for phrase in ("invalid sender", "sender is not valid", "sender is not verified",
+                                                 "sender is not authorized", "verify your sender")):
+            return "Bestätigte Absenderadresse in Brevo prüfen"
+    if provider == "resend":
+        if code == "invalid_permission":
+            return "Versandrechte des API-Schlüssels prüfen"
+        if "can only send testing emails" in message or "domain is not verified" in message:
+            return "Verifizierten Absender und Einschränkungen für Test-E-Mails prüfen"
+    if status == 401 or any(phrase in message for phrase in ("api key is invalid", "invalid api key", "key not found")):
+        return "API-Schlüssel und Zugriff beim Anbieter prüfen"
+    return "Absender, Empfänger und Einstellungen beim Anbieter prüfen"
 
 
 def install_activity(db: sqlite3.Connection) -> None:
@@ -166,13 +189,20 @@ class EmailNotifier:
                 return bool(json.load(response).get(response_id))
         except HTTPError as error:
             with error:
-                if self.provider != "brevo" or error.code != 400:
-                    return False
                 try:
                     details = json.loads(error.read(4096))
-                    return (details.get("code") == "duplicate_parameter"
-                            and "idempotency" in details.get("message", "").lower())
-                except (OSError, ValueError, AttributeError):
-                    return False
+                except (OSError, ValueError):
+                    details = {}
+            if not isinstance(details, dict):
+                details = {}
+            code = details.get("code") if self.provider == "brevo" else details.get("name")
+            message = details.get("message")
+            message = message.lower() if isinstance(message, str) else ""
+            if (self.provider == "brevo" and error.code == 400 and code == "duplicate_parameter"
+                    and "idempotency" in message):
+                return True
+            LOG.warning("%s hat die E-Mail abgelehnt (HTTP %d). %s.", self.provider.title(), error.code,
+                        _rejection_hint(self.provider, error.code, code, message))
+            return False
         except (URLError, OSError, HTTPException, ValueError, AttributeError):
             return False

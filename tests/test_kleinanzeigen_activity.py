@@ -129,6 +129,26 @@ class KleinanzeigenActivityTest(unittest.TestCase):
             self.assertFalse(notifier._send("match:1", "Neues Angebot", "Ein Zimmer passt.", ""))
             self.assertTrue(notifier._send("match:1", "Neues Angebot", "Ein Zimmer passt.", ""))
 
+    def test_email_rejection_logs_only_safe_diagnostics(self):
+        notifier = EmailNotifier("example-key", "sender@example.com", "me@example.net", provider="brevo")
+        endpoint = "https://api.brevo.com/v3/smtp/email"
+        for status, code, message, hint in (
+            (401, "unauthorized", "Unrecognised IP address 192.0.2.10", "IP-Adresse in Brevo nicht zugelassen"),
+            (403, "permission_denied", "Access denied for resource", "Rechte für transaktionale E-Mails"),
+            (400, "invalid_parameter", "Sender is not verified", "Bestätigte Absenderadresse"),
+            (401, "unauthorized", "Key not found", "API-Schlüssel und Zugriff"),
+            (403, "private-provider-value", "Arbitrary provider message", "Einstellungen beim Anbieter prüfen"),
+        ):
+            with self.subTest(status=status, code=code):
+                body = json.dumps({"code": code, "message": f"{message}: sender@example.com example-key"}).encode()
+                error = HTTPError(endpoint, status, "Rejected", {}, io.BytesIO(body))
+                with patch("kleinanzeigen_activity.urlopen", side_effect=error), self.assertLogs("kleinanzeigen_activity") as logs:
+                    self.assertFalse(notifier._send("match:1", "Neues Angebot", "Ein Zimmer passt.", ""))
+                self.assertIn(f"Brevo hat die E-Mail abgelehnt (HTTP {status})", logs.output[0])
+                self.assertIn(hint, logs.output[0])
+                for private_value in (message, "sender@example.com", "example-key", "private-provider-value"):
+                    self.assertNotIn(private_value, logs.output[0])
+
 
 if __name__ == "__main__":
     unittest.main()
