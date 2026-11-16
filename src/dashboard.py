@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 from dashboard_auth import logout_button, require_authentication
 from dashboard_data import (
-    BERLIN, RESULT_LIMIT, AddressCheck, DateBasis, DatedListing, ListingProfile, Match,
+    BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, ListingProfile, Match, Reply,
     SecondaryListing, load_dashboard, weekend_dates,
 )
 from reviewed_applications import (
@@ -417,14 +417,28 @@ def _secondary_offers(rows: tuple[SecondaryListing, ...], hours: int, profiles: 
                 _location_link(row.url)
 
 
-def _replies(rows) -> None:
+def _replies(rows: tuple[Reply, ...], *, wg_enabled: bool, wg_status: tuple[float, bool] | None) -> None:
     st.subheader("Antwortentwürfe", anchor=False)
+    if wg_enabled:
+        if wg_status is None:
+            st.caption("MietRadar hat das WG-Gesucht-Postfach noch nicht geprüft.")
+        elif not wg_status[1]:
+            st.info("MietRadar kann das WG-Gesucht-Postfach gerade nicht lesen. Prüfe den WG-Gesucht-Login auf Railway.")
+            _location_link(WG_REPLY_INBOX, "WG-Gesucht-Postfach öffnen")
+        else:
+            st.caption(f"WG-Gesucht-Postfach zuletzt geprüft · {_date(wg_status[0])}")
     if not rows:
-        st.info("Keine Antworten vorhanden.")
+        st.info("Keine Antwortentwürfe vorhanden.")
         return
     for row in rows:
         with st.container(border=True):
-            st.caption(f"{row.listing_id or 'Kleinanzeigen'} · {STATES.get(row.state, 'Entwurf')} · {_date(row.received_at)}")
+            when = _date(row.received_at)
+            if row.platform == "WG-Gesucht":
+                when = f"Erfasst {when}"
+            details = [row.platform, row.listing_id, row.label, STATES.get(row.state, "Entwurf"), when]
+            st.caption(" · ".join(detail for detail in details if detail))
+            if row.summary:
+                st.text(row.summary)
             if row.review_reason:
                 st.text(row.review_reason)
             _location_link(row.url, "Nachrichtenverlauf öffnen")
@@ -514,7 +528,8 @@ def main() -> None:
     with address:
         _addresses(data.address_checks, data.listing_profiles)
     with replies:
-        _replies(data.replies)
+        _replies(data.replies, wg_enabled=os.getenv("MUNICH_WG_REPLY_DRAFTS", "").strip().lower() == "true",
+                 wg_status=data.wg_inbox_status)
     with activity:
         _activity(data.activity)
 

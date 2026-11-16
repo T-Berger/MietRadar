@@ -13,6 +13,7 @@ COPY requirements-radar.txt requirements-send.txt requirements-dashboard.txt ./
 RUN pip install --no-cache-dir -r requirements-send.txt -r requirements-dashboard.txt
 COPY src/munich_radar.py src/munich_transit.py src/munich_delivery.py src/wg_source.py src/wg_observations.py src/wg_alerts.py src/wg_preferences.py src/wg_delivery.py src/llm_personalizer.py src/kleinanzeigen_source.py src/kleinanzeigen_radar.py src/kleinanzeigen_delivery.py ./src/
 COPY src/munich_tiers.py src/wg_first_message.py src/reviewed_applications.py ./src/
+COPY src/wg_reply_inbox.py src/wg_reply_response.py src/wg_reply_drafts.py ./src/
 COPY src/listing_profiles.py src/listing_photos.py ./src/
 COPY src/kleinanzeigen_activity.py src/kleinanzeigen_judge.py src/kleinanzeigen_replies.py ./src/
 COPY src/kleinanzeigen_reply_queue.py src/kleinanzeigen_response.py src/outgoing_judge.py ./src/

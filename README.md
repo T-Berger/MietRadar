@@ -52,6 +52,8 @@ Im privaten Dashboard kannst du einen Bonitätsnachweis für Vermieter als PDF h
 
 Für `WG_EMAIL` kannst du die Gmail-Adresse deines WG-Gesucht-Kontos verwenden. `WG_PASSWORD` braucht ein eigenes Passwort für WG-Gesucht. **Weiter mit Google** funktioniert im persönlichen Browser. Der Worker auf Railway hat eine eigene Browsersitzung.
 
+Mit `MUNICH_WG_REPLY_DRAFTS=true` prüft MietRadar beim regulären Lauf auch das angemeldete WG-Gesucht-Postfach. Unter **Antwortentwürfe** erscheint ein kurzer deutscher Vorschlag für die jeweils neueste offene Nachricht pro Unterhaltung. Bereits beantwortete Nachrichten verlassen die Liste beim nächsten Abruf. Du kannst den Entwurf kopieren und den Originalverlauf direkt bei WG-Gesucht öffnen.
+
 Hinterlege deine kurze Vorstellung als `MUNICH_APPLICANT_INTRO` privat in Railway oder in `config/.env`. Bei WG-Gesucht steht sie direkt unter der Anrede. Der Entwurf greift ein konkretes Detail aus der Anzeige auf und geht auf Fragen ein, soweit deine Antworten vorliegen. Mit Mistral prüft der Radar den Anzeigenbezug und die Antworten beim Speichern sowie vor dem automatischen Versand. Aktuelle unversendete Entwürfe werden beim nächsten erreichbaren Inserat aktualisiert und erneut geprüft.
 
 Für WG-Gesucht kannst du zwei oder mehr mögliche Besichtigungstermine privat in `MUNICH_VIEWING_SLOTS` eintragen. Verwende einen Termin pro Zeile im Format `JJJJ-MM-TTTHH:MM` in Münchner Ortszeit. Der Radar bietet die nächsten beiden verfügbaren Termine an und überspringt vergangene Einträge. Ohne verfügbare Termine fragt der Entwurf nach einer Uhrzeit.

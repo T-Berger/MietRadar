@@ -14,6 +14,11 @@
 !src/wg_alerts.py
 !src/wg_preferences.py
 !src/wg_delivery.py
+!src/wg_first_message.py
+!src/reviewed_applications.py
+!src/wg_reply_inbox.py
+!src/wg_reply_response.py
+!src/wg_reply_drafts.py
 !src/llm_personalizer.py
 !src/kleinanzeigen_source.py
 !src/kleinanzeigen_radar.py
