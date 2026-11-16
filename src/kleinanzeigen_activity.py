@@ -8,8 +8,9 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from http.client import HTTPException
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import NAMESPACE_URL, uuid5
 
 from kleinanzeigen_judge import judge_reply
 from kleinanzeigen_reply_queue import save_reply_draft
@@ -123,9 +124,10 @@ class EmailNotifier:
     api_key: str
     sender: str
     recipient: str
+    provider: str = "resend"
 
     def flush(self, db: sqlite3.Connection, now: datetime) -> tuple[int, bool]:
-        # Resend honors the same idempotency key for 24h. Older items stay in the local log.
+        # Older items stay in the local log. Brevo's duplicate protection is shorter than Resend's 24h.
         pending = db.execute("""SELECT id, subject, summary, url FROM klein_activity
             WHERE emailed_at IS NULL AND occurred_at BETWEEN ? AND ? ORDER BY occurred_at DESC LIMIT 15
         """, ((now - timedelta(hours=23)).timestamp(), now.timestamp())).fetchall()
@@ -139,14 +141,38 @@ class EmailNotifier:
         return sent, True
 
     def _send(self, event_id: str, subject: str, summary: str, url: str) -> bool:
-        payload = {"from": self.sender, "to": [self.recipient], "subject": f"MietRadar · {subject}",
-                   "text": f"{summary}\n\n{url}".strip()}
-        request = Request("https://api.resend.com/emails", method="POST", data=json.dumps(payload).encode("utf-8"),
-                          headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json",
-                                   "User-Agent": "MietRadar/1.0",
-                                   "Idempotency-Key": "mietradar/" + hashlib.sha256(event_id.encode()).hexdigest()})
+        subject = f"MietRadar · {subject}"
+        body = f"{summary}\n\n{url}".strip()
+        headers = {"Content-Type": "application/json", "User-Agent": "MietRadar/1.0"}
+        if self.provider == "brevo":
+            endpoint = "https://api.brevo.com/v3/smtp/email"
+            headers["api-key"] = self.api_key
+            payload = {"sender": {"name": "MietRadar", "email": self.sender}, "to": [{"email": self.recipient}],
+                       "subject": subject, "textContent": body,
+                       "headers": {"idempotencyKey": str(uuid5(NAMESPACE_URL, f"mietradar/email/{event_id}"))}}
+            response_id = "messageId"
+        elif self.provider == "resend":
+            endpoint = "https://api.resend.com/emails"
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["Idempotency-Key"] = "mietradar/" + hashlib.sha256(event_id.encode()).hexdigest()
+            payload = {"from": self.sender, "to": [self.recipient], "subject": subject, "text": body}
+            response_id = "id"
+        else:
+            raise ValueError(f"Unbekannter E-Mail-Anbieter: {self.provider}")
+
+        request = Request(endpoint, method="POST", data=json.dumps(payload).encode("utf-8"), headers=headers)
         try:
             with urlopen(request, timeout=10) as response:
-                return bool(json.load(response).get("id"))
+                return bool(json.load(response).get(response_id))
+        except HTTPError as error:
+            with error:
+                if self.provider != "brevo" or error.code != 400:
+                    return False
+                try:
+                    details = json.loads(error.read(4096))
+                    return (details.get("code") == "duplicate_parameter"
+                            and "idempotency" in details.get("message", "").lower())
+                except (OSError, ValueError, AttributeError):
+                    return False
         except (URLError, OSError, HTTPException, ValueError, AttributeError):
             return False

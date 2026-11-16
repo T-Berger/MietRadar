@@ -125,7 +125,12 @@ Der Radar ordnet Antworten in **Besichtigung**, **Rückfrage**, **Absage**, **Vo
 - `KLEINANZEIGEN_REPLY_MODE=draft` bereitet Antworten zur Durchsicht vor. Sie stehen unter `python src/munich_radar.py klein-reply-drafts`.
 - `KLEINANZEIGEN_REPLY_MODE=auto` darf eine klare Besichtigungseinladung oder eine Frage nach weiterem Interesse einmal pro Inserat unverbindlich beantworten. Dafür braucht der Radar einen eindeutigen Nachrichtenverlauf und das angemeldete Kleinanzeigen-Profil. Termine, Unterlagen, Zahlungen und unklare Fälle bleiben bei dir. Die Option für Erstbewerbungen (`KLEINANZEIGEN_AUTOSEND`) lässt sich unabhängig davon setzen.
 
-MietRadar meldet neue Treffer in den ÖPNV-Kategorien A* und A nach dem nächsten Suchlauf für WG-Gesucht und Kleinanzeigen. Der Verlauf enthält auch Kleinanzeigen-Ortsprüfungen, Versandstatus und bewertete Antworten. Wenn du diese Hinweise automatisch per E-Mail bekommen willst, setze `RESEND_API_KEY`, `MUNICH_NOTIFY_EMAIL_FROM` (Absender auf einer bei Resend verifizierten Domain) und `MUNICH_NOTIFY_EMAIL_TO` (deine E-Mail-Adresse). Der Versand läuft über die [Resend HTTPS API](https://resend.com/docs/api-reference/emails/send-email). Mit `python src/munich_radar.py klein-activity` kannst du die Hinweise bis zu 30 Tage im lokalen Verlauf ansehen.
+MietRadar meldet neue Treffer in den ÖPNV-Kategorien A* und A nach dem nächsten Suchlauf für WG-Gesucht und Kleinanzeigen. Der Verlauf enthält auch Kleinanzeigen-Ortsprüfungen, Versandstatus und bewertete Antworten. Mit `python src/munich_radar.py klein-activity` kannst du die Hinweise bis zu 30 Tage im lokalen Verlauf ansehen.
+
+Für E-Mail-Hinweise setze `MUNICH_NOTIFY_EMAIL_FROM` auf die beim Anbieter bestätigte Absenderadresse und `MUNICH_NOTIFY_EMAIL_TO` auf deine Empfängeradresse. Wähle den Anbieter über `MUNICH_NOTIFY_EMAIL_PROVIDER`:
+
+- `resend` (Standard) verwendet `RESEND_API_KEY` und einen Absender auf einer [bei Resend verifizierten Domain](https://resend.com/docs/dashboard/domains/introduction).
+- `brevo` verwendet `BREVO_API_KEY`. Du kannst [eine vorhandene E-Mail-Adresse als Absender bestätigen](https://help.brevo.com/hc/en-us/articles/208836149-Create-a-new-sender-From-name-and-From-email). Brevo verwendet bei nicht authentifizierten Absenderdomains [eine eigene Versanddomain](https://help.brevo.com/hc/en-us/articles/14925263522578-Comply-with-Gmail-Yahoo-and-Microsoft-s-requirements-for-email-senders). Der eingestellte Empfänger bleibt auch bei einem Plus-Alias gleich.
 
 ### Auf Railway betreiben
 

@@ -1,14 +1,15 @@
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
-from kleinanzeigen_activity import EmailNotifier, record_activity, record_replies
+from kleinanzeigen_activity import Activity, EmailNotifier, install_activity, record_activity, record_replies
 from kleinanzeigen_replies import KleinanzeigenReply
 from munich_radar import _database
 from munich_tiers import save_secondary_offer
@@ -95,6 +96,38 @@ class KleinanzeigenActivityTest(unittest.TestCase):
             self.assertEqual(requests[0].get_header("Idempotency-key"), requests[1].get_header("Idempotency-key"))
             self.assertEqual(requests[1].get_header("User-agent"), "MietRadar/1.0")
             self.assertEqual(json.loads(requests[1].data)["to"], ["me@example.com"])
+
+    def test_brevo_keeps_exact_alias_and_confirms_a_retried_email(self):
+        sender = "sender@example.com"
+        recipient = "me+resend@example.net"
+        endpoint = "https://api.brevo.com/v3/smtp/email"
+        notifier = EmailNotifier("example-key", sender, recipient, provider="brevo")
+        duplicate = HTTPError(endpoint, 400, "Bad Request", {}, io.BytesIO(
+            b'{"code":"duplicate_parameter","message":"Email for the idempotency key has already been processed"}'
+        ))
+        with closing(sqlite3.connect(":memory:")) as db:
+            install_activity(db)
+            Activity("match:1", "match", "1", "https://example.net/offer", "Neues Angebot",
+                     "Ein Zimmer passt.", NOW.timestamp()).save(db)
+            with patch("kleinanzeigen_activity.urlopen", side_effect=[URLError("timeout"), duplicate]) as fetch:
+                self.assertEqual(notifier.flush(db, NOW), (0, False))
+                self.assertEqual(notifier.flush(db, NOW), (1, True))
+                self.assertEqual(notifier.flush(db, NOW), (0, True))
+            first, second = [call.args[0] for call in fetch.call_args_list]
+            payload = json.loads(second.data)
+            self.assertEqual(second.full_url, endpoint)
+            self.assertEqual(second.get_header("Api-key"), "example-key")
+            self.assertEqual(json.loads(first.data)["headers"], payload["headers"])
+            self.assertEqual(payload["sender"], {"name": "MietRadar", "email": sender})
+            self.assertEqual(payload["to"], [{"email": recipient}])
+            self.assertEqual(payload["textContent"], "Ein Zimmer passt.\n\nhttps://example.net/offer")
+
+    def test_brevo_only_accepts_provider_message_id(self):
+        notifier = EmailNotifier("example-key", "sender@example.com", "me@example.net", provider="brevo")
+        with patch("kleinanzeigen_activity.urlopen", side_effect=[io.BytesIO(b'{"id":"wrong"}'),
+                                                                io.BytesIO(b'{"messageId":"accepted"}')]):
+            self.assertFalse(notifier._send("match:1", "Neues Angebot", "Ein Zimmer passt.", ""))
+            self.assertTrue(notifier._send("match:1", "Neues Angebot", "Ein Zimmer passt.", ""))
 
 
 if __name__ == "__main__":

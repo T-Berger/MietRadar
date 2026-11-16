@@ -688,7 +688,13 @@ def _reply_settings() -> tuple[AlertsInbox | None, str]:
 def _email_notifier() -> EmailNotifier | None:
     if not (os.getenv("MUNICH_NOTIFY_EMAIL_TO", "").strip() or os.getenv("MUNICH_NOTIFY_EMAIL_FROM", "").strip()):
         return None
-    return EmailNotifier(_required("RESEND_API_KEY"), _required("MUNICH_NOTIFY_EMAIL_FROM"), _required("MUNICH_NOTIFY_EMAIL_TO"))
+    provider = os.getenv("MUNICH_NOTIFY_EMAIL_PROVIDER", "resend").strip().lower()
+    if provider not in {"brevo", "resend"}:
+        raise ValueError("MUNICH_NOTIFY_EMAIL_PROVIDER muss brevo oder resend sein")
+    return EmailNotifier(
+        _required(f"{provider.upper()}_API_KEY"), _required("MUNICH_NOTIFY_EMAIL_FROM"),
+        _required("MUNICH_NOTIFY_EMAIL_TO"), provider=provider,
+    )
 
 
 def _outgoing_provider() -> str:
