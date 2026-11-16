@@ -164,6 +164,8 @@ def _listing_fields(listing: Listing) -> dict:
     fields = {name: getattr(listing, name) for name in _LISTING_LIMITS}
     if listing.is_commercial:
         fields["is_commercial"] = True
+    if listing.recipient_role != "unknown":
+        fields["recipient_role"] = listing.recipient_role
     for name in ("published_at", "published_day", "available_from", "available_until"):
         value = getattr(listing, name)
         fields[name] = value.isoformat() if value is not None else None

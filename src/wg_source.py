@@ -35,6 +35,37 @@ _SEARCH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _COMPANY_PROFILE = re.compile(r"/profile/company/[^/]+\.[0-9]+\.html", re.I)
+_MANAGING_ROLE = (
+    r"(?:hausverwaltung|immobilienverwaltung|verwaltung|(?:haus)?verwalter(?:in|:in)?|"
+    r"(?:immobilien)?makler(?:in|:in)?|vermieter(?:in|:in)?|eigent[üu]mer(?:in|:in)?)"
+)
+_RESIDENT_ROLE = r"(?:mitbewohner|bewohner)(?:(?:\*|:)?in(?:nen)?)?"
+_ROLE_VALUE = rf"(?:d(?:er|ie)\s+)?(?P<role>{_MANAGING_ROLE}|{_RESIDENT_ROLE})[.!]?"
+_CONTACT_PANEL_ROLE = re.compile(_ROLE_VALUE, re.I)
+_CONTACT_ROLE = re.compile(
+    rf"(?:ansprechpartner(?:in|:in)?|kontakt(?:person)?|rolle)\s*:\s*{_ROLE_VALUE}",
+    re.I,
+)
+_EXPLICIT_CONTACT_ROLE = re.compile(
+    rf"(?:kontakt(?:aufnahme)?\s+(?:direkt\s+)?über|ansprechpartner(?:in|:in)?\s+ist)\s+"
+    rf"(?:d(?:ie|en|er)\s+)?(?P<role>{_MANAGING_ROLE}|{_RESIDENT_ROLE})[.!]?",
+    re.I,
+)
+_MANAGER_VOICE = re.compile(
+    rf"(?:ich bin|wir sind)\s+(?:(?:der|die|ein(?:e)?)\s+)?{_MANAGING_ROLE}\b"
+    r"|(?:ich verwalte|wir verwalten)\s+(?:d(?:iese[sn]?|er|ie|as)\s+)?(?:wohnung|haus|immobilie|wg|objekt)\b"
+    r"|(?:ich vermiete|wir vermieten)\b[^.!?\n]{0,70}\bim auftrag (?:des|der)\s+"
+    r"(?:eigent[üu]mer|hausverwaltung|vermieter)\w*\b",
+    re.I,
+)
+_HOUSEMATE_VOICE = re.compile(
+    r"(?:ich wohne|wir wohnen)\s+[^.!?\n]{0,75}\b(?:hier|in (?:der|dieser|unserer)\s+(?:wg|wohnung))\b"
+    rf"|wir sind\s+(?:eure|deine|die)\s+(?:zukünftigen|neuen)\s+{_RESIDENT_ROLE}\b"
+    r"|wir suchen\s+[^.!?\n]{0,65}\bmitbewohner\w*\s+für\s+unsere\s+wg\b"
+    r"|ich bin\s+[^.!?\n]{1,45}\bund wohne\s+[^.!?\n]{0,65}\b(?:hier|in (?:der|dieser|unserer)\s+(?:wg|wohnung))\b",
+    re.I,
+)
+_NO_LONGER_RESIDENT = re.compile(r"\b(?:nicht|kein\w*|bald|demnächst|erst ab)\b", re.I)
 _BERLIN = ZoneInfo("Europe/Berlin")
 _LAYOUT_LIMIT = 4 * 1024 * 1024
 _NUMBER = r"(?:[0-9]{1,3}(?:[. ][0-9]{3})+(?:,[0-9]{1,2})?|[0-9]{1,7}(?:[,.][0-9]{1,2})?)"
@@ -45,6 +76,7 @@ _RENT_KINDS = {
     "kaltmiete": "cold", "nettokaltmiete": "cold", "miete": "unspecified", "preis": "unspecified",
 }
 RentKind = Literal["warm", "total", "cold", "unspecified"]
+RecipientRole = Literal["manager", "roommate", "unknown"]
 
 
 class WGSourceError(Exception):
@@ -109,6 +141,7 @@ class Listing:
     available_from: date | None = None
     available_until: date | None = None
     is_commercial: bool = False
+    recipient_role: RecipientRole = "unknown"
 
 
 def _search_url(url):
@@ -387,6 +420,33 @@ def _commercial_provider(soup) -> bool:
     return False
 
 
+def listing_recipient_role(
+    description: str, *, commercial: bool = False, contact_roles: Sequence[str] = (),
+) -> RecipientRole:
+    """Identify the addressee using contact labels or a clear first-person statement."""
+    statements = [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n", description) if part.strip()]
+    marked: set[RecipientRole] = set()
+    for lines, patterns in ((contact_roles, (_CONTACT_PANEL_ROLE, _CONTACT_ROLE, _EXPLICIT_CONTACT_ROLE)),
+                            (statements, (_CONTACT_ROLE, _EXPLICIT_CONTACT_ROLE))):
+        for line in lines:
+            normalized = _clean(line)
+            marker = next((match for pattern in patterns if (match := pattern.fullmatch(normalized))), None)
+            if not marker:
+                continue
+            marked.add("manager" if re.fullmatch(_MANAGING_ROLE, marker["role"], re.I) else "roommate")
+    if marked:
+        return next(iter(marked)) if len(marked) == 1 else "unknown"
+
+    manager = any(_MANAGER_VOICE.match(part) for part in statements)
+    roommate = any((match := _HOUSEMATE_VOICE.match(part)) and not _NO_LONGER_RESIDENT.search(match[0])
+                   for part in statements)
+    if manager and roommate:
+        return "unknown"
+    if roommate:
+        return "roommate"
+    return "manager" if manager or commercial else "unknown"
+
+
 def _parse_candidates(soup):
     results = []
     for card in soup.select("a.wgg-list-card.offer_list_item[data-id]"):
@@ -537,6 +597,11 @@ class WGSource:
         available_from, available_until = _detail_availability(soup)
         is_wg = bool(residents or wanted or urlsplit(listing_url).path.startswith("/wg-zimmer-"))
         rent_eur, rent_kind, area_sqm = _detail_facts(soup, ref.id, is_wg=is_wg)
+        commercial = _commercial_provider(soup)
+        contact_roles = [
+            text for panel in soup.select(".rhs_contact_information, .contact_box_sticky, .bottom_contact_box")
+            for text in panel.stripped_strings
+        ]
         return Listing(
             id=ref.id,
             url=listing_url,
@@ -556,5 +621,6 @@ class WGSource:
             photo_urls=_detail_photos(soup, ref.id),
             available_from=available_from,
             available_until=available_until,
-            is_commercial=_commercial_provider(soup),
+            is_commercial=commercial,
+            recipient_role=listing_recipient_role(description, commercial=commercial, contact_roles=contact_roles),
         )

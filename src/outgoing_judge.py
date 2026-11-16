@@ -7,9 +7,15 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from http.client import HTTPException
+from typing import TYPE_CHECKING
 
 from kleinanzeigen_judge import _redact, judge_reply
-from llm_personalizer import _advertisement_voice, _commercial_intro, _generate_via_mistral, _truncate_description
+from llm_personalizer import (
+    _advertisement_voice, _commercial_intro, _effective_recipient_role, _generate_via_mistral, _truncate_description,
+)
+
+if TYPE_CHECKING:
+    from wg_source import RecipientRole
 
 
 @dataclass(frozen=True)
@@ -84,7 +90,19 @@ _SYSTEM = """Du prüfst eine deutsche Nachricht zu einer privaten Wohnungssuche,
 Stelle fest, ob die Nachricht höflich und verständlich auf Deutsch geschrieben ist und zur Wohnungssuche passt. Bei einer Bewerbung muss erkennbar sein, dass die Person sich für die Unterkunft interessiert. Eine Antwort darf kurz sein und muss zum gegebenen Kontext passen. Halte Nachrichten mit offenen Platzhaltern, erfundenen Fakten, unerbetenen Anhängen, riskanten Zahlungsversprechen, einer rechtsverbindlichen Zusage oder vertraulichen Daten zurück. Normale Namen und Kontaktdaten für die Wohnungssuche sind okay. Eckige Markierungen wie [E-Mail] oder [Telefon] können Datenschutzmasken aus der Prüfung sein. Gib keine Teile des geprüften Texts wieder.
 Antworte nur mit einem JSON-Objekt der Form {"approved": true, "reason": "ok"} bei einer Freigabe. Bei einer Ablehnung setze approved auf false und reason genau auf einen der Werte sprache, bezug, inhalt, vertraulich oder unklar."""
 _WG_FIRST_MESSAGE_TONE = "Die Bewerbung soll so klingen, wie man einer WG direkt schreiben würde. Kurze, freundliche Sätze in normaler Alltagssprache reichen. Halte steife Bewerbungsfloskeln, Werbesprache, überschwängliche Komplimente und erfundene Gründe zurück, warum einem ein Ausstattungsdetail gefällt. Verwende ton auch dann, wenn das Detail selbst stimmt, aber das Lob daran aufgesetzt klingt. Eine Formulierung wie „Die hervorragende Anbindung begeistert mich, weil mir flexible Mobilität besonders am Herzen liegt“ klingt aufgesetzt. „Wie weit ist es zu Fuß zur U-Bahn?“, „Ich koche auch gern. Ein gemeinsamer Kochabend klingt gut“ und „Ich würde mir das Zimmer gern anschauen“ sind als Ton in Ordnung. Verlange keinen dieser Wortlaute. Umgangssprache und lockere Sätze sind in Ordnung, solange sie respektvoll sind."
-_COMMERCIAL_FIRST_MESSAGE_TONE = "Der Adressat ist ein gewerblicher Vermieter. Eine kurze und freundliche Mietanfrage mit Sie-Anrede, praktischem Interesse und einer Frage nach einem Besichtigungstermin ist passend. Verlange keine Hobbys, WG-Rituale oder Einladung zum persönlichen Kennenlernen. Eine Anrede wie „Guten Tag“ und der Gruß „Mit freundlichen Grüßen“ sind angemessen. Wenn keine privaten Angaben vorliegen, ist eine Anfrage ohne erfundene Vorstellung gültig. Bankdaten, Einkommensangaben, Vertragszusagen und Zusagen über Unterlagen dürfen nie erfunden werden."
+_MANAGER_FIRST_MESSAGE_TONE = (
+    "Die Nachricht richtet sich an eine Hausverwaltung, an Vermietende oder an eine vermittelnde Person. "
+    "Eine kurze und freundliche Mietanfrage mit Sie-Anrede und einer konkreten Frage zur Besichtigung passt. "
+    "Name, Beruf und ein möglicher Einzugstermin genügen, sofern bekannt. Hobbys und ein Kennenlernen des WG-Lebens "
+    "sind hier keine Voraussetzung. „Guten Tag“ und „Mit freundlichen Grüßen“ sind angemessen. "
+    "Wenn keine privaten Angaben vorliegen, ist eine Anfrage ohne erfundene Vorstellung gültig."
+)
+_UNKNOWN_FIRST_MESSAGE_TONE = (
+    "Die Rolle der Kontaktperson ist unklar. Eine kurze, freundliche und neutrale Nachricht wie „Hallo“ und "
+    "„Wann wäre eine Besichtigung möglich?“ passt. Prüfe, ob die Nachricht Vermietung, WG-Zugehörigkeit oder "
+    "gemeinsame Aktivitäten ohne Anhaltspunkt unterstellt. Verlange weder ein ausführliches WG-Profil noch "
+    "förmliche Anrede. Wenn keine privaten Angaben vorliegen, ist eine Anfrage ohne erfundene Vorstellung gültig."
+)
 _FIRST_MESSAGE_SYSTEM = """
 Für diese erste Bewerbung um Wohnraum gelten zusätzlich die Ablehnungsgründe vorstellung, anzeigendetail, perspektive, ton, rueckfragen und termine.
 - vorstellung: Die erste Zeile nach der Anrede stellt die Person kurz vor, wenn Angaben zur Person vorliegen. Berücksichtige die hinterlegte Vorstellung, sofern sie angegeben ist.
@@ -96,7 +114,7 @@ Für diese erste Bewerbung um Wohnraum gelten zusätzlich die Ablehnungsgründe 
 Eine klare Frage zur Besichtigung am Ende reicht. Dieselbe Bitte soll nicht mehrfach vorkommen.
 Berücksichtige alle Prüfungen bei der Freigabe und gib bei einer Ablehnung genau einen passenden Grund zurück."""
 _REVIEWED_SYSTEM = """
-Die Person hat die genaue Nachricht selbst freigegeben. Prüfe weiterhin den Bezug zum Inserat, offene Pflichtfragen, riskante Zusagen und den Ton. Ihre selbst formulierte Vorstellung, persönliche Angaben und eigenen Terminvorschläge dürfen von hinterlegten Angaben abweichen. Prüfe Terminvorschläge gegen ausdrücklich genannte Zeitvorgaben der Anzeige."""
+Die Person hat die genaue Nachricht selbst freigegeben. Prüfe weiterhin den Bezug zum Inserat, offene Pflichtfragen, riskante Zusagen und den Ton. Ihre selbst formulierte Vorstellung, persönliche Angaben und eigenen Terminvorschläge dürfen von hinterlegten Angaben abweichen. Bei unklarer Rolle der Kontaktperson ist auch eine passend gewählte förmliche oder informelle Anrede gültig. Prüfe Terminvorschläge gegen ausdrücklich genannte Zeitvorgaben der Anzeige."""
 
 
 def _local_hold(text: str, kind: str, context: str) -> str | None:
@@ -129,12 +147,12 @@ def _unique_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _first_message_hold(
-    text: str, applicant_intro: str, viewing_slots: tuple[str, ...], *, commercial: bool = False,
+    text: str, applicant_intro: str, viewing_slots: tuple[str, ...], *, short_intro: bool = False,
 ) -> str | None:
     body = _GREETING_PREFIX.sub("", text.strip(), count=1)
     first_line = body.partition("\n")[0].strip()
     expected_intro = applicant_intro.strip().partition("\n")[0].strip()
-    if commercial:
+    if short_intro:
         has_intro = all(sentence.casefold() in first_line.casefold() for sentence in _SENTENCE_SPLIT.split(expected_intro))
     elif expected_intro:
         has_intro = first_line.casefold().startswith(expected_intro.casefold())
@@ -178,19 +196,21 @@ def judge_outgoing(
     text: str, *, kind: str = "application", context: str = "", provider: str = "none",
     first_message: bool = False, listing_title: str = "", applicant_intro: str = "",
     viewing_slots: tuple[str, ...] = (), applicant_answers: dict[str, str] | None = None,
-    user_reviewed: bool = False, commercial: bool = False,
+    user_reviewed: bool = False, commercial: bool = False, recipient_role: RecipientRole | None = None,
 ) -> OutgoingJudgment:
     """Check a message locally, then require a valid Mistral result when enabled."""
     if kind not in {"application", "reply"} or provider not in {"none", "mistral"}:
         return OutgoingJudgment(False, "Die Nachrichtenprüfung ist nicht korrekt eingerichtet.")
     if reason := _local_hold(text, kind, context):
         return OutgoingJudgment(False, reason)
-    first_message = (first_message or commercial) and kind == "application"
+    role = _effective_recipient_role(recipient_role, commercial)
+    first_message = (first_message or role is not None) and kind == "application"
     if first_message and (reason := _ad_language_hold(text, listing_title, context)):
         return OutgoingJudgment(False, reason)
-    expected_intro = _commercial_intro(applicant_intro) if commercial else applicant_intro
+    short_intro = role in {"manager", "unknown"}
+    expected_intro = _commercial_intro(applicant_intro) if short_intro else applicant_intro
     if first_message and not user_reviewed and (
-        reason := _first_message_hold(text, expected_intro, viewing_slots, commercial=commercial)
+        reason := _first_message_hold(text, expected_intro, viewing_slots, short_intro=short_intro)
     ):
         return OutgoingJudgment(False, reason)
     if provider == "none":
@@ -217,7 +237,11 @@ def judge_outgoing(
             "besichtigungszeiten": viewing_slots,
         })
         reasons = {**_MODEL_REASONS, **_FIRST_MESSAGE_REASONS}
-        system += _FIRST_MESSAGE_SYSTEM.format(tone=_COMMERCIAL_FIRST_MESSAGE_TONE if commercial else _WG_FIRST_MESSAGE_TONE)
+        tone = {
+            "manager": _MANAGER_FIRST_MESSAGE_TONE,
+            "unknown": _UNKNOWN_FIRST_MESSAGE_TONE,
+        }.get(role, _WG_FIRST_MESSAGE_TONE)
+        system += _FIRST_MESSAGE_SYSTEM.format(tone=tone)
         if user_reviewed:
             system += _REVIEWED_SYSTEM
     payload = json.dumps(fields, ensure_ascii=False)

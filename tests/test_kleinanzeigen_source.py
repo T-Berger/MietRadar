@@ -124,6 +124,19 @@ Wohnfläche: 75 m²
         self.assertTrue(room.is_commercial)
         self.assertFalse(flat.is_commercial)
 
+    def test_recipient_role_is_ad_local_and_kept_from_either_email_format(self):
+        email = EmailMessage()
+        email["From"] = SENDER
+        email.set_content(f"Ich wohne selbst in der WG.\n{ROOM}\n\n{FLAT}")
+        email.add_alternative(f'''<section><p>Kontakt: Hausverwaltung</p>
+          <article><a href="{ROOM}">WG-Zimmer</a><div>Der Vermieter kennt das Haus.</div></article>
+          <article><a href="{FLAT}">Wohnung</a><div>Ich bin die Vermieterin.</div></article>
+        </section>''', subtype="html")
+        room, flat = extract_listings(email.as_bytes(), SENDER)
+        self.assertEqual(room.recipient_role, "roommate")
+        self.assertEqual(flat.recipient_role, "manager")
+        self.assertFalse(flat.is_commercial)
+
     def test_keeps_a_move_in_month_found_only_in_the_plain_alternate(self):
         email = EmailMessage()
         email["From"] = SENDER

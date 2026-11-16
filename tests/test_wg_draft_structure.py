@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from llm_personalizer import personalise_message, revise_first_message_draft
+from llm_personalizer import application_render_signature, personalise_message, revise_first_message_draft
 
 
 INTRO = "Ich bin Alex, 31. Ich koche gern und wandere viel."
@@ -121,6 +121,43 @@ class WGDraftStructureTest(unittest.TestCase):
                                     applicant_intro="Ich bin Architekt.")
         self.assertIn("ich interessiere mich für Ihre Wohnung.", draft)
         self.assertNotIn("Name ist Architekt", draft)
+
+    def test_same_room_gets_a_different_inquiry_for_each_contact_role(self):
+        intro = "Ich bin Alex Neumann, 31. Ich arbeite als Architekt. In meiner Freizeit koche ich gern."
+        template = f"Hi {{name}},\n\n{{LLM_TEXT}}\n\n{MOVE_IN}\n\nViele Grüße\nAlex Neumann"
+        description = "Wir kochen freitags zusammen."
+        options = {
+            "provider": "none",
+            "listing_type": "wg",
+            "applicant_intro": intro,
+            "applicant_answers": {"einzug": MOVE_IN},
+        }
+        manager = personalise_message(template, description, recipient_role="manager", **options)
+        roommate = personalise_message(template, description, poster_name="Sam", recipient_role="roommate",
+                                       commercial=True, **options)
+        unknown = personalise_message(template, description, recipient_role="unknown", **options)
+        self.assertIn("Name ist Alex Neumann. Ich arbeite als Architekt.", manager)
+        self.assertIn("Ihr Zimmer", manager)
+        self.assertIn("Könnten Sie mir einen Besichtigungstermin vorschlagen?", manager)
+        self.assertTrue(roommate.startswith(f"Hi Sam,\n\n{intro}"))
+        self.assertIn("Wenn ihr zusammen kocht, wär ich gern dabei.", roommate)
+        self.assertIn(MOVE_IN, roommate)
+        self.assertIn(QUESTION, roommate)
+        self.assertTrue(unknown.startswith("Hallo,"))
+        self.assertIn("Ich interessiere mich für das Zimmer.", unknown)
+        self.assertIn("Wann wäre eine Besichtigung möglich?", unknown)
+        for short in (manager, unknown):
+            self.assertIn(MOVE_IN, short)
+            self.assertNotIn("koche", short)
+            self.assertNotIn("euch", short)
+
+    def test_render_signature_changes_with_the_contact_role(self):
+        roles = ("manager", "roommate", "unknown", None)
+        signatures = {
+            application_render_signature("Hallo", "mistral", first_message=True, recipient_role=role)
+            for role in roles
+        }
+        self.assertEqual(len(signatures), len(roles))
 
 
 if __name__ == "__main__":

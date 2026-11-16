@@ -39,6 +39,7 @@ SMALL_WORDS = {"am", "an", "auf", "für", "im", "in", "mit", "und", "von", "zu",
 WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
 RENT_LABELS = {"warm": "Warmmiete", "cold": "Kaltmiete", "total": "Gesamtmiete"}
 FIT_LABELS = {"strong": "Passt gut", "possible": "Könnte passen", "unclear": "Noch unklar"}
+RECIPIENT_LABELS = {"manager": "Verwaltung/Vermietung", "roommate": "Mitbewohner"}
 PROVIDER_FILTER_LABELS: dict[ProviderFilter, str] = {
     "all": "Alle Anbieter",
     "commercial": "Gewerbliche Anbieter",
@@ -169,7 +170,8 @@ def _map_facts(row: MapListing) -> str:
         rent = f"{rent} {rent_kind}"
     area = _format_value(row.area_sqm, "m²")
     provider = "Gewerblich" if row.is_commercial else None
-    return " · ".join(filter(None, (row.platform, provider, f"{route} {direction}", rent, area)))
+    recipient = RECIPIENT_LABELS.get(row.recipient_role)
+    return " · ".join(filter(None, (row.platform, provider, recipient, f"{route} {direction}", rent, area)))
 
 
 def _listing_map(rows: tuple[MapListing, ...]) -> None:
@@ -283,11 +285,13 @@ def _listing_card(
         sections.append(f'<p class="radar-listing__foot">{escape(note)}</p>')
     badge = f'<span class="radar-listing__badge">{escape(status)}</span>' if status else ""
     provider = '<span class="radar-listing__badge">Gewerblich</span>' if profile and profile.is_commercial else ""
+    recipient = RECIPIENT_LABELS.get(profile.recipient_role) if profile else None
+    recipient_badge = f'<span class="radar-listing__badge">{recipient}</span>' if recipient else ""
     photos = _listing_photos(profile.photo_urls) if profile else ""
     st.html(
         '<article class="radar-listing"><header>'
         f'<div class="radar-listing__meta"><span class="radar-listing__source">{escape(platform)}</span>'
-        f'{provider}{badge}</div>'
+        f'{provider}{recipient_badge}{badge}</div>'
         f'<h3>{escape(title)}</h3></header>{photos}<div class="radar-listing__facts">{facts}</div>'
         f'{"".join(sections)}<p class="radar-listing__foot">{escape(date_label)}</p></article>'
     )

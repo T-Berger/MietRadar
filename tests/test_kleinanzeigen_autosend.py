@@ -39,7 +39,8 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
             cutoff = NOW - timedelta(hours=48)
             radar.scan(db, inbox, NOW, cutoff, 10, {})
             radar.scan(db, inbox, NOW, cutoff, 10, {})
-            self.assertEqual(sender.attempts, [(newest.url, "Hi, ich bin 28."), (older.url, "Hi, ich bin 28.")])
+            self.assertEqual([url for url, _ in sender.attempts], [newest.url, older.url])
+            self.assertTrue(all("Besichtigung" in message for _, message in sender.attempts))
             self.assertEqual(db.execute("SELECT id FROM klein_review").fetchall(), [(unknown.id,)])
 
     def test_manual_astar_address_gets_rechecked_before_attempt(self):
@@ -53,11 +54,12 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
             radar.scan(db, inbox, NOW, cutoff, 10, {})
             router.classify.side_effect = [("a*", 19), ("outside", None), ("a*", 20)]
             self.assertTrue(radar.check_address(db, listing.id, "Musterstraße 12, 81667 München", NOW, cutoff)[0])
+            message = db.execute("SELECT message FROM drafts WHERE id = ?", (listing.id,)).fetchone()[0]
             inbox.recent_items.return_value = []
             radar.scan(db, inbox, NOW, cutoff, 10, {})
             self.assertEqual(sender.attempts, [])
             radar.scan(db, inbox, NOW, cutoff, 10, {})
-            self.assertEqual(sender.attempts, [(listing.url, "Hallo!")])
+            self.assertEqual(sender.attempts, [(listing.url, message)])
         self.assertEqual(router.classify.call_count, 3)
 
     def test_autosend_rechecks_known_availability_before_using_an_existing_draft(self):
@@ -71,6 +73,7 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
         sender = RecordingSender()
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             radar.scan(db, inbox, NOW, cutoff, 10, {})
+            draft = db.execute("SELECT message FROM drafts WHERE id = ?", (listing.id,)).fetchone()
             with db:
                 db.execute("DELETE FROM listing_availability")
             radar.delivery = DeliveryQueue(sender, clock=lambda: NOW)
@@ -83,7 +86,7 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
             radar.scan(db, inbox, NOW, cutoff, 10, {})
             self.assertFalse(sender.attempts)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_origins").fetchone(), (0,))
-            self.assertEqual(db.execute("SELECT message FROM drafts WHERE id = ?", (listing.id,)).fetchone(), ("Hallo!",))
+            self.assertEqual(db.execute("SELECT message FROM drafts WHERE id = ?", (listing.id,)).fetchone(), draft)
         router.classify.assert_called_once_with(listing.address, NOW)
 
 

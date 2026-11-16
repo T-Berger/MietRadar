@@ -138,6 +138,7 @@ class DashboardDataTest(unittest.TestCase):
         self.assertIsNone(data.listing_profiles["12"].latitude)
         self.assertIsNone(data.listing_profiles["12"].longitude)
         self.assertFalse(data.listing_profiles["12"].is_commercial)
+        self.assertEqual(data.listing_profiles["12"].recipient_role, "unknown")
         self.assertFalse(filter_listing_providers(data, "commercial").matches)
         self.assertIsNone(data.wg_scan)
 
@@ -398,10 +399,11 @@ class DashboardDataTest(unittest.TestCase):
                     db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', 'Hallo', 0)",
                                (listing_id, url, stamp))
                 listing = Listing(listing_id, url, "Zimmer", "", NOW, "Beispielstraße 1, 80331 München")
-                record_listing_profile(db, replace(listing, is_commercial=listing_id != "2"),
+                role = "roommate" if listing_id == "3" else "manager"
+                record_listing_profile(db, replace(listing, is_commercial=listing_id != "2", recipient_role=role),
                                        route_tier="a" if listing_id != "3" else "b",
                                        coordinates=(48.12, 11.55))
-                # A later alert without provider evidence must not erase a previously confirmed marker.
+                # An alert without provider or recipient evidence preserves confirmed markers.
                 record_listing_profile(db, listing)
 
         data = load_dashboard(self.path, now=NOW, posting_window=(NOW.date(), NOW.date()))
@@ -410,9 +412,12 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual({row.id for row in commercial.secondary_offers}, {"3"})
         self.assertEqual({row.id for row in commercial.dated_listings}, {"1", "3"})
         self.assertEqual({(row.id, row.is_commercial) for row in map_listings(commercial)}, {("1", True), ("3", True)})
+        self.assertEqual({(row.id, row.recipient_role) for row in map_listings(commercial)},
+                         {("1", "manager"), ("3", "roommate")})
         self.assertEqual({row.id for row in map_listings(commercial, date_filtered=True)}, {"1", "3"})
         other = filter_listing_providers(data, "other")
         self.assertEqual({(row.id, row.is_commercial) for row in map_listings(other)}, {("2", False)})
+        self.assertEqual(other.listing_profiles["2"].recipient_role, "manager")
 
     def test_address_change_invalidates_a_saved_map_point(self):
         with closing(_database(self.path)) as db:

@@ -17,6 +17,7 @@ from outgoing_judge import OutgoingJudgment, judge_outgoing
 from rental_availability import AVAILABILITY_POLICY_VERSION
 from reviewed_applications import ApplicationAttachment, install_application_reviews, review_is_pending
 from wg_first_message import viewing_slot_labels
+from wg_source import RecipientRole
 
 
 class DeliveryOutcome(Enum):
@@ -32,6 +33,15 @@ class Sender(Protocol):
     def send(self, url: str, text: str, before_submit: Callable[[], bool]) -> DeliveryOutcome: ...
 
 
+def application_recipient_role(
+    detected: str | None, stored: str | None = None, *, commercial: bool = False,
+) -> RecipientRole:
+    for role in (detected, stored):
+        if role == "manager" or role == "roommate":
+            return role
+    return "manager" if commercial else "unknown"
+
+
 @dataclass(frozen=True)
 class FirstMessageReview:
     listing_title: str
@@ -40,6 +50,7 @@ class FirstMessageReview:
     applicant_answers: dict[str, str]
     user_reviewed: bool = False
     commercial: bool = False
+    recipient_role: RecipientRole | None = None
 
     def slots(self, now: datetime) -> tuple[str, ...]:
         return viewing_slot_labels(self.viewing_availability, now)
@@ -49,6 +60,7 @@ class FirstMessageReview:
             message, context=context, provider=provider, first_message=True, listing_title=self.listing_title,
             applicant_intro=self.applicant_intro, viewing_slots=self.slots(now),
             applicant_answers=self.applicant_answers, user_reviewed=self.user_reviewed, commercial=self.commercial,
+            recipient_role=self.recipient_role,
         )
 
 

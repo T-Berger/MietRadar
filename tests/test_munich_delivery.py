@@ -104,7 +104,7 @@ class DeliveryTest(unittest.TestCase):
 
     def test_scanner_sends_newest_then_leaves_other_drafts_and_respects_manual_done(self):
         older, newest, done, stale, nonmatch = offer(1, 5), offer(2, 1), offer(3, 0), offer(4, 25), offer(5, 2)
-        newest = replace(newest, title="WG-Zimmer mit Balkon", is_wg=True)
+        newest = replace(newest, title="WG-Zimmer mit Balkon", is_wg=True, recipient_role="roommate")
         self.draft(done, done=1)
         by_id = {item.id: item for item in (older, newest, done, stale, nonmatch)}
         source, router = Mock(), Mock()

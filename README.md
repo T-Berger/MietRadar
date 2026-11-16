@@ -65,7 +65,7 @@ Unter **Angebote** kannst du das letzte Wochenende oder eigene Kalendertage in M
 
 Der Tab **Karte** zeigt die Angebote der Stufen A* bis C für denselben Zeitraum. Wähle einen Punkt für die Fahrzeit, die verfügbaren Miet- und Flächenangaben und den Link zum Inserat. Ein Angebot erscheint auf der Karte, sobald der Suchlauf einen geprüften Standort gespeichert hat. Die Karte nutzt [OpenStreetMap](https://www.openstreetmap.org/copyright).
 
-Über **Anbietertyp** kannst du gewerbliche Angebote filtern. MietRadar verwendet dafür das Firmenprofil bei WG-Gesucht oder eine ausdrückliche Anbieterkennzeichnung im Kleinanzeigen-Suchalarm. Bei gewerblichen Angeboten formuliert MietRadar die Anfrage in der Sie-Form und verwendet nur die hinterlegten Angaben, die zur Mietanfrage passen.
+Über **Anbietertyp** kannst du gewerbliche Angebote filtern. MietRadar verwendet dafür das Firmenprofil bei WG-Gesucht oder eine ausdrückliche Anbieterkennzeichnung im Kleinanzeigen-Suchalarm. Die Ansprache richtet sich nach der Kontaktrolle. Eine Verwaltung oder private Vermietung bekommt eine kurze Anfrage in der Sie-Form. Künftige Mitbewohner bekommen eine persönliche WG-Nachricht. Bleibt die Rolle unklar, formuliert MietRadar neutral.
 
 Lokal: Installiere die Abhängigkeiten mit `pip install -r requirements-dashboard.txt` und hinterlege ein eigenes langes Passwort als `MUNICH_DASHBOARD_PASSWORD` in deiner privaten `config/.env`. Starte den Worker und öffne das Dashboard in einem zweiten Terminal:
 

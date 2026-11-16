@@ -68,14 +68,14 @@ class ReviewedDeliveryRelayTest(unittest.TestCase):
             result = self.relay.dispatch("/v1/prepare", {**job, "listing": self.public_listing()})
         return result, judge
 
-    def test_new_and_legacy_mac_workers_use_the_commercial_judge_for_known_companies(self):
+    def test_legacy_mac_worker_uses_stored_role_for_known_private_management(self):
         self.draft()
         with self.db:
-            self.db.execute("INSERT INTO listing_profiles (id, title, is_commercial) VALUES (?, ?, 1)",
+            self.db.execute("INSERT INTO listing_profiles (id, title, recipient_role) VALUES (?, ?, 'manager')",
                             (self.listing.id, self.listing.title))
         prepared, judge = self.prepare(self.job())
         self.assertTrue(prepared["ready"])
-        self.assertIs(judge.call_args.kwargs["commercial"], True)
+        self.assertEqual(judge.call_args.kwargs["recipient_role"], "manager")
 
     def test_authentication_and_next_never_return_unapproved_message_text(self):
         self.draft(approve=False)
