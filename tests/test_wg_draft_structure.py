@@ -59,8 +59,9 @@ class WGDraftStructureTest(unittest.TestCase):
         )
         self.assertIn(intro, message)
         self.assertEqual(message.count("koche ich gern"), 1)
-        self.assertIn("Da wär ich gern dabei.", message)
-        self.assertIn("Balkon", message)
+        self.assertIn("Wenn ihr zusammen kocht, wär ich gern dabei.", message)
+        self.assertNotIn("Balkon", message)
+        self.assertEqual(revise_first_message_draft(message, intro, listing_title="Zimmer mit Balkon"), message)
 
     def test_does_not_claim_an_affinity_for_an_activity_the_profile_does_not_share(self):
         intro = "Ich bin Alex. Ich koche nicht gern."
@@ -70,7 +71,18 @@ class WGDraftStructureTest(unittest.TestCase):
             listing_type="wg",
         )
         self.assertIn("zusammen kocht", message)
-        self.assertNotIn("Da wär ich gern dabei.", message)
+        self.assertNotIn("wär ich gern dabei.", message)
+
+    def test_offline_repair_removes_advertiser_copy_and_keeps_the_first_person_reply(self):
+        reaction = "Die Idee, mal zusammen zu kochen, gefällt mir."
+        previous = (
+            f"Hi zusammen,\n\n{INTRO}\n\n{MOVE_IN} "
+            "Ihr könnt zusammen kochen und im Innenhof sitzen.\n\n"
+            "Das Zimmer ist möbliert und verfügt über ein Regal und einen Tisch.\n\n"
+            f"{reaction}\n\n{QUESTION}\n\nViele Grüße\nAlex"
+        )
+        result = revise_first_message_draft(previous, INTRO, listing_title="Zimmer mit Balkon")
+        self.assertEqual(result, f"Hi zusammen,\n\n{INTRO}\n\n{MOVE_IN}\n\n{reaction}\n\n{QUESTION}\n\nViele Grüße\nAlex")
 
 
 if __name__ == "__main__":

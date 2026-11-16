@@ -101,7 +101,7 @@ class MistralProviderTest(unittest.TestCase):
     @patch.object(llm_personalizer, "urlopen")
     def test_first_message_uses_only_grounded_details_and_private_local_answers(self, open_url):
         ad = "Wir kochen freitags zusammen. Wann kannst du einziehen?"
-        paragraph = "Euer gemeinsames Kochen am Freitag klingt gut."
+        paragraph = "Dass ihr freitags zusammen kocht, find ich schön."
         open_url.return_value = response(json.dumps({
             "detail": {"text": paragraph, "evidence": "Wir kochen freitags zusammen."},
             "questions": {"einzug": "Wann kannst du einziehen?", "haustiere": "Bringst du Haustiere mit?"},
@@ -187,7 +187,7 @@ class MistralProviderTest(unittest.TestCase):
         message = llm_personalizer.personalise_message(
             template, f"{transit} Wir spielen manchmal Brettspiele.", provider="mistral", first_message=True,
         )
-        self.assertIn("Dass ihr Brettspiele spielt, klingt gut.", message)
+        self.assertIn("Dass ihr Brettspiele spielt, find ich sympathisch.", message)
         self.assertNotIn("Tram", message)
         generic_listing = llm_personalizer.personalise_message(
             template, transit, provider="mistral", first_message=True,
@@ -236,7 +236,7 @@ class MistralProviderTest(unittest.TestCase):
             listing_type="wg", provider="none", first_message=True,
         )
         self.assertIn("Dass ihr zusammen kocht, find ich schön.", message)
-        self.assertIn("Der Balkon gefällt mir.", message)
+        self.assertNotIn("Balkon", message)
         message = llm_personalizer.personalise_message(
             template, "Wir kochen nicht zusammen. Das Zimmer hat einen Balkon.",
             listing_type="wg", provider="none", first_message=True,
@@ -246,19 +246,38 @@ class MistralProviderTest(unittest.TestCase):
 
     @patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=True)
     @patch.object(llm_personalizer, "urlopen")
-    def test_wg_ad_details_cover_household_and_room_separately(self, open_url):
+    def test_wg_uses_one_applicant_reaction_when_the_model_returns_both_details(self, open_url):
         household = "Wir frühstücken sonntags zusammen."
         room = "Das Zimmer hat einen großen Balkon."
         open_url.return_value = response(json.dumps({
-            "household": {"text": "Euer Frühstück am Sonntag klingt gut.", "evidence": household},
+            "household": {"text": "Dass ihr sonntags zusammen frühstückt, find ich schön.", "evidence": household},
             "room": {"text": "Auch der große Balkon gefällt mir.", "evidence": room},
             "questions": {},
         }))
-        ad, _ = llm_personalizer._first_message_details(f"{household}\n{room}", "Zimmer zu vermieten", "wg", "mistral")
+        message = llm_personalizer.personalise_message(
+            "Hi zusammen,\n\nIch bin Lea.\n\n{LLM_TEXT}", f"{household}\n{room}",
+            provider="mistral", first_message=True, listing_type="wg",
+        )
+        self.assertIn("Dass ihr sonntags zusammen frühstückt, find ich schön.", message)
+        self.assertNotIn("Balkon", message)
 
-        self.assertEqual(ad.household, "Euer Frühstück am Sonntag klingt gut.")
-        self.assertEqual(ad.room, "Auch der große Balkon gefällt mir.")
-        self.assertIsNone(ad.shared_topic)
+    @patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=True)
+    @patch.object(llm_personalizer, "urlopen")
+    def test_grounded_advertiser_voice_or_inventory_cannot_enter_a_draft(self, open_url):
+        invitation = "Bei uns könnt ihr gemeinsam kochen und den Speiseplan mitbestimmen."
+        inventory = "Das Zimmer ist frisch gestrichen und verfügt über Bett, Tisch und Regal."
+        open_url.return_value = response(json.dumps({
+            "household": {"text": "Ihr könnt gemeinsam kochen und den Speiseplan mitbestimmen.", "evidence": invitation},
+            "room": {"text": inventory, "evidence": inventory},
+            "questions": {},
+        }))
+        message = llm_personalizer.personalise_message(
+            "Hi zusammen,\n\nIch bin Lea.\n\n{LLM_TEXT}", f"{invitation}\n{inventory}",
+            provider="mistral", first_message=True, listing_type="wg",
+        )
+        self.assertIn("Ich hätte Lust, ab und zu mit euch zu kochen.", message)
+        self.assertNotIn("Speiseplan", message)
+        self.assertNotIn("Regal", message)
 
     @patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=True)
     @patch.object(llm_personalizer, "urlopen")
