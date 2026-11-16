@@ -92,6 +92,27 @@ class Scanner:
     klein_delivery: DeliveryQueue | None = None
     outgoing_provider: str = "none"
     render_signature: str | None = None
+    applicant_intro: str = ""
+
+    def add_intro_to_current_drafts(self, db: sqlite3.Connection, now: datetime) -> int:
+        """Repair introductions when the listing source cannot be rechecked."""
+        if not self.applicant_intro:
+            return 0
+        drafts = db.execute("""
+            SELECT d.id, d.url, d.fresh_at, d.basis, d.message FROM drafts d
+            WHERE d.done = 0 AND d.fresh_at BETWEEN ? AND ? AND instr(d.message, ?) = 0
+              AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
+              AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id)
+            ORDER BY d.fresh_at DESC LIMIT ?
+        """, ((now - self.max_age).timestamp(), now.timestamp(), self.applicant_intro, self.limit)).fetchall()
+        updated = 0
+        for listing_id, url, stamp, basis, previous in drafts:
+            with db:
+                updated += save_application_draft(
+                    db, listing_id, url, stamp, basis, with_applicant_intro(previous, self.applicant_intro),
+                    context="", provider=self.outgoing_provider, now=now, previous_message=previous,
+                )
+        return updated
 
     def scan(self, db: sqlite3.Connection, now: datetime, retry_after: dict[str, datetime]) -> Counter:
         cutoff = now - self.max_age
@@ -358,6 +379,7 @@ def _scanner(max_age: timedelta) -> Scanner:
         _number("MUNICH_APPLICANT_AGE", 28, 18, 100), _number("MUNICH_MAX_AGE_GAP", 7, 0, 100),
         klein_alerts=klein_alerts, outgoing_provider=_outgoing_provider(),
         render_signature=application_render_signature(template, provider),
+        applicant_intro=os.getenv("MUNICH_APPLICANT_INTRO", "").strip(),
     )
 
 
@@ -557,6 +579,9 @@ def _poll(
             LOG.warning("Scan pausiert: %s", exc)
             failed = True
             delay = min(max(600, delay * 2), 3600)
+            updated = scanner.add_intro_to_current_drafts(db, datetime.now(timezone.utc))
+            if updated:
+                counts["Entwürfe mit Vorstellung ergänzt"] += updated
         now = datetime.now(timezone.utc)
         klein_paused = scanner.klein_delivery is not None and scanner.klein_delivery.paused
         if reply_inbox:

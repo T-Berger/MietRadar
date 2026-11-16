@@ -217,6 +217,26 @@ class ScannerTest(unittest.TestCase):
         source.details.assert_called_once()
         delivery.deliver.assert_not_called()
 
+    def test_offline_intro_repair_updates_only_current_unsent_drafts(self):
+        now = NOW.timestamp()
+        intro = "Ich bin Sam und arbeite als Architekt."
+        scanner = Scanner(Mock(), Mock(), "Hi!", "none", timedelta(hours=24), 12, applicant_intro=intro)
+        url = offer(1, 1).url
+        plain = "Hi zusammen,\n\nWann kann ich vorbeikommen?"
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                db.executemany("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', ?, ?)", [
+                    ("current", url, now, plain, 0), ("done", url, now, plain, 1),
+                    ("expired", url, now - 25 * 3600, plain, 0), ("sending", url, now, plain, 0),
+                ])
+                db.execute("INSERT INTO delivery VALUES ('sending', 'unconfirmed', ?, ?)", (now, now))
+            self.assertEqual(scanner.add_intro_to_current_drafts(db, NOW), 1)
+            self.assertEqual(scanner.add_intro_to_current_drafts(db, NOW), 0)
+            messages = dict(db.execute("SELECT id, message FROM drafts"))
+            self.assertEqual(messages["current"], f"Hi zusammen,\n\n{intro}\n\nWann kann ich vorbeikommen?")
+            self.assertTrue(all(messages[key] == plain for key in ("done", "expired", "sending")))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM draft_render_signatures").fetchone(), (0,))
+
 
 class AlertParsingTest(unittest.TestCase):
     def test_extracts_only_canonical_listing_links_from_configured_sender(self):
