@@ -1,4 +1,4 @@
-"""Save Kleinanzeigen activity and optionally email it to the MietRadar user."""
+"""Save listing matches and Kleinanzeigen activity and optionally email them."""
 
 from __future__ import annotations
 
@@ -68,13 +68,16 @@ def record_activity(db: sqlite3.Connection, now: datetime, sending_paused: bool 
             FROM klein_reply_drafts WHERE attempted_at BETWEEN ? AND ? AND state IN ('sent', 'unconfirmed')
         """, (cutoff, now.timestamp()))
         db.execute("""INSERT OR IGNORE INTO klein_activity (id, kind, listing_id, url, subject, summary, occurred_at)
-            SELECT 'match:' || d.id, 'match', d.id, d.url, 'Neuer Kleinanzeigen-Treffer',
-                   'Die ÖPNV-Verbindung passt. Ein deutscher Bewerbungsentwurf liegt bereit.', d.fresh_at
+            SELECT 'match:' || d.id, 'match', d.id, d.url,
+                   CASE WHEN d.id GLOB 'ka-*' THEN 'Neuer Kleinanzeigen-Treffer' ELSE 'Neuer WG-Gesucht-Treffer' END,
+                   CASE WHEN s.state = 'sent' THEN 'Die ÖPNV-Verbindung passt. Die Bewerbung wurde bereits gesendet.'
+                        ELSE 'Die ÖPNV-Verbindung passt. Ein deutscher Bewerbungsentwurf liegt bereit.' END, ?
             FROM drafts d LEFT JOIN delivery s ON s.id = d.id
-            WHERE d.id GLOB 'ka-*' AND d.fresh_at BETWEEN ? AND ?
-              AND d.done = 0 AND d.message IS NOT NULL AND s.id IS NULL
+            WHERE d.fresh_at BETWEEN ? AND ?
+              AND ((d.done = 0 AND d.message IS NOT NULL AND s.id IS NULL) OR s.state = 'sent')
               AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = d.id)
-        """, (cutoff, now.timestamp()))
+              AND NOT EXISTS (SELECT 1 FROM listing_availability a WHERE a.id = d.id AND a.reason IS NOT NULL)
+        """, (now.timestamp(), cutoff, now.timestamp()))
         db.execute("""INSERT OR IGNORE INTO klein_activity (id, kind, listing_id, url, subject, summary, occurred_at)
             SELECT 'delivery:' || s.state || ':' || s.id, 'delivery', s.id, d.url,
                 CASE s.state WHEN 'sent' THEN 'Kleinanzeigen-Bewerbung gesendet'

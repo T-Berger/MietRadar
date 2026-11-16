@@ -708,14 +708,14 @@ def _replies(rows: tuple[Reply, ...], *, wg_enabled: bool, wg_status: tuple[floa
 def _activity(rows) -> None:
     st.subheader("Verlauf", anchor=False)
     if not rows:
-        st.info("Noch keine Kleinanzeigen-Aktivität.")
+        st.info("Noch keine Aktivität.")
         return
     for row in rows:
         with st.container(border=True):
             st.text(row.subject)
-            st.caption(f"{row.listing_id or 'Kleinanzeigen'} · {_date(row.occurred_at)}")
+            st.caption(f"{row.listing_id or 'MietRadar'} · {_date(row.occurred_at)}")
             st.text(row.summary)
-            _location_link(row.url, "Auf Kleinanzeigen öffnen")
+            _location_link(row.url, "Auf der Plattform öffnen")
 
 
 def main() -> None:
