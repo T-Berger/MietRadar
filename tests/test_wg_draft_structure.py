@@ -1,4 +1,6 @@
+import json
 import unittest
+from unittest.mock import patch
 
 from llm_personalizer import personalise_message, revise_first_message_draft
 
@@ -79,10 +81,25 @@ class WGDraftStructureTest(unittest.TestCase):
             f"Hi zusammen,\n\n{INTRO}\n\n{MOVE_IN} "
             "Ihr könnt zusammen kochen und im Innenhof sitzen.\n\n"
             "Das Zimmer ist möbliert und verfügt über ein Regal und einen Tisch.\n\n"
+            "Die effiziente Nutzung des Raums beeindruckt mich.\n\n"
             f"{reaction}\n\n{QUESTION}\n\nViele Grüße\nAlex"
         )
         result = revise_first_message_draft(previous, INTRO, listing_title="Zimmer mit Balkon")
         self.assertEqual(result, f"Hi zusammen,\n\n{INTRO}\n\n{MOVE_IN}\n\n{reaction}\n\n{QUESTION}\n\nViele Grüße\nAlex")
+
+    def test_wg_model_can_omit_room_flattery_even_if_the_ad_has_an_amenity(self):
+        template = f"Hi zusammen,\n\n{INTRO}\n\n{{LLM_TEXT}}\n\nViele Grüße\nAlex"
+        evidence = "Die Raumaufteilung ist kompakt."
+        forced_praise = "Ich finde, dass die Raumaufteilung jeden einzelnen Quadratzentimeter gut nutzt."
+        for room in (None, {"text": forced_praise, "evidence": evidence}):
+            with self.subTest(room=room), patch("llm_personalizer._generate_text", return_value=json.dumps({
+                "household": None, "room": room, "questions": {},
+            })):
+                message = personalise_message(
+                    template, evidence, provider="mistral", first_message=True,
+                    listing_type="wg", listing_title="Zimmer mit Balkon",
+                )
+                self.assertEqual(message, f"Hi zusammen,\n\n{INTRO}\n\n{QUESTION}\n\nViele Grüße\nAlex")
 
 
 if __name__ == "__main__":

@@ -128,9 +128,11 @@ class Scanner:
         updated = 0
         viewing_slots = viewing_slot_labels(self.viewing_availability, now)
         for listing_id, url, stamp, basis, previous, title in drafts:
+            listing_type = "wg" if "/wg-zimmer-" in url else "wohnung"
+            # Leave the optional reference empty when a WG draft uses model personalization.
+            repair_title = "" if listing_type == "wg" and self.provider != "none" else title
             revised = revise_first_message_draft(
-                previous, self.applicant_intro, listing_title=title,
-                listing_type="wg" if "/wg-zimmer-" in url else "wohnung",
+                previous, self.applicant_intro, listing_title=repair_title, listing_type=listing_type,
                 viewing_slots=viewing_slots, template=self.template,
             )
             if revised == previous:

@@ -144,6 +144,18 @@ class OutgoingJudgeTest(unittest.TestCase):
         self.assertIn("reine Ausstattungslisten", system)
         self.assertIn("Nacherzählungen ohne persönliche Reaktion", system)
 
+    def test_first_message_model_can_hold_forced_praise_in_a_reviewed_draft(self):
+        with patch("outgoing_judge._generate_via_mistral",
+                   return_value='{"approved":false,"reason":"ton"}') as complete:
+            verdict = judge_outgoing(
+                "Hallo zusammen,\n\nIch bin Mika. Die ideale Küche begeistert mich, weil mir Komfort so wichtig ist. "
+                "Wann könnte ich vorbeikommen?",
+                first_message=True, user_reviewed=True, provider="mistral", context="Die Küche ist neu.",
+            )
+        self.assertFalse(verdict.approved)
+        self.assertIn("aufgesetzt", verdict.reason)
+        self.assertIn("Ein Bezug ist freiwillig", complete.call_args.args[0])
+
     def test_first_message_model_gets_listing_and_only_confirmed_answers_used(self):
         draft = (
             "Hi, ich bin Alex, 29, und arbeite als Webentwickler.\n\n"
