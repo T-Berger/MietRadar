@@ -292,7 +292,7 @@ class MistralProviderTest(unittest.TestCase):
 
         self.assertIsNone(context.shared_topic)
         self.assertFalse(context.household)
-        self.assertEqual(context.room, "Der Balkon gefällt mir.")
+        self.assertFalse(context.room)
 
     def test_offline_revision_keeps_the_draft_and_adds_only_a_verified_title_fact(self):
         draft = "Hi zusammen,\n\nIch kann ab 1. Dezember einziehen.\n\nLiebe Grüße\nLea"
