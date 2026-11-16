@@ -21,14 +21,14 @@ from dotenv import load_dotenv
 from kleinanzeigen_activity import EmailNotifier, install_activity, record_activity, record_replies
 from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
-from listing_profiles import ROUTE_FIT, install_listing_profiles, record_listing_profile
+from listing_profiles import ROUTE_FIT, install_listing_profiles, record_listing_profile, record_listing_route
 from llm_personalizer import (
     applicant_intro_from_template, application_render_signature, personalise_message,
     revise_first_message_draft, with_applicant_intro,
 )
 from munich_delivery import DeliveryQueue, FirstMessageReview, install_schema, save_application_draft
 from munich_tiers import remove_secondary_offer, save_secondary_offer, secondary_freshness
-from munich_transit import TransitRouter
+from munich_transit import PRIMARY_TIERS, TransitRouter
 from reviewed_applications import (
     fail_application_review, get_application_attachment, pending_application_reviews, set_application_wait_reason,
 )
@@ -195,7 +195,7 @@ class Scanner:
             if refused:
                 fail_application_review(db, item, "Die Anzeige entspricht inzwischen nicht mehr deinen Suchfiltern.", now)
                 continue
-            tier, _ = self.router.classify(listing.address, now) if listing.address else (None, None)
+            tier, minutes = self.router.classify(listing.address, now) if listing.address else (None, None)
             if tier is None:
                 set_application_wait_reason(
                     db, item, "Die ÖPNV-Fahrzeit konnte gerade nicht bestätigt werden. MietRadar prüft sie erneut.",
@@ -203,9 +203,11 @@ class Scanner:
                 retry_after[item.id] = retry_at
                 counts["Freigaben warten auf ÖPNV-Prüfung"] += 1
                 continue
-            if tier != "a":
+            if tier not in PRIMARY_TIERS:
                 fail_application_review(db, item, "Die Fahrt dauert inzwischen länger als 30 Minuten.", now)
                 continue
+            with db:
+                record_listing_route(db, item.id, tier, minutes)
             attachment = get_application_attachment(db, item.attachment_digest) if item.attachment_digest else None
             if item.attachment_digest and attachment is None:
                 fail_application_review(db, item, "Der freigegebene Anhang steht nicht mehr zur Verfügung.", now)
@@ -289,25 +291,32 @@ class Scanner:
             """, (cutoff.timestamp(), now.timestamp(), wg_signature, refresh_limit)).fetchall()
             refresh_refs = [(ref, None) for url, in older_drafts if (ref := ListingRef.from_url(url))]
 
-        photo_backfill = db.execute("""
-            SELECT f.url FROM (
-                SELECT id, url, fresh_at FROM drafts WHERE done = 0 AND message IS NOT NULL
+        metadata_backfill = db.execute("""
+            SELECT f.url, p.photo_urls IS NULL, MAX(f.check_route) AND p.route_tier IS NULL FROM (
+                SELECT id, url, fresh_at,
+                       NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id) AS check_route
+                FROM drafts d WHERE done = 0 AND message IS NOT NULL
                 UNION ALL
-                SELECT id, url, fresh_at FROM munich_secondary_offers
+                SELECT id, url, fresh_at, 0 FROM munich_secondary_offers
             ) f LEFT JOIN listing_profiles p ON p.id = f.id
-            WHERE f.id NOT LIKE 'ka-%' AND p.photo_urls IS NULL AND f.fresh_at BETWEEN ? AND ?
-            GROUP BY f.id ORDER BY MAX(f.fresh_at) DESC LIMIT ?
+            WHERE f.id NOT LIKE 'ka-%' AND f.fresh_at BETWEEN ? AND ?
+              AND (p.photo_urls IS NULL OR (f.check_route AND p.route_tier IS NULL))
+            GROUP BY f.id ORDER BY p.photo_urls IS NOT NULL, MAX(f.fresh_at) DESC LIMIT ?
         """, (cutoff.timestamp(), now.timestamp(), (self.limit + 1) // 2)).fetchall()
-        photo_refs = [ref for url, in photo_backfill if (ref := ListingRef.from_url(url))]
-        photo_ids = {ref.id for ref in photo_refs}
+        metadata_refs = [(ref, photos, route) for url, photos, route in metadata_backfill
+                         if (ref := ListingRef.from_url(url))]
+        photo_ids = {ref.id for ref, photos, _ in metadata_refs if photos}
+        route_ids = {ref.id for ref, _, route in metadata_refs if route}
+        metadata_ids = photo_ids | route_ids
         original_ids = {ref.id for ref, _ in refs}
         refresh_ids = {ref.id for ref, _ in refresh_refs}
         queued_ids = original_ids.copy()
-        for ref in [ref for ref, _ in refresh_refs] + photo_refs:
+        for ref in [ref for ref, _ in refresh_refs] + [ref for ref, _, _ in metadata_refs]:
             if ref.id not in queued_ids:
                 refs.append((ref, None))
                 queued_ids.add(ref.id)
-        refs.sort(key=lambda row: (row[0].id not in refresh_ids, row[0].id not in photo_ids))
+        refs.sort(key=lambda row: (row[0].id not in refresh_ids, row[0].id not in photo_ids,
+                                   row[0].id not in original_ids))
 
         eligible = []
         detail_reads = 0
@@ -323,7 +332,7 @@ class Scanner:
             refresh_draft = bool(draft and not draft[6] and wg_signature and draft[5] != wg_signature)
             skip_draft = bool(draft and (not draft[1] or draft[2] or draft[3] or draft[6] or
                                        (not refresh_draft and (not self.delivery or self.delivery.paused))))
-            if skip_draft and ref.id not in photo_ids:
+            if skip_draft and ref.id not in metadata_ids:
                 continue
             if detail_reads >= self.limit:
                 break
@@ -340,11 +349,15 @@ class Scanner:
                 retry_after[ref.id] = now + self.max_age
                 continue
             record_listing_profile(db, listing)
-            if ref.id in photo_ids:
-                if listing.photo_urls:
-                    counts["Inserate mit Fotos ergänzt"] += 1
-                if skip_draft or (ref.id not in original_ids and not refresh_draft):
-                    continue
+            if ref.id in photo_ids and listing.photo_urls:
+                counts["Inserate mit Fotos ergänzt"] += 1
+            if ref.id in metadata_ids and (skip_draft or (ref.id not in original_ids and not refresh_draft)):
+                if ref.id in route_ids and listing.address:
+                    tier, minutes = self.router.classify(listing.address, now)
+                    if tier in PRIMARY_TIERS:
+                        with db:
+                            record_listing_route(db, listing.id, tier, minutes)
+                continue
 
             published_at = listing.published_at
             published_day = listing.published_day
@@ -414,14 +427,15 @@ class Scanner:
             tier, minutes = self.router.classify(listing.address, now)
             fit, fit_reason = ROUTE_FIT.get(tier, ("unclear", "Die ÖPNV-Verbindung konnte nicht geprüft werden."))
             record_listing_profile(db, listing, fit=fit, reason=fit_reason,
-                                   provider=self.provider if tier in {"a", "b", "c"} else "none")
+                                   provider=self.provider if tier in PRIMARY_TIERS or tier in {"b", "c"} else "none",
+                                   route_tier=tier, route_minutes=minutes)
             if tier in {"b", "c"} and minutes is not None:
                 with db:
                     save_secondary_offer(db, listing.id, listing.url, listing.title, fresh_at, basis,
                                          tier, "Ostbahnhof" if tier == "b" else "Hbf", minutes)
                 counts[f"{tier.upper()}-Tier-Treffer"] += 1
                 continue
-            if tier != "a":
+            if tier not in PRIMARY_TIERS:
                 if tier == "outside":
                     with db:
                         remove_secondary_offer(db, listing.id)

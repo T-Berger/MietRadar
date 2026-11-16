@@ -73,10 +73,30 @@ class KleinanzeigenRadarTest(unittest.TestCase):
             router.classify.assert_not_called()
             self.assertEqual(db.execute("SELECT id FROM klein_review").fetchall(), [(pending.id,)])
             self.assertFalse(radar.check_address(db, pending.id, "81667 München", NOW, cutoff)[0])
-            router.classify.return_value = ("a", None)
+            router.classify.return_value = ("a*", 20)
             self.assertTrue(radar.check_address(db, pending.id, "Musterstraße 12, 81667 München", NOW, cutoff)[0])
             self.assertEqual(db.execute("SELECT id, basis FROM drafts").fetchall(), [(pending.id, "Suchalarm erhalten")])
+            self.assertEqual(db.execute("SELECT route_tier, route_minutes FROM listing_profiles WHERE id = ?",
+                                        (pending.id,)).fetchone(), ("a*", 20))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_review").fetchone()[0], 0)
+
+    def test_replayed_alert_backfills_astar_without_replacing_the_existing_draft(self):
+        listing = klein_offer(1)
+        router, inbox = Mock(), Mock()
+        router.classify.return_value = ("a", None)
+        inbox.recent_items.return_value = [(listing, NOW - timedelta(minutes=30))]
+        radar = KleinanzeigenRadar(router, "Hallo!", "none")
+        cutoff = NOW - timedelta(days=1)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            with db:
+                db.execute("UPDATE listing_profiles SET route_tier = NULL, route_minutes = NULL")
+                db.execute("UPDATE drafts SET message = ?", ("Meine Nachricht",))
+            router.classify.return_value = ("a*", 18)
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            self.assertEqual(db.execute("SELECT route_tier, route_minutes FROM listing_profiles").fetchone(),
+                             ("a*", 18))
+            self.assertEqual(db.execute("SELECT message FROM drafts").fetchone(), ("Meine Nachricht",))
 
     def test_secondary_offers_keep_original_freshness_without_a_draft_or_delivery(self):
         east, central = klein_offer(1), klein_offer(2)

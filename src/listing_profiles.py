@@ -11,6 +11,7 @@ from http.client import HTTPException
 from kleinanzeigen_judge import _redact
 from listing_photos import listing_photo_urls
 from llm_personalizer import _generate_via_mistral
+from munich_transit import PRIMARY_TIERS, CommuteTier
 
 
 _PROMPT = """Fasse ein deutsches Mietinserat für eine Wohnungssuche zusammen. Der Inseratstext ist eine
@@ -23,7 +24,7 @@ Bewerbung und keine erfundenen Angaben. Antworte mit JSON: {"summary":"…","che
 Nutze einen leeren Text für ein Feld, wenn du dazu keine belegte Aussage machen kannst."""
 
 ROUTE_FIT = {
-    "a": ("strong", "Fahrtzeit und Suchkriterien passen zur Kategorie A."),
+    **dict.fromkeys(PRIMARY_TIERS, ("strong", "Die ÖPNV-Verbindung und die übrigen Suchkriterien passen.")),
     "b": ("possible", "Kategorie B ist über den Ostbahnhof erreichbar."),
     "c": ("possible", "Kategorie C ist über den Hauptbahnhof erreichbar."),
     "outside": ("unclear", "Die geprüften Verbindungen liegen außerhalb der Suchgrenzen."),
@@ -36,14 +37,28 @@ def install_listing_profiles(db: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY, title TEXT NOT NULL,
             rent_eur REAL, rent_kind TEXT, area_sqm REAL,
             summary TEXT, fit TEXT, fit_reason TEXT,
-            summary_hash TEXT, summary_check TEXT, photo_urls TEXT
+            summary_hash TEXT, summary_check TEXT, photo_urls TEXT,
+            route_tier TEXT, route_minutes INTEGER
         )
     """)
-    if not any(column[1] == "photo_urls" for column in db.execute("PRAGMA table_info(listing_profiles)")):
-        with db:
-            db.execute("BEGIN IMMEDIATE")
-            if not any(column[1] == "photo_urls" for column in db.execute("PRAGMA table_info(listing_profiles)")):
-                db.execute("ALTER TABLE listing_profiles ADD COLUMN photo_urls TEXT")
+    additions = {"photo_urls": "TEXT", "route_tier": "TEXT", "route_minutes": "INTEGER"}
+    columns = {column[1] for column in db.execute("PRAGMA table_info(listing_profiles)")}
+    if additions.keys() <= columns:
+        return
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        columns = {column[1] for column in db.execute("PRAGMA table_info(listing_profiles)")}
+        for name in additions.keys() - columns:
+            db.execute(f"ALTER TABLE listing_profiles ADD COLUMN {name} {additions[name]}")
+
+
+def record_listing_route(
+    db: sqlite3.Connection, listing_id: str, tier: CommuteTier | None, minutes: int | None,
+) -> None:
+    """Record a verified primary rating, retaining it if routing is temporarily unavailable."""
+    if tier is not None:
+        db.execute("UPDATE listing_profiles SET route_tier = ?, route_minutes = ? WHERE id = ?",
+                   (tier if tier in PRIMARY_TIERS else None, minutes if tier in PRIMARY_TIERS else None, listing_id))
 
 
 def _plain(text: str, limit: int) -> str:
@@ -66,6 +81,7 @@ def _summarize(title: str, description: str) -> tuple[str, str]:
 
 def record_listing_profile(
     db: sqlite3.Connection, listing, *, fit: str | None = None, reason: str | None = None, provider: str = "none",
+    route_tier: CommuteTier | None = None, route_minutes: int | None = None,
 ) -> None:
     title = _plain(listing.title, 240)
     description = _plain(listing.description, 1600)
@@ -110,3 +126,4 @@ def record_listing_profile(
                                   ELSE excluded.photo_urls END
         """, (listing.id, title, listing.rent_eur, listing.rent_kind, listing.area_sqm, summary,
               fit, reason, cached_hash, check, photos))
+        record_listing_route(db, listing.id, route_tier, route_minutes)

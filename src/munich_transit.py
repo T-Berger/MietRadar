@@ -22,8 +22,11 @@ OSTBAHNHOF = "48.12806,11.60365"
 STATIONS = (HAUPTBAHNHOF, OSTBAHNHOF)
 USER_AGENT = "MietRadar/1.0 (+https://github.com/T-Berger/MietRadar)"
 MUNICH_TIME = ZoneInfo("Europe/Berlin")
+PRIORITY_DURATION_SECONDS = 20 * 60
 MAX_DURATION_SECONDS = 30 * 60
 SECONDARY_DURATION_SECONDS = 45 * 60
+PRIMARY_TIERS = frozenset({"a*", "a"})
+CommuteTier = Literal["a*", "a", "b", "c", "outside"]
 MAX_REQUESTS_PER_DAY = 300
 _DAY = 24 * 60 * 60
 _CITY_NAMES = {"münchen", "muenchen", "munich"}
@@ -165,19 +168,27 @@ class TransitRouter:
             incomplete |= result is None
         return None if incomplete else False
 
-    def classify(self, origin: str, now: datetime) -> tuple[Literal["a", "b", "c", "outside"] | None, int | None]:
-        """Classify the commute. B and C measure from the station to the listing."""
+    def classify(self, origin: str, now: datetime) -> tuple[CommuteTier | None, int | None]:
+        """Classify the commute. A* and B/C measure from the station to the listing."""
         coordinates = self._coordinates(origin)
         if not coordinates:
             return None, None
         departure = _next_weekday_departure(now)
+        # Reuse these results for B and C when there is no 20-minute connection.
+        inbound = {
+            station: self._routes_between(station, coordinates, departure, SECONDARY_DURATION_SECONDS)
+            for station in STATIONS
+        }
+        fastest_inbound = min(routes.fastest_seconds for routes in inbound.values())
+        if fastest_inbound <= PRIORITY_DURATION_SECONDS:
+            return "a*", math.ceil(fastest_inbound / 60)
         primary = self._qualifies(coordinates, departure)
         if primary is True:
             return "a", None
         if primary is None:
             return None, None
         for station, tier in ((OSTBAHNHOF, "b"), (HAUPTBAHNHOF, "c")):
-            routes = self._routes_between(station, coordinates, departure, SECONDARY_DURATION_SECONDS)
+            routes = inbound[station]
             result = routes.within(SECONDARY_DURATION_SECONDS)
             if result is None:
                 return None, None

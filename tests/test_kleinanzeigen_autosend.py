@@ -24,7 +24,13 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
             (newest, NOW - timedelta(minutes=5)), (unknown, NOW - timedelta(minutes=4)),
             (no_route, NOW - timedelta(minutes=2)),
         ]
-        router.classify.side_effect = lambda address, now: ("outside", None) if address == no_route.address else ("a", None)
+        routes = {
+            older.address: ("a", 26),
+            newest.address: ("a*", 20),
+            stale.address: ("a*", 16),
+            no_route.address: ("outside", None),
+        }
+        router.classify.side_effect = lambda address, now: routes[address]
         sender = RecordingSender()
         queue = DeliveryQueue(sender, clock=lambda: NOW)
         radar = KleinanzeigenRadar(router, "Hi, ich bin 28.", "none", delivery=queue)
@@ -35,7 +41,7 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
             self.assertEqual(sender.attempts, [(newest.url, "Hi, ich bin 28."), (older.url, "Hi, ich bin 28.")])
             self.assertEqual(db.execute("SELECT id FROM klein_review").fetchall(), [(unknown.id,)])
 
-    def test_manual_address_draft_gets_rechecked_before_attempt(self):
+    def test_manual_astar_address_gets_rechecked_before_attempt(self):
         listing = klein_offer(1, address=None)
         inbox, router = Mock(), Mock()
         inbox.recent_items.return_value = [(listing, NOW - timedelta(minutes=20))]
@@ -44,13 +50,14 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
         cutoff = NOW - timedelta(days=1)
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             radar.scan(db, inbox, NOW, cutoff, 10, {})
-            router.classify.return_value = ("a", None)
+            router.classify.side_effect = [("a*", 19), ("outside", None), ("a*", 20)]
             self.assertTrue(radar.check_address(db, listing.id, "Musterstraße 12, 81667 München", NOW, cutoff)[0])
             inbox.recent_items.return_value = []
-            router.qualifies.return_value = False
             radar.scan(db, inbox, NOW, cutoff, 10, {})
             self.assertEqual(sender.attempts, [])
-        router.qualifies.assert_called_once()
+            radar.scan(db, inbox, NOW, cutoff, 10, {})
+            self.assertEqual(sender.attempts, [(listing.url, "Hallo!")])
+        self.assertEqual(router.classify.call_count, 3)
 
 
 if __name__ == "__main__":
