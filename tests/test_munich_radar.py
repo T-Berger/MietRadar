@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 from dashboard_data import load_dashboard
+from listing_photos import PHOTO_GALLERY_VERSION
 from listing_profiles import record_listing_location
 from llm_personalizer import application_render_signature
 from munich_radar import Scanner, _database
@@ -403,9 +404,61 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual((role, commercial), ("manager", None))
             self.assertTrue(message.startswith("Guten Tag,"))
             self.assertIn("Architekt", message)
-            self.assertNotIn("koche", message)
+            self.assertIn("In meiner Freizeit koche ich gern.", message)
+            self.assertIn("Wann könnte ich Ihr Zimmer besichtigen?", message)
             self.assertEqual(scanner.add_intro_to_current_drafts(db, NOW), 0)
             self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Entwürfe aktualisiert"], 0)
+            self.assertEqual(db.execute("SELECT message FROM drafts").fetchone(), (message,))
+
+    def test_updates_a_neutral_draft_without_replacing_edited_queued_or_sent_messages(self):
+        listings = [replace(offer(index, 1), is_wg=True) for index in range(1, 5)]
+        current, edited, queued, sent = listings
+        source, router, delivery = Mock(), Mock(), Mock()
+        source.inventory_scope = "munich"
+        source.candidates.return_value = [ref(listing) for listing in listings]
+        source.details.return_value = current
+        router.classify.return_value = ("a", None)
+        router.coordinates.return_value = (48.128, 11.603)
+        scanner = Scanner(
+            source, router, "Hallo,\n\n{LLM_TEXT}\n\nViele Grüße\nAlex Neumann", "none", timedelta(hours=24),
+            12, delivery=delivery, render_signature="current-template",
+            applicant_intro="Ich bin Alex Neumann, 31. Ich arbeite als Architekt. In meiner Freizeit koche ich gern.",
+            applicant_answers={"einzug": "Ich könnte zum 1. Dezember einziehen."},
+        )
+        old_message = (
+            "Hallo,\n\nich bin Alex Neumann und arbeite als Architekt. In meiner Freizeit koche ich gern.\n\n"
+            "Ich könnte zum 1. Dezember einziehen. Wann könnte ich mir das Zimmer anschauen?\n\n"
+            "Viele Grüße\nAlex Neumann"
+        )
+        # Signature stored for this fixture by the version that omitted age from neutral drafts.
+        old_signature = "dc25049f9d227b8f64c98a3a81ecfee4c12bb3a82707a2f8924263c514453c14"
+        with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
+            with db:
+                for listing in listings:
+                    db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'veröffentlicht', ?, 0)",
+                               (listing.id, listing.url, listing.published_at.timestamp(), old_message))
+                    db.execute("INSERT INTO draft_render_signatures VALUES (?, ?)", (listing.id, old_signature))
+                    db.execute("""
+                        INSERT INTO listing_profiles (id, title, route_tier, latitude, longitude, photo_urls,
+                                                      photo_gallery_version)
+                        VALUES (?, ?, 'a', 48.128, 11.603, '[]', ?)
+                    """, (listing.id, listing.title, PHOTO_GALLERY_VERSION))
+                    record_listing_availability(db, listing.id, None)
+                for listing, state in ((edited, "edited"), (queued, "queued")):
+                    db.execute("""
+                        INSERT INTO application_reviews (id, message_hash, state, updated_at) VALUES (?, '', ?, ?)
+                    """, (listing.id, state, NOW.timestamp()))
+                db.execute("INSERT INTO delivery VALUES (?, 'sent', ?, ?)", (sent.id, NOW.timestamp(), NOW.timestamp()))
+
+            self.assertEqual(scanner.scan(db, NOW, {})["Entwürfe aktualisiert"], 1)
+            messages = dict(db.execute("SELECT id, message FROM drafts"))
+            self.assertIn("Alex Neumann, 31.", messages[current.id])
+            self.assertIn("Ich arbeite als Architekt.", messages[current.id])
+            self.assertIn("In meiner Freizeit koche ich gern.", messages[current.id])
+            self.assertTrue(all(messages[listing.id] == old_message for listing in (edited, queued, sent)))
+            self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Entwürfe aktualisiert"], 0)
+        source.details.assert_called_once_with(ref(current))
+        delivery.deliver.assert_not_called()
 
     def test_offline_intro_repair_updates_only_current_unsent_drafts(self):
         now = NOW.timestamp()

@@ -182,7 +182,7 @@ class OutgoingJudgeTest(unittest.TestCase):
         self.assertEqual(payload["verwendete_antworten"], {"rauchen": "Ich rauche nicht."})
         self.assertNotIn("Hund", raw_payload)
 
-    def test_commercial_message_accepts_sie_and_omits_private_hobbies_from_profile(self):
+    def test_legacy_commercial_message_provides_only_the_profile_facts_it_used(self):
         intro = "Ich bin Alex Neumann, 31. Ich arbeite als Architekt. In meiner Freizeit koche ich gern."
         draft = ("Guten Tag,\n\nmein Name ist Alex Neumann. Ich arbeite als Architekt.\n\n"
                  "Ich interessiere mich für Ihre Wohnung. Könnten Sie mir einen Besichtigungstermin vorschlagen?")
@@ -193,25 +193,54 @@ class OutgoingJudgeTest(unittest.TestCase):
         system, payload, _ = complete.call_args.args
         self.assertIn("Sie-Anrede", system)
         self.assertNotIn("Ein gemeinsamer Kochabend klingt gut", system)
-        self.assertEqual(json.loads(payload)["vorstellung"], "Mein Name ist Alex Neumann. Ich arbeite als Architekt.")
+        self.assertEqual(json.loads(payload)["vorstellung"], "Ich bin Alex Neumann und arbeite als Architekt.")
+        self.assertNotIn("koche", payload)
 
     def test_checks_generated_drafts_with_the_tone_of_the_contact_role(self):
-        intro = "Ich bin Alex Neumann, 31. Ich arbeite als Architekt. In meiner Freizeit koche ich gern."
-        practical_intro = "Mein Name ist Alex Neumann. Ich arbeite als Architekt."
-        for role, expected_tone, expected_intro in (
-            ("manager", "Sie-Anrede", practical_intro),
-            ("roommate", "wie man einer WG direkt schreiben würde", intro),
-            ("unknown", "Die Rolle der Kontaktperson ist unklar", practical_intro),
+        opening = "Ich bin Alex Neumann, 31, und arbeite als Architekt."
+        details = (
+            "In meiner Freizeit koche ich gern und zeichne.",
+            "Ich organisiere ehrenamtlich Veranstaltungen.",
+            "Ich rauche nicht und habe keine Allergien.",
+        )
+        intro = "\n\n".join((opening, *details))
+        for role, expected_tone in (
+            ("manager", "Sie-Anrede"),
+            ("roommate", "wie man einer WG direkt schreiben würde"),
+            ("unknown", "Die Rolle der Kontaktperson ist unklar"),
         ):
             with self.subTest(role=role), patch(
                 "outgoing_judge._generate_via_mistral", return_value='{"approved":true,"reason":"ok"}',
             ) as complete:
                 draft = personalise_message(
                     "Hi zusammen,\n\n{LLM_TEXT}\n\nViele Grüße\nAlex Neumann", "", provider="none",
-                    recipient_role=role, applicant_intro=intro,
+                    recipient_role=role, applicant_intro=intro, listing_type="wg",
                 )
                 verdict = judge_outgoing(draft, recipient_role=role, applicant_intro=intro, provider="mistral")
                 self.assertTrue(verdict.approved, verdict.reason)
                 system, payload, _ = complete.call_args.args
                 self.assertIn(expected_tone, system)
-                self.assertEqual(json.loads(payload)["vorstellung"], expected_intro)
+                reviewed = json.loads(payload)
+                self.assertEqual(reviewed["vorstellung"], opening)
+                self.assertEqual(reviewed["verwendete_profilangaben"], list(details))
+                if role == "unknown":
+                    self.assertIn("Eine konkrete Frage zur Besichtigung zeigt bereits Interesse", system)
+
+    def test_profile_and_answer_evidence_ignores_spacing_and_sentence_punctuation(self):
+        opening = "Ich bin Alex Neumann, 31, und arbeite als Architekt."
+        draft = (
+            f"Hallo,\n\n{opening} Ich   engagiere mich ehrenamtlich.\n\n"
+            "Ich rauche nicht! Wann könnte ich mir das Zimmer anschauen?"
+        )
+        with patch("outgoing_judge._generate_via_mistral",
+                   return_value='{"approved":true,"reason":"ok"}') as complete:
+            verdict = judge_outgoing(
+                draft, recipient_role="unknown", provider="mistral",
+                applicant_intro=f"{opening}\nIch engagiere mich ehrenamtlich",
+                applicant_answers={"rauchen": "Ich rauche nicht.", "haustiere": "Ich habe einen Hund."},
+            )
+        self.assertTrue(verdict.approved)
+        evidence = json.loads(complete.call_args.args[1])
+        self.assertEqual(evidence["verwendete_profilangaben"], ["Ich engagiere mich ehrenamtlich"])
+        self.assertEqual(evidence["verwendete_antworten"], {"rauchen": "Ich rauche nicht."})
+        self.assertNotIn("Hund", complete.call_args.args[1])

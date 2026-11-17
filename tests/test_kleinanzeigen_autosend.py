@@ -40,7 +40,8 @@ class KleinanzeigenAutosendTest(unittest.TestCase):
             radar.scan(db, inbox, NOW, cutoff, 10, {})
             radar.scan(db, inbox, NOW, cutoff, 10, {})
             self.assertEqual([url for url, _ in sender.attempts], [newest.url, older.url])
-            self.assertTrue(all("Besichtigung" in message for _, message in sender.attempts))
+            for _, message in sender.attempts:
+                self.assertIn("wann könnte ich mir die wohnung anschauen?", message.casefold())
             self.assertEqual(db.execute("SELECT id FROM klein_review").fetchall(), [(unknown.id,)])
 
     def test_manual_astar_address_gets_rechecked_before_attempt(self):
