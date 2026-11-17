@@ -358,8 +358,10 @@ class Scanner:
             set_application_wait_reason(db, item, None)
             result = self.reviewed_delivery.deliver(
                 db, item.id, item.url, item.message, item.fresh_at, self.max_age, context=listing.description,
-                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
-                                                recipient_role=self._recipient_role(db, listing)), attachment=attachment,
+                first_message=FirstMessageReview(
+                    listing.title, self.applicant_intro, (), self.applicant_answers,
+                    user_reviewed=True, recipient_role=self._recipient_role(db, listing),
+                ), attachment=attachment,
             )
             if result:
                 counts[result] += 1

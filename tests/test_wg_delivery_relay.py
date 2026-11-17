@@ -35,6 +35,8 @@ class ReviewedDeliveryRelayTest(unittest.TestCase):
         self.scanner = Mock(spec=Scanner)
         self.scanner.max_age = timedelta(hours=24)
         self.scanner.outgoing_provider = "mistral"
+        self.scanner.applicant_intro = "Ich bin Sam."
+        self.scanner.applicant_answers = {"einzug": "Ich kann ab Dezember einziehen."}
         self.scanner.validate_reviewed_listing.return_value = True
         self.relay = self.new_relay()
 
@@ -158,6 +160,8 @@ class ReviewedDeliveryRelayTest(unittest.TestCase):
         self.assertEqual(judge.call_args.args, (MESSAGE,))
         self.assertEqual(judge.call_args.kwargs["provider"], "mistral")
         self.assertTrue(judge.call_args.kwargs["user_reviewed"])
+        self.assertEqual(judge.call_args.kwargs["applicant_intro"], self.scanner.applicant_intro)
+        self.assertEqual(judge.call_args.kwargs["applicant_answers"], self.scanner.applicant_answers)
         self.scanner.validate_reviewed_listing.assert_called_once()
         rival = self.new_relay()
         start = Barrier(2)

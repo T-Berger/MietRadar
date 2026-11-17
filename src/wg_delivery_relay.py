@@ -212,8 +212,10 @@ class ReviewedDeliveryRelay:
             judgment = review_outgoing(
                 db, item.id, item.message, kind="application", context=listing.description,
                 provider=self.scanner.outgoing_provider, now=self.clock(),
-                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
-                                                recipient_role=role),
+                first_message=FirstMessageReview(
+                    listing.title, self.scanner.applicant_intro, (), self.scanner.applicant_answers,
+                    user_reviewed=True, recipient_role=role,
+                ),
             )
             if not judgment.approved:
                 fail_application_review(db, item, judgment.reason, self.clock())
