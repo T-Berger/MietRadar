@@ -6,7 +6,7 @@ from unittest.mock import patch
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlsplit
 
-from src.munich_transit import DEFAULT_TRANSIT_API_URL, STATIONS, TransitRouter
+from src.munich_transit import DEFAULT_TRANSIT_API_URL, STATIONS, TransitLeg, TransitRoute, TransitRouter
 
 
 ORIGIN = "Beispielstraße 1, 81667 München"
@@ -135,6 +135,59 @@ class TransitRouterTest(unittest.TestCase):
         self.assertEqual(router.classify(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), ("a", None))
         self.assertIs(router.qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), True)
         self.assertEqual(router.coordinates(ORIGIN), (48.128, 11.603))
+        self.assertEqual(urlopen.call_count, 4)
+
+    @patch("src.munich_transit.urlopen")
+    def test_cached_connections_preserve_winning_itinerary_and_waiting_time(self, urlopen):
+        slower = route("06:00:00", "06:28:00")
+        fastest = dict(route("06:04:00", "06:18:01"), legs=[
+            {"mode": "WALK", "duration": 150, "from": {"name": "START"}, "to": {"name": "Hauptbahnhof"}},
+            {"mode": "SUBWAY", "routeShortName": "U5", "duration": 419, "from": {"name": "Hauptbahnhof"},
+             "to": {"name": "Innsbrucker Ring"}, "headsign": "Neuperlach Süd"},
+            {"mode": "SUBWAY", "displayName": "U8", "duration": 179,
+             "from": {"name": "Innsbrucker Ring"}, "to": {"name": "Karl-Preis-Platz"},
+             "interlineWithPreviousLeg": True},
+            {"mode": "WALK", "duration": 91, "from": {"name": "Karl-Preis-Platz"}, "to": {"name": "END"}},
+        ])
+        cancelled = dict(route("06:00:00", "06:12:00"), legs=[{"mode": "TRAM", "cancelled": True}])
+        urlopen.side_effect = [
+            response([GEOCODE]), response({"itineraries": [slower, fastest, cancelled]}), response({"itineraries": []}),
+        ]
+        router = TransitRouter()
+        coordinates = (GEOCODE["lat"], GEOCODE["lon"])
+        self.assertEqual(router.classify(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), ("a*", 19))
+        connections = router.connections(coordinates, FRIDAY_BEFORE_CLOCK_CHANGE, cached_only=True)
+        planned_for = datetime(2026, 3, 30, 6, tzinfo=timezone.utc).timestamp()
+        expected = TransitRoute("Hauptbahnhof", "from_station", 19, (
+            TransitLeg("WALK", None, None, "Hauptbahnhof", 3),
+            TransitLeg("SUBWAY", "U5", "Hauptbahnhof", "Innsbrucker Ring", 7, "Neuperlach Süd"),
+            TransitLeg("SUBWAY", "U8", "Innsbrucker Ring", "Karl-Preis-Platz", 3, through_service=True),
+            TransitLeg("WALK", None, "Karl-Preis-Platz", None, 2),
+        ), planned_for)
+        self.assertEqual(connections, (expected,))
+        self.assertEqual(urlopen.call_count, 3)
+
+    @patch("src.munich_transit.MAX_REQUESTS_PER_DAY", 4)
+    @patch("src.munich_transit.urlopen")
+    def test_route_details_reuse_the_short_plan_and_reserve_requests_for_search(self, urlopen):
+        urlopen.side_effect = [
+            response([GEOCODE]),
+            response({"itineraries": [route("06:00:00", "06:25:00")]}),
+            response({"itineraries": [route("06:00:00", "06:34:00")]}),
+            response({"itineraries": [route("06:00:00", "06:17:00")]}),
+        ]
+        router = TransitRouter()
+        coordinates = (GEOCODE["lat"], GEOCODE["lon"])
+        self.assertIs(router.qualifies(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), True)
+        connections = router.connections(coordinates, FRIDAY_BEFORE_CLOCK_CHANGE)
+        self.assertEqual([(item.station, item.direction, item.minutes) for item in connections], [
+            ("Hauptbahnhof", "to_station", 25), ("Ostbahnhof", "to_station", 34),
+        ])
+        supplement = parse_qs(urlsplit(urlopen.call_args.args[0].full_url).query)
+        self.assertEqual(supplement["toPlace"], [STATIONS[1]])
+        self.assertEqual(supplement["maxTravelTime"], ["45"])
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(router.classify(ORIGIN, FRIDAY_BEFORE_CLOCK_CHANGE), ("a*", 17))
         self.assertEqual(urlopen.call_count, 4)
 
     @patch("src.munich_transit.urlopen")

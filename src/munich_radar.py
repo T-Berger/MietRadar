@@ -23,7 +23,8 @@ from kleinanzeigen_radar import KleinanzeigenRadar, install_klein_review
 from kleinanzeigen_reply_queue import ReplyDispatcher, install_reply_queue
 from listing_photos import LEGACY_PHOTO_GALLERY_LIMIT, PHOTO_GALLERY_VERSION
 from listing_profiles import (
-    ROUTE_FIT, install_listing_profiles, record_listing_location, record_listing_profile, record_listing_route,
+    ROUTE_FIT, decode_transit_routes, encode_transit_routes, install_listing_profiles, record_listing_location,
+    record_listing_profile, record_listing_route, valid_listing_coordinates,
 )
 from llm_personalizer import (
     applicant_intro_from_template, application_render_signature, personalise_message,
@@ -122,6 +123,57 @@ class Scanner:
     applicant_answers: dict[str, str] = field(default_factory=dict)
     reviewed_startup_problem: Callable[[], str | None] | None = None
     _location_retry_after: dict[str, datetime] = field(default_factory=dict, init=False, repr=False)
+
+    def refresh_transit_connections(self, db: sqlite3.Connection, now: datetime) -> int:
+        """Keep the routes from this scan and fill in a few older offers after the normal checks."""
+        since = (now - timedelta(days=7)).timestamp()
+        until = now.timestamp()
+        retry_before = (now - timedelta(days=1)).timestamp()
+        rows = db.execute("""
+            WITH candidates AS (
+                SELECT d.id, d.fresh_at FROM drafts d
+                JOIN listing_profiles p ON p.id = d.id AND p.route_tier IN ('a*', 'a')
+                WHERE d.fresh_at BETWEEN ? AND ?
+                UNION ALL
+                SELECT id, fresh_at FROM munich_secondary_offers WHERE fresh_at BETWEEN ? AND ?
+            ), recent AS (
+                SELECT id, MAX(fresh_at) AS fresh_at FROM candidates GROUP BY id
+            )
+            SELECT p.id, p.latitude, p.longitude, p.location_address_hash, p.transit_routes, p.transit_checked_at
+            FROM recent r JOIN listing_profiles p ON p.id = r.id
+            JOIN listing_availability a ON a.id = r.id AND a.reason IS NULL AND a.policy_version = ?
+            WHERE p.latitude IS NOT NULL AND p.longitude IS NOT NULL
+            ORDER BY p.transit_checked_at IS NOT NULL, r.fresh_at DESC, p.id DESC LIMIT 100
+        """, (since, until, since, until, AVAILABILITY_POLICY_VERSION)).fetchall()
+        lookups = 3
+        updated = 0
+        for listing_id, latitude, longitude, address_hash, saved, checked_at in rows:
+            point = valid_listing_coordinates(latitude, longitude)
+            if point is None:
+                continue
+            previous = decode_transit_routes(saved)
+            cached = self.router.connections(point, now, cached_only=True)
+            routes = {(route.station, route.direction): route for route in (*previous, *cached)}
+            next_checked_at = checked_at
+            if len(routes) >= 4:
+                next_checked_at = checked_at or until
+            elif lookups and (checked_at is None or checked_at <= retry_before):
+                for route in self.router.connections(point, now):
+                    routes[route.station, route.direction] = route
+                next_checked_at = until
+                lookups -= 1
+            connections = tuple(routes.values())
+            if connections == previous and next_checked_at == checked_at:
+                continue
+            with db:
+                changed = db.execute("""
+                    UPDATE listing_profiles SET transit_routes = ?, transit_checked_at = ?
+                    WHERE id = ? AND latitude IS ? AND longitude IS ? AND location_address_hash IS ?
+                """, (encode_transit_routes(connections) if connections else None,
+                      next_checked_at, listing_id, latitude, longitude, address_hash)).rowcount
+            if connections != previous:
+                updated += changed
+        return updated
 
     def add_intro_to_current_drafts(self, db: sqlite3.Connection, now: datetime) -> int:
         """Clean up recent unedited drafts using the cached listing title."""
@@ -1004,6 +1056,8 @@ def _poll(
             if not ok:
                 LOG.warning("E-Mail-Hinweise vorerst nicht angenommen. Einstellungen prüfen.")
                 failed = True
+        if connections := scanner.refresh_transit_connections(db, datetime.now(timezone.utc)):
+            counts["Angebote mit ÖPNV-Verbindungen"] += connections
         LOG.info("Scan fertig: %s", ", ".join(f"{n} {key}" for key, n in counts.items()) or "nichts Neues")
         if once:
             return int(failed or klein_paused or reply_paused or
