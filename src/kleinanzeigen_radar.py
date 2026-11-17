@@ -17,7 +17,7 @@ from munich_transit import MUNICH_TIME, PRIMARY_TIERS, TransitRouter
 from rental_availability import AVAILABILITY_POLICY_VERSION, availability_rejection, record_listing_availability
 from wg_alerts import AlertsInbox
 from wg_preferences import rejection_reason
-from wg_source import RecipientRole
+from wg_source import RecipientRole, listing_contact_name
 
 
 def install_klein_review(db: sqlite3.Connection) -> None:
@@ -172,7 +172,7 @@ class KleinanzeigenRadar:
                 if refresh:
                     if self._save(db, listing.id, listing.url, listing.description, listing.is_wg,
                                   stamp.timestamp(), basis, address, now, title=listing.title,
-                                  previous_message=draft[5], role=role):
+                                  previous_message=draft[5], role=role, contact_name=listing.contact_name):
                         counts["Kleinanzeigen-Entwürfe aktualisiert"] += 1
                     retry_after[listing.id] = now + timedelta(minutes=1)
                 elif draft:
@@ -180,7 +180,8 @@ class KleinanzeigenRadar:
                         self._save_origin(db, listing.id, address)
                         remove_secondary_offer(db, listing.id)
                 elif self._save(db, listing.id, listing.url, listing.description, listing.is_wg,
-                                stamp.timestamp(), basis, address, now, title=listing.title, role=role):
+                                stamp.timestamp(), basis, address, now, title=listing.title, role=role,
+                                contact_name=listing.contact_name):
                     counts["neue Kleinanzeigen-Entwürfe"] += 1
                 continue
             if tier in _SECONDARY_STATIONS and minutes is not None:
@@ -324,7 +325,7 @@ class KleinanzeigenRadar:
             return False, "Die ÖPNV-Fahrt konnte nicht geprüft werden." if tier is None else "Keine passende ÖPNV-Verbindung gefunden."
         role = application_recipient_role(stored_role, commercial=bool(commercial))
         saved = self._save(db, listing_id, url, excerpt, bool(is_wg), fresh_at, basis, origin, now,
-                           title=title, role=role)
+                           title=title, role=role, contact_name=listing_contact_name(excerpt.splitlines()))
         return saved, "Entwurf gespeichert. Der Versandstatus steht unter delivery." if saved else "Der Treffer wurde bereits verarbeitet."
 
     def _recipient_review(self, title: str | None, role: RecipientRole) -> FirstMessageReview | None:
@@ -335,12 +336,12 @@ class KleinanzeigenRadar:
     def _save(
         self, db: sqlite3.Connection, listing_id: str, url: str, excerpt: str, is_wg: bool, fresh_at: float, basis: str,
         address: str, now: datetime, *, title: str = "", previous_message: str | None = None,
-        role: RecipientRole = "unknown",
+        role: RecipientRole = "unknown", contact_name: str | None = None,
     ) -> bool:
         message = personalise_message(
             self.template, excerpt, listing_url=url, provider=self.provider, listing_type="wg" if is_wg else "wohnung",
             listing_title=title, recipient_role=role, applicant_intro=self.applicant_intro,
-            applicant_answers=self.applicant_answers,
+            applicant_answers=self.applicant_answers, poster_name=contact_name or "",
         )
         with db:
             saved = save_application_draft(

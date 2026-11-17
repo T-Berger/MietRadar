@@ -58,7 +58,8 @@ class KleinanzeigenRadarTest(unittest.TestCase):
         self.assertEqual(delivery.deliver.call_args.args[1], wg.id)
 
     def test_missing_address_stays_in_review_until_a_fresh_transit_match(self):
-        pending = klein_offer(2, address=None)
+        pending = klein_offer(2, address=None, is_commercial=True, recipient_role="manager",
+                              description="Kontaktperson: Robin Stein", contact_name="Robin Stein")
         old = klein_offer(3, address=None)
         exclusive = klein_offer(4, address=None, title="Nur für Studierende")
         router, inbox = Mock(), Mock()
@@ -76,6 +77,9 @@ class KleinanzeigenRadarTest(unittest.TestCase):
             router.classify.return_value = ("a*", 20)
             self.assertTrue(radar.check_address(db, pending.id, "Musterstraße 12, 81667 München", NOW, cutoff)[0])
             self.assertEqual(db.execute("SELECT id, basis FROM drafts").fetchall(), [(pending.id, "Suchalarm erhalten")])
+            message, = db.execute("SELECT message FROM drafts").fetchone()
+            self.assertTrue(message.startswith("Guten Tag Robin Stein,"))
+            self.assertIn("Ihre Wohnung besichtigen?", message)
             self.assertEqual(db.execute("SELECT route_tier, route_minutes FROM listing_profiles WHERE id = ?",
                                         (pending.id,)).fetchone(), ("a*", 20))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM klein_review").fetchone()[0], 0)

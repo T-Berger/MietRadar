@@ -13,7 +13,9 @@ from urllib.parse import quote, unquote, urlsplit
 from bs4 import BeautifulSoup, Tag
 
 from listing_photos import listing_photo_urls
-from wg_source import Listing, RentKind, listing_recipient_role, parse_area_sqm, parse_rent_eur, rent_kind_for_label
+from wg_source import (
+    Listing, RentKind, listing_contact_name, listing_recipient_role, parse_area_sqm, parse_rent_eur, rent_kind_for_label,
+)
 
 _HOSTS = {"www.kleinanzeigen.de", "kleinanzeigen.de"}
 _LISTING_PATH = re.compile(r"/s-anzeige/[\w-]+/(?P<id>[0-9]+)-(?P<category>[0-9]+)-[0-9]+")
@@ -234,6 +236,7 @@ def _listing(ref: _Reference, title: str, lines: list[str], photo_urls: tuple[st
         rent_eur=rent_eur, rent_kind=rent_kind, area_sqm=area_sqm, photo_urls=photo_urls,
         available_from=available_from, available_until=available_until,
         is_commercial=commercial, recipient_role=listing_recipient_role(description, commercial=commercial),
+        contact_name=listing_contact_name(lines),
     )
 
 
@@ -252,6 +255,7 @@ def _with_fallback_facts(primary: Listing, fallback: Listing) -> Listing:
         available_from=primary.available_from or fallback.available_from,
         available_until=primary.available_until or fallback.available_until,
         is_commercial=commercial, recipient_role=listing_recipient_role(description, commercial=commercial),
+        contact_name=listing_contact_name(description.splitlines()),
     )
 
 
