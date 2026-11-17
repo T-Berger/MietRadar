@@ -101,7 +101,7 @@ class WGDraftStructureTest(unittest.TestCase):
                 )
                 self.assertEqual(message, f"Hi zusammen,\n\n{INTRO}\n\n{QUESTION}\n\nViele Grüße\nAlex")
 
-    def test_commercial_inquiry_keeps_supplied_profile_and_move_in_without_wg_hobbies(self):
+    def test_commercial_inquiry_keeps_supplied_profile_and_requested_facts(self):
         intro = "Ich bin Alex Neumann, 31, und arbeite als Architekt. In meiner Freizeit koche ich gern."
         draft = personalise_message(
             "Hi {name},\n\n{LLM_TEXT}\n\nIch kann ab 1. Dezember einziehen und würde euch gern kennenlernen.\n\n"
@@ -110,11 +110,14 @@ class WGDraftStructureTest(unittest.TestCase):
             poster_name="Hausverwaltung Nord", provider="none", listing_type="wg", commercial=True,
             applicant_intro=intro, applicant_answers={"haustiere": "Ich habe keine Haustiere."},
         )
-        self.assertEqual(draft, (
-            "Guten Tag,\n\nich bin Alex Neumann und arbeite als Architekt.\n\n"
-            "Ich kann ab 1. Dezember einziehen. Ich habe keine Haustiere. Wann könnte ich Ihr Zimmer besichtigen?"
-            "\n\nMit freundlichen Grüßen\nAlex Neumann"
-        ))
+        self.assertTrue(draft.startswith("Guten Tag,\n\n"))
+        self.assertIn("Alex Neumann, 31, und arbeite als Architekt.", draft)
+        self.assertIn("In meiner Freizeit koche ich gern.", draft)
+        self.assertIn("Ich kann ab 1. Dezember einziehen.", draft)
+        self.assertIn("Ich habe keine Haustiere.", draft)
+        self.assertIn("Wann könnte ich Ihr Zimmer besichtigen?", draft)
+        self.assertTrue(draft.endswith("Mit freundlichen Grüßen\nAlex Neumann"))
+        self.assertNotIn("euch", draft)
 
     def test_commercial_inquiry_does_not_treat_a_profession_as_a_name(self):
         draft = personalise_message("Hallo!", "", provider="none", listing_type="wohnung", commercial=True,
@@ -137,19 +140,42 @@ class WGDraftStructureTest(unittest.TestCase):
         roommate = personalise_message(template, description, poster_name="Sam", recipient_role="roommate",
                                        commercial=True, **options)
         unknown = personalise_message(template, description, recipient_role="unknown", **options)
-        self.assertIn("ich bin Alex Neumann und arbeite als Architekt.", manager)
+        self.assertIn("Alex Neumann, 31.", manager)
+        self.assertIn("Ich arbeite als Architekt.", manager)
         self.assertIn("Wann könnte ich Ihr Zimmer besichtigen?", manager)
-        self.assertNotIn("koche", manager)
         self.assertTrue(roommate.startswith(f"Hi Sam,\n\n{intro}"))
         self.assertIn("Wenn ihr zusammen kocht, wär ich gern dabei.", roommate)
         self.assertIn(MOVE_IN, roommate)
         self.assertIn(QUESTION, roommate)
-        self.assertEqual(unknown, (
-            "Hallo,\n\nich bin Alex Neumann und arbeite als Architekt. In meiner Freizeit koche ich gern."
-            f"\n\n{MOVE_IN} Wann könnte ich mir das Zimmer anschauen?\n\nViele Grüße\nAlex Neumann"
-        ))
+        self.assertTrue(unknown.startswith("Hallo,\n\n"))
+        self.assertIn("Alex Neumann, 31.", unknown)
+        self.assertIn("Ich arbeite als Architekt.", unknown)
+        self.assertIn("In meiner Freizeit koche ich gern.", unknown)
+        self.assertIn(MOVE_IN, unknown)
+        self.assertIn("Wann könnte ich mir das Zimmer anschauen?", unknown)
+        self.assertTrue(unknown.endswith("Viele Grüße\nAlex Neumann"))
         self.assertIn(MOVE_IN, manager)
         self.assertNotIn("euch", manager)
+
+    def test_all_contact_roles_include_the_complete_profile_and_one_viewing_question(self):
+        intro = ("Ich bin Alex Neumann, 31, und arbeite als Architekt. Nach Feierabend koche ich gern, "
+                 "spiele Brettspiele und gehe wandern. Neben der Arbeit helfe ich ehrenamtlich im Sportverein. "
+                 "Ich rauche nicht und habe keine Allergien.")
+        phone = "+49 30 23125000"
+        template = f"Hallo {{name}},\n\n{{APPLICANT_INTRO}}\n\n{{LLM_TEXT}}\n\nViele Grüße\nAlex Neumann\nTelefon: {phone}"
+        for role, listing_type in (("roommate", "wg"), ("unknown", "zimmer"), ("manager", "wohnung")):
+            with self.subTest(role=role):
+                draft = personalise_message(
+                    template, "Bitte sag kurz, ob du rauchst.", provider="none", listing_type=listing_type,
+                    first_message=True, recipient_role=role, applicant_intro=intro,
+                    applicant_answers={"einzug": MOVE_IN, "rauchen": "Ich rauche nicht."},
+                )
+                for fact in ("Alex Neumann, 31", "arbeite als Architekt", "koche ich gern", "Brettspiele",
+                             "gehe wandern", "ehrenamtlich im Sportverein", "rauche nicht", "keine Allergien", MOVE_IN,
+                             phone):
+                    self.assertEqual(draft.count(fact), 1, draft)
+                self.assertEqual(draft.count("?"), 1, draft)
+                self.assertNotIn("{APPLICANT_INTRO}", draft)
 
     def test_neutral_inquiry_without_applicant_info_mentions_the_offer(self):
         draft = personalise_message("Hallo!", "", provider="none", listing_type="wohnung",

@@ -92,23 +92,21 @@ Antworte nur mit einem JSON-Objekt der Form {"approved": true, "reason": "ok"} b
 _WG_FIRST_MESSAGE_TONE = "Die Bewerbung soll so klingen, wie man einer WG direkt schreiben würde. Kurze, freundliche Sätze in normaler Alltagssprache reichen. Halte steife Bewerbungsfloskeln, Werbesprache, überschwängliche Komplimente und erfundene Gründe zurück, warum einem ein Ausstattungsdetail gefällt. Verwende ton auch dann, wenn das Detail selbst stimmt, aber das Lob daran aufgesetzt klingt. Eine Formulierung wie „Die hervorragende Anbindung begeistert mich, weil mir flexible Mobilität besonders am Herzen liegt“ klingt aufgesetzt. „Wie weit ist es zu Fuß zur U-Bahn?“, „Ich koche auch gern. Ein gemeinsamer Kochabend klingt gut“ und „Ich würde mir das Zimmer gern anschauen“ sind als Ton in Ordnung. Verlange keinen dieser Wortlaute. Umgangssprache und lockere Sätze sind in Ordnung, solange sie respektvoll sind."
 _MANAGER_FIRST_MESSAGE_TONE = (
     "Die Nachricht richtet sich an eine Hausverwaltung, an Vermietende oder an eine vermittelnde Person. "
-    "Eine kurze und freundliche Mietanfrage mit Sie-Anrede passt. Eine flüssige Vorstellung wie „ich bin Alex und "
-    "arbeite als Architekt“ und eine direkte Frage wie „Wann wäre bei Ihnen ein Besichtigungstermin möglich?“ "
-    "sind passend. Name, Beruf und ein möglicher Einzugstermin genügen, sofern bekannt. „Guten Tag“ und "
-    "„Mit freundlichen Grüßen“ sind angemessen. "
+    "Eine freundliche Mietanfrage mit Sie-Anrede und einer klaren Besichtigungsfrage passt. "
+    "Eine ausführlichere, gut lesbare Vorstellung aus dem hinterlegten Profil passt ebenfalls. "
+    "„Guten Tag“ und „Mit freundlichen Grüßen“ sind angemessen. "
     "Wenn keine privaten Angaben vorliegen, ist eine Anfrage ohne erfundene Vorstellung gültig. "
     "Bankdaten, Einkommensangaben, Vertragszusagen und Zusagen über Unterlagen dürfen nie erfunden werden."
 )
 _UNKNOWN_FIRST_MESSAGE_TONE = (
-    "Die Rolle der Kontaktperson ist unklar. Eine kurze, freundliche und neutrale Nachricht wie „Hallo“ und "
-    "„Wann könnte ich zur Besichtigung vorbeikommen?“ passt. Ein bekanntes eigenes Hobby kann eine Anfrage zu "
-    "einem WG-Zimmer persönlicher machen. Prüfe, ob die Nachricht Vermietung, WG-Zugehörigkeit oder gemeinsame "
-    "Aktivitäten ohne Anhaltspunkt unterstellt. Auch eine knappe Vorstellung mit Alltagswortlaut ist angemessen. "
+    "Die Rolle der Kontaktperson ist unklar. Ein neutrales „Hallo“, eine persönliche Vorstellung und eine direkte "
+    "Frage wie „Wann könnte ich mir das Zimmer anschauen?“ passen. Prüfe, ob die Nachricht Vermietung, "
+    "WG-Zugehörigkeit oder gemeinsame Aktivitäten ohne Anhaltspunkt unterstellt. "
     "Wenn keine persönlichen Angaben vorliegen, ist eine Anfrage ohne Vorstellung gültig."
 )
 _FIRST_MESSAGE_SYSTEM = """
 Für diese erste Bewerbung um Wohnraum gelten zusätzlich die Ablehnungsgründe vorstellung, anzeigendetail, perspektive, ton, rueckfragen und termine.
-- vorstellung: Die erste Zeile nach der Anrede stellt die Person kurz vor, wenn Angaben zur Person vorliegen. Berücksichtige die hinterlegte Vorstellung und die belegten Angaben unter verwendete_profilangaben, soweit vorhanden.
+- vorstellung: Die Nachricht beginnt nach der Anrede mit der Person, wenn Angaben zu ihr vorliegen. Eine zusammenhängende Vorstellung darf mehrere belegte Angaben zu Alter, Beruf, Freizeit und Ehrenamt enthalten. Freiwillige Profilangaben wie „Ich rauche nicht und habe keine Allergien“ sind zulässig. Nutze dazu vorstellung, verwendete_profilangaben und verwendete_antworten. Jede Angabe reicht einmal.
 - anzeigendetail: Prüfe erwähnte Details gegen Titel und Text. Ein Bezug ist freiwillig. Eine kurze persönliche Anfrage ohne Bezug ist in Ordnung. Wenn die Anzeige zu etwas einlädt, darf die Person darauf reagieren. Eine Einladung belegt noch keine bestehende Gewohnheit. Prüfe behauptete gemeinsame Interessen anhand der vorhandenen Vorstellung.
 - perspektive: Prüfe, ob die Person sich aus ihrer eigenen Sicht bewirbt. Halte übernommene Anzeigenpassagen, Aussagen aus Sicht der Vermietenden, reine Ausstattungslisten und Nacherzählungen ohne persönliche Reaktion zurück. Eine sachliche Info zum Einzug, eine praktische Frage oder ein glaubwürdiges gemeinsames Interesse sind gute Gründe, ein Detail zu erwähnen.
 - ton: {tone}
@@ -149,19 +147,41 @@ def _unique_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return data
 
 
+def _sentences(text: str) -> tuple[str, ...]:
+    return tuple(" ".join(part.split()) for part in _SENTENCE_SPLIT.split(text) if part.strip())
+
+
+def _sentence_keys(text: str) -> tuple[str, ...]:
+    return tuple(sentence.rstrip(".!?").casefold() for sentence in _sentences(text))
+
+
+def _starts_with_intro(first_line: str, intro: str) -> bool:
+    expected = _sentence_keys(intro)
+    return bool(expected and _sentence_keys(first_line)[:len(expected)] == expected)
+
+
+def _known_opening(first_line: str, applicant_intro: str, *, allow_legacy_intro: bool) -> str:
+    opening = applicant_intro.strip().partition("\n")[0]
+    if _starts_with_intro(first_line, opening):
+        return opening
+    if allow_legacy_intro:
+        short_intro, _ = _short_rental_intro(applicant_intro)
+        if short_intro:
+            normalized_intro, _ = _short_rental_intro(first_line)
+            if _starts_with_intro(first_line, short_intro) or normalized_intro.casefold() == short_intro.casefold():
+                return short_intro
+    return ""
+
+
 def _first_message_hold(
-    text: str, applicant_intro: str, viewing_slots: tuple[str, ...], *, short_intro: bool = False,
+    text: str, applicant_intro: str, viewing_slots: tuple[str, ...], *, allow_legacy_intro: bool = False,
 ) -> str | None:
     body = _GREETING_PREFIX.sub("", text.strip(), count=1)
     first_line = body.partition("\n")[0].strip()
-    expected_intro = applicant_intro.strip().partition("\n")[0].strip()
-    if short_intro:
-        has_intro = first_line.casefold().startswith(expected_intro.casefold())
-        if not has_intro:
-            normalized_intro, _ = _short_rental_intro(first_line)
-            has_intro = normalized_intro.casefold() == expected_intro.casefold()
-    elif expected_intro:
-        has_intro = first_line.casefold().startswith(expected_intro.casefold())
+    if applicant_intro.strip():
+        has_intro = bool(_known_opening(first_line, applicant_intro, allow_legacy_intro=allow_legacy_intro))
+    elif allow_legacy_intro:
+        has_intro = True
     else:
         name = _NAMED_INTRO.match(first_line)
         has_intro = bool(name and name[1][0].isupper())
@@ -213,10 +233,9 @@ def judge_outgoing(
     first_message = (first_message or role is not None) and kind == "application"
     if first_message and (reason := _ad_language_hold(text, listing_title, context)):
         return OutgoingJudgment(False, reason)
-    short_intro = role in {"manager", "unknown"}
-    expected_intro = _short_rental_intro(applicant_intro)[0] if short_intro else applicant_intro
+    allow_legacy_intro = role in {"manager", "unknown"}
     if first_message and not user_reviewed and (
-        reason := _first_message_hold(text, expected_intro, viewing_slots, short_intro=short_intro)
+        reason := _first_message_hold(text, applicant_intro, viewing_slots, allow_legacy_intro=allow_legacy_intro)
     ):
         return OutgoingJudgment(False, reason)
     if provider == "none":
@@ -231,25 +250,26 @@ def judge_outgoing(
     system = _SYSTEM
     if first_message:
         answers = applicant_answers or {}
-        folded_text = text.casefold()
+        body = _GREETING_PREFIX.sub("", text.strip(), count=1)
+        first_line = body.partition("\n")[0]
+        sent_sentences = set(_sentence_keys(body))
+        configured_intro = _known_opening(first_line, applicant_intro, allow_legacy_intro=allow_legacy_intro)
+        additional_profile_sentences = sent_sentences - set(_sentence_keys(configured_intro))
         fields.update({
             "titel": _redact(listing_title)[:240],
             "kontext": _redact(_truncate_description(context, 6000)),
-            "vorstellung": _redact(expected_intro.strip().partition("\n")[0]),
+            "vorstellung": _redact(configured_intro),
             "antwortthemen": sorted(answers),
             "verwendete_antworten": {
                 topic: _redact(answer) for topic, answer in answers.items()
-                if answer and answer.casefold() in folded_text
+                if answer and (keys := set(_sentence_keys(answer))) and keys <= sent_sentences
             },
+            "verwendete_profilangaben": [
+                _redact(sentence) for sentence in _sentences(applicant_intro)
+                if sentence.rstrip(".!?").casefold() in additional_profile_sentences
+            ],
             "besichtigungszeiten": viewing_slots,
         })
-        if role == "unknown":
-            sent_profile_text = {part.strip().rstrip(".!?").casefold() for part in _SENTENCE_SPLIT.split(text)}
-            profile_sentences = (part.strip() for part in _SENTENCE_SPLIT.split(applicant_intro))
-            fields["verwendete_profilangaben"] = [
-                _redact(sentence) for sentence in profile_sentences
-                if sentence and sentence.rstrip(".!?").casefold() in sent_profile_text
-            ]
         reasons = {**_MODEL_REASONS, **_FIRST_MESSAGE_REASONS}
         tone = {
             "manager": _MANAGER_FIRST_MESSAGE_TONE,

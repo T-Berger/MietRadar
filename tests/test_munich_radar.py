@@ -404,9 +404,11 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual((role, commercial), ("manager", None))
             self.assertTrue(message.startswith("Guten Tag,"))
             self.assertIn("Architekt", message)
-            self.assertNotIn("koche", message)
+            self.assertIn("In meiner Freizeit koche ich gern.", message)
+            self.assertIn("Wann könnte ich Ihr Zimmer besichtigen?", message)
             self.assertEqual(scanner.add_intro_to_current_drafts(db, NOW), 0)
             self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Entwürfe aktualisiert"], 0)
+            self.assertEqual(db.execute("SELECT message FROM drafts").fetchone(), (message,))
 
     def test_updates_a_neutral_draft_without_replacing_edited_queued_or_sent_messages(self):
         listings = [replace(offer(index, 1), is_wg=True) for index in range(1, 5)]
@@ -423,9 +425,13 @@ class ScannerTest(unittest.TestCase):
             applicant_intro="Ich bin Alex Neumann, 31. Ich arbeite als Architekt. In meiner Freizeit koche ich gern.",
             applicant_answers={"einzug": "Ich könnte zum 1. Dezember einziehen."},
         )
-        old_message = "Hallo,\n\nich interessiere mich für das Zimmer."
-        # Signature stored for this fixture by the previous version of the neutral draft template.
-        old_signature = "322a597ea6b71a912dd729ed180416bcef2d7a36cee9eed0c0f7297ad3ecf0ff"
+        old_message = (
+            "Hallo,\n\nich bin Alex Neumann und arbeite als Architekt. In meiner Freizeit koche ich gern.\n\n"
+            "Ich könnte zum 1. Dezember einziehen. Wann könnte ich mir das Zimmer anschauen?\n\n"
+            "Viele Grüße\nAlex Neumann"
+        )
+        # Signature stored for this fixture by the version that omitted age from neutral drafts.
+        old_signature = "dc25049f9d227b8f64c98a3a81ecfee4c12bb3a82707a2f8924263c514453c14"
         with tempfile.TemporaryDirectory() as directory, closing(_database(Path(directory) / "radar.sqlite3")) as db:
             with db:
                 for listing in listings:
@@ -446,7 +452,8 @@ class ScannerTest(unittest.TestCase):
 
             self.assertEqual(scanner.scan(db, NOW, {})["Entwürfe aktualisiert"], 1)
             messages = dict(db.execute("SELECT id, message FROM drafts"))
-            self.assertIn("ich bin Alex Neumann und arbeite als Architekt.", messages[current.id])
+            self.assertIn("Alex Neumann, 31.", messages[current.id])
+            self.assertIn("Ich arbeite als Architekt.", messages[current.id])
             self.assertIn("In meiner Freizeit koche ich gern.", messages[current.id])
             self.assertTrue(all(messages[listing.id] == old_message for listing in (edited, queued, sent)))
             self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Entwürfe aktualisiert"], 0)
