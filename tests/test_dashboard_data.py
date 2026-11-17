@@ -542,9 +542,64 @@ class DashboardDataTest(unittest.TestCase):
         ])
         self.assertEqual([row.id for row in postings.matches], ["day-only"])
         self.assertEqual(postings.matches[0].published_day, sunday)
+        self.assertIsNone(postings.matches[0].published_at)
+        self.assertEqual(postings.matches[0].first_seen_at, saturday_start)
+        last_minute, day_only, first_minute, fallback = postings.dated_listings
+        self.assertEqual((last_minute.published_at, last_minute.first_seen_at), (monday_start - 1, monday_start - 1))
+        self.assertEqual((day_only.published_at, day_only.published_day), (None, sunday))
+        self.assertEqual(first_minute.published_at, saturday_start)
+        self.assertEqual(fallback.published_at, saturday_start)
 
         sightings = load_dashboard(self.path, now=monday, posting_window=(saturday, sunday), date_basis="first_seen")
         self.assertEqual([(row.id, row.day) for row in sightings.dated_listings], [("sighting", saturday)])
+        self.assertEqual(sightings.dated_listings[0].first_seen_at, saturday_start)
+        self.assertIsNone(sightings.dated_listings[0].published_at)
+
+    def test_current_match_dates_distinguish_publication_first_scan_and_alert(self):
+        current = NOW.timestamp()
+        first_seen = (NOW - timedelta(hours=2)).timestamp()
+        published = (NOW - timedelta(hours=4)).timestamp()
+        rows = [
+            ("10", "https://www.wg-gesucht.de/10.html", "Veröffentlicht"),
+            ("11", "https://www.wg-gesucht.de/11.html", "Veröffentlicht"),
+            ("12", "https://www.wg-gesucht.de/12.html", "zuerst gesehen"),
+            ("ka-13", "https://www.kleinanzeigen.de/s-anzeige/zimmer/13-199-650", "Suchalarm erhalten"),
+        ]
+        with closing(_database(self.path)) as db, db:
+            for listing_id, url, basis in rows:
+                record_listing_availability(db, listing_id, None)
+                db.execute("INSERT INTO drafts VALUES (?, ?, ?, ?, 'Hallo', 0)", (listing_id, url, current, basis))
+            db.execute("""INSERT INTO wg_observations (id, url, first_seen_at, last_seen_at, published_at)
+                          VALUES ('10', ?, ?, ?, ?)""", (rows[0][1], first_seen, current, published))
+
+        matches = {row.id: row for row in load_dashboard(self.path, now=NOW).matches}
+        self.assertEqual({item: (row.published_at, row.first_seen_at) for item, row in matches.items()}, {
+            "10": (published, first_seen), "11": (current, None), "12": (None, current), "ka-13": (None, None),
+        })
+
+    def test_dated_secondary_offers_include_published_listings_without_inventory(self):
+        friday = date(2026, 11, 13)
+        published = (NOW - timedelta(days=2)).timestamp()
+        with closing(_database(self.path)) as db, db:
+            for listing_id, basis, reason in (
+                ("ka-11", "Veröffentlicht", None),
+                ("ka-12", "Veröffentlicht", None),
+                ("ka-13", "Veröffentlicht", "Anzeige nicht mehr verfügbar"),
+                ("ka-14", "Suchalarm erhalten", None),
+            ):
+                url = f"https://www.kleinanzeigen.de/s-anzeige/zimmer/{listing_id[3:]}-199-650"
+                record_listing_availability(db, listing_id, reason)
+                db.execute("INSERT INTO munich_secondary_offers VALUES (?, ?, 'Zimmer', ?, ?, 'b', 'Ostbahnhof', 42)",
+                           (listing_id, url, published, basis))
+        set_listing_hidden(self.path, "ka-12", True, title="Zimmer",
+                           url="https://www.kleinanzeigen.de/s-anzeige/zimmer/12-199-650")
+
+        data = load_dashboard(self.path, now=NOW, posting_window=(friday, friday))
+        self.assertEqual(data.secondary_offers, ())
+        self.assertEqual([(row.id, row.day, row.published_at) for row in data.dated_listings],
+                         [("ka-11", friday, published)])
+        self.assertEqual([(row.id, row.tier, row.published_at) for row in data.dated_secondary_offers],
+                         [("ka-11", "b", published)])
 
     def test_published_drafts_remain_searchable_with_an_old_schema(self):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -554,3 +609,34 @@ class DashboardDataTest(unittest.TestCase):
 
         data = load_dashboard(self.path, now=NOW, posting_window=weekend_dates(NOW.date()))
         self.assertEqual([(row.id, row.day) for row in data.dated_listings], [("12", NOW.date())])
+
+    def test_oldest_first_queries_beyond_the_latest_hundred_postings(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TABLE drafts (id TEXT, url TEXT, fresh_at REAL, basis TEXT, message TEXT, done INTEGER)")
+            db.executemany("INSERT INTO drafts VALUES (?, 'https://www.wg-gesucht.de/test.html', ?, 'Veröffentlicht', NULL, 1)",
+                           [(str(index), NOW.timestamp() - 101 + index) for index in range(101)])
+
+        window = (NOW.date(), NOW.date())
+        latest = load_dashboard(self.path, now=NOW, posting_window=window).dated_listings
+        oldest = load_dashboard(self.path, now=NOW, posting_window=window, newest_first=False).dated_listings
+        self.assertEqual((latest[0].id, latest[-1].id), ("100", "1"))
+        self.assertEqual((oldest[0].id, oldest[-1].id), ("0", "99"))
+
+    def test_historical_matches_are_filtered_before_the_result_limit(self):
+        url = "https://www.wg-gesucht.de/test.html"
+        first_seen = NOW.timestamp() - 102
+        sightings = [(str(index), url, first_seen + index, NOW.timestamp()) for index in range(102)]
+        with closing(_database(self.path)) as db, db:
+            db.executemany("INSERT INTO wg_observations(id, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)",
+                           sightings)
+            db.executemany("INSERT INTO listing_availability(id, policy_version) VALUES (?, ?)",
+                           [(row[0], AVAILABILITY_POLICY_VERSION) for row in sightings])
+            db.execute("INSERT INTO drafts VALUES ('0', ?, ?, 'zuerst gesehen', 'Hallo', 0)", (url, first_seen))
+            db.execute("""INSERT INTO munich_secondary_offers(id, url, title, fresh_at, basis, tier, station, minutes)
+                          VALUES ('1', ?, 'Zimmer', ?, 'zuerst gesehen', 'b', 'Ostbahnhof', 40)""",
+                       (url, first_seen + 1))
+
+        data = load_dashboard(self.path, now=NOW, posting_window=(NOW.date(), NOW.date()),
+                              date_basis="first_seen", only_matches=True)
+        self.assertEqual([row.id for row in data.dated_listings], ["1", "0"])
+        self.assertEqual([row.id for row in data.dated_secondary_offers], ["1"])

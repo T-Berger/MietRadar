@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from html import escape
+from itertools import groupby
 from math import isfinite, log2
 from pathlib import Path
 from typing import TypeVar
@@ -102,6 +103,7 @@ INTRO = """
   .radar-listing__section .radar-fit-possible { background: #fcf1d7; color: #664713; }
   .radar-listing__section .radar-fit-unclear { background: #efeaed; color: #51434e; }
   .radar-listing .radar-listing__foot { font-size: .8rem; opacity: .86; }
+  .radar-listing header .radar-listing__foot { margin-top: .35rem; }
 </style>
 <header class="radar-heading"><p class="place">MÜNCHEN</p><h1>MietRadar</h1>
 <p>Neue Mietangebote und deine Nachrichten.</p></header>
@@ -349,8 +351,8 @@ def _listing_card(
         '<article class="radar-listing"><header>'
         f'<div class="radar-listing__meta"><span class="radar-listing__source">{escape(platform)}</span>'
         f'{provider}{recipient_badge}{badge}</div>'
-        f'<h3>{escape(title)}</h3></header>{photos}<div class="radar-listing__facts">{facts}</div>'
-        f'{"".join(sections)}<p class="radar-listing__foot">{escape(date_label)}</p></article>'
+        f'<h3>{escape(title)}</h3><p class="radar-listing__foot">{escape(date_label)}</p></header>'
+        f'{photos}<div class="radar-listing__facts">{facts}</div>{"".join(sections)}</article>'
     )
     if map_key is not None:
         _offer_location_map(profile, title, key=map_key)
@@ -495,52 +497,104 @@ def _offer_page(rows: Sequence[OfferRow], view: str) -> Sequence[OfferRow]:
     return rows[start:start + OFFERS_PER_PAGE]
 
 
+def _reset_offer_pages() -> None:
+    for view in ("current", "dated", "secondary"):
+        st.session_state.pop(f"{view}_offer_page", None)
+
+
+def _offer_date(row: Match | DatedListing | SecondaryListing, basis: DateBasis | None) -> tuple[date, float | None]:
+    if basis == "first_seen":
+        stamp, day = row.first_seen_at, None
+    else:
+        stamp, day = row.published_at, row.published_day
+    if stamp is not None:
+        return datetime.fromtimestamp(stamp, BERLIN).date(), stamp
+    if day is not None:
+        return day, None
+    if isinstance(row, DatedListing):
+        return row.day, None
+    stamp = row.first_seen_at if row.first_seen_at is not None else row.fresh_at
+    return datetime.fromtimestamp(stamp, BERLIN).date(), stamp
+
+
+def _daily_offer_page(
+    rows: Sequence[OfferRow], view: str, newest_first: bool, basis: DateBasis | None = None,
+) -> Iterator[OfferRow]:
+    direction = -1 if newest_first else 1
+
+    def order(row: OfferRow) -> tuple[int, bool, float, str]:
+        day, stamp = _offer_date(row, basis)
+        return direction * day.toordinal(), stamp is None, direction * (stamp or 0), row.id
+
+    page = _offer_page(sorted(rows, key=order), view)
+    for day, offers in groupby(page, key=lambda row: _offer_date(row, basis)[0]):
+        st.subheader(f"{WEEKDAYS[day.weekday()]}, {day:%d.%m.%Y}", anchor=False)
+        yield from offers
+
+
+def _offer_date_label(row: Match | DatedListing | SecondaryListing) -> str:
+    if row.published_at is not None:
+        posting = f"Veröffentlicht · {_date(row.published_at)}"
+    elif row.published_day is not None:
+        posting = f"{_posting_day(row.published_day)} · Uhrzeit unbekannt"
+    else:
+        posting = "Einstelldatum unbekannt"
+
+    if row.first_seen_at is not None:
+        return f"{posting} · Zuerst gesehen · {_date(row.first_seen_at)}"
+    if not isinstance(row, DatedListing) and row.basis.casefold().startswith("suchalarm"):
+        return f"{posting} · Suchalarm · {_date(row.fresh_at)}"
+    return posting
+
+
+def _render_match(
+    row: Match, profile: ListingProfile | None, db_path: Path, hours: int, *, view: str,
+    review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
+    show_maps: bool,
+) -> None:
+    tier, route = _primary_route(profile)
+    with st.container(border=True):
+        date_label = _offer_date_label(row)
+        if row.basis == "zuerst gesehen" and row.message and row.state != "queued":
+            if review_available and reviewed_send and row.platform == "WG-Gesucht":
+                date_label += " · Versand nur nach Freigabe"
+            else:
+                date_label += " · nur als Entwurf"
+        status = STATES.get(row.state, "Entwurf")
+        if row.judge_approved is False:
+            status = "Freigegeben · Text zurückgehalten" if row.state == "queued" else "Text zurückgehalten"
+        elif row.state == "queued" and row.review_reason:
+            status = "Freigegeben · Versand verzögert"
+        _listing_card(
+            profile, title=_headline(row.url), platform=row.platform,
+            status=f"{tier} · {status}", date_label=f"{date_label} · {row.id}", route=route,
+            map_key=f"{view}_map_{row.id}" if show_maps and row.state != "unavailable" else None,
+        )
+        _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
+                       row.url, view=view)
+        _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
+                     attachment=attachment)
+
+
 def _matches(
     rows: tuple[Match, ...], hours: int, wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile],
-    db_path: Path, *, review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
-    show_maps: bool,
+    db_path: Path, *, newest_first: bool, review_available: bool, reviewed_send: bool,
+    attachment: ApplicationAttachmentInfo | None, show_maps: bool,
 ) -> None:
     st.subheader("Neue Mietangebote", anchor=False)
     _scan_status(wg_scan)
-    platforms = sorted({row.platform for row in rows})
+    category = st.selectbox("ÖPNV-Kategorie", ("A* und A", "A*", "A"), key="current_offer_category",
+                            on_change=_reset_offer_pages)
     if not rows:
         st.info(f"Keine passenden Angebote in den letzten {hours} Stunden.")
         return
-    platform = st.selectbox("Plattform", ["Alle", *platforms]) if len(platforms) > 1 else "Alle"
-    category = st.selectbox("ÖPNV-Kategorie", ["A* und A", "A*", "A"])
-    filtered = [row for row in rows if (platform == "Alle" or row.platform == platform)
-                and (category == "A* und A" or _primary_route(profiles.get(row.id))[0] == category)]
+    filtered = [row for row in rows if category == "A* und A" or _primary_route(profiles.get(row.id))[0] == category]
     if not filtered:
         st.info("Keine Angebote mit diesen Filtern.")
         return
-    for row in _offer_page(filtered, "current"):
-        profile = profiles.get(row.id)
-        tier, route = _primary_route(profile)
-        with st.container(border=True):
-            date_label = f"{row.basis.capitalize()} · {_date(row.fresh_at)}"
-            if row.basis == "zuerst gesehen":
-                posting = (f"{_posting_day(row.published_day)}, Uhrzeit unbekannt"
-                           if row.published_day else "Veröffentlichungsdatum unbekannt")
-                date_label = f"{date_label} · {posting}"
-                if row.message and row.state != "queued":
-                    if review_available and reviewed_send and row.platform == "WG-Gesucht":
-                        date_label += " · Versand nur nach Freigabe"
-                    else:
-                        date_label += " · nur als Entwurf"
-            status = STATES.get(row.state, "Entwurf")
-            if row.judge_approved is False:
-                status = "Freigegeben · Text zurückgehalten" if row.state == "queued" else "Text zurückgehalten"
-            elif row.state == "queued" and row.review_reason:
-                status = "Freigegeben · Versand verzögert"
-            _listing_card(
-                profile, title=_headline(row.url), platform=row.platform,
-                status=f"{tier} · {status}", date_label=f"{date_label} · {row.id}", route=route,
-                map_key=f"current_map_{row.id}" if show_maps and row.state != "unavailable" else None,
-            )
-            _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
-                           row.url, view="current")
-            _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
-                         attachment=attachment)
+    for row in _daily_offer_page(filtered, "current", newest_first):
+        _render_match(row, profiles.get(row.id), db_path, hours, view="current", review_available=review_available,
+                      reviewed_send=reviewed_send, attachment=attachment, show_maps=show_maps)
 
 
 def _scan_status(wg_scan: tuple[float, int] | None) -> None:
@@ -549,26 +603,34 @@ def _scan_status(wg_scan: tuple[float, int] | None) -> None:
         st.caption(f"Letzte WG-Gesucht-Suche: {_date(timestamp)} · Sichtbare Anzeigen erfasst: {count}")
 
 
-def _date_filter(today: date) -> tuple[DateBasis | None, tuple[date, date] | None]:
-    current = "Aktuelle Treffer"
-    weekend = "Dieses Wochenende" if today.weekday() >= 5 else "Letztes Wochenende"
-    custom = "Eigener Zeitraum"
-    selected = st.selectbox("Zeitraum für Angebote", [current, weekend, custom])
-    if selected == current:
+def _date_filter(selected: str, today: date) -> tuple[DateBasis | None, tuple[date, date] | None]:
+    if selected == "current":
         return None, None
-    date_label = st.radio("Datum filtern nach", ["Veröffentlicht", "Zuerst gesehen"])
-    basis: DateBasis = "first_seen" if date_label == "Zuerst gesehen" else "published"
+    basis: DateBasis = st.radio(
+        "Datum filtern nach", ("published", "first_seen"), horizontal=True, key="offer_date_basis",
+        format_func={"published": "Veröffentlicht", "first_seen": "Zuerst gesehen (Einstelldatum fehlt)"}.__getitem__,
+        on_change=_reset_offer_pages,
+    )
+    if selected == "today":
+        return basis, (today, today)
+    if selected == "yesterday":
+        yesterday = today - timedelta(days=1)
+        return basis, (yesterday, yesterday)
+    if selected == "week":
+        return basis, (today - timedelta(days=6), today)
     start, end = weekend_dates(today)
-    if selected == weekend:
+    if selected == "weekend":
         return basis, (start, min(end, today))
-    days = st.date_input("Von – bis", (start, min(end, today)), max_value=today, format="DD.MM.YYYY")
+    days = st.date_input("Von – bis", (start, min(end, today)), max_value=today, format="DD.MM.YYYY",
+                         key="offer_custom_dates", on_change=_reset_offer_pages)
     return basis, days if isinstance(days, tuple) and len(days) == 2 else None
 
 
 def _dated_offers(
     rows: tuple[DatedListing, ...], days: tuple[date, date] | None, basis: DateBasis,
     wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile], db_path: Path,
-    *, provider_filtered: bool = False, show_maps: bool,
+    *, newest_first: bool, current_matches: dict[str, Match], hours: int, review_available: bool,
+    reviewed_send: bool, attachment: ApplicationAttachmentInfo | None, show_maps: bool,
 ) -> None:
     sightings = basis == "first_seen"
     st.subheader("Zuerst erfasste Mietangebote" if sightings else "Veröffentlichte Mietangebote", anchor=False)
@@ -580,30 +642,37 @@ def _dated_offers(
     st.caption(f"{start:%d.%m.%Y} bis {end:%d.%m.%Y} · Münchner Zeit")
     if sightings:
         st.caption("Die erste Suche erfasst auch Anzeigen, die schon online sind.")
-    if not rows:
-        if provider_filtered:
-            st.info("Für diesen Zeitraum gibt es keine Angebote dieses Anbietertyps.")
+    category = st.selectbox("ÖPNV-Kategorie", ("Alle", "A*", "A"), key="dated_offer_category",
+                            on_change=_reset_offer_pages)
+    filtered = []
+    for row in rows:
+        profile = profiles.get(row.id)
+        tier = profile.route_tier.upper() if profile and profile.route_tier else None
+        if category == "Alle" or (row.matched and tier == category):
+            filtered.append(row)
+    if not filtered:
+        if not rows and not sightings:
+            st.info("Keine Angebote mit bestätigtem Einstelldatum für diese Filter. Wähle „Zuerst gesehen (Einstelldatum fehlt)“, "
+                    "um stattdessen nach der ersten Erfassung durch MietRadar zu filtern.")
         else:
-            st.info("Für diesen Zeitraum gibt es keine Erstsichtungen ohne Veröffentlichungsdatum." if sightings else
-                    "Für diesen Zeitraum wurde kein Veröffentlichungsdatum bestätigt. Unter „Zuerst gesehen“ stehen die Erstsichtungen ohne Datum.")
+            st.info("Keine Angebote mit diesen Filtern.")
         return
     if len(rows) == RESULT_LIMIT:
         st.caption(f"Anzeige auf {RESULT_LIMIT} Ergebnisse begrenzt.")
-    for row in _offer_page(rows, "dated"):
+    for row in _daily_offer_page(filtered, "dated", newest_first, basis):
+        profile = profiles.get(row.id)
+        if match := current_matches.get(row.id):
+            _render_match(match, profile, db_path, hours, view="dated", review_available=review_available,
+                          reviewed_send=reviewed_send, attachment=attachment, show_maps=show_maps)
+            continue
         with st.container(border=True):
-            if sightings:
-                date_label = (f"Zuerst gesehen am {WEEKDAYS[row.day.weekday()]}, {row.day:%d.%m.%Y}"
-                              " · Veröffentlichungsdatum unbekannt")
-            else:
-                date_label = _posting_day(row.day)
-            profile = profiles.get(row.id)
             status = "Filter erfüllt" if row.matched else "Erfasst"
             route = None
             if row.matched and profile and profile.route_tier in {"a*", "a"}:
                 tier, route = _primary_route(profile)
                 status = f"{tier} · {status}"
             _listing_card(profile, title=_headline(row.url), platform=row.platform,
-                          status=status, date_label=date_label, route=route,
+                          status=status, date_label=_offer_date_label(row), route=route,
                           map_key=f"dated_map_{row.id}" if show_maps else None)
             _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
                            row.url, view="dated")
@@ -625,27 +694,25 @@ def _addresses(rows: tuple[AddressCheck, ...], profiles: dict[str, ListingProfil
 
 
 def _secondary_offers(
-    rows: tuple[SecondaryListing, ...], hours: int, profiles: dict[str, ListingProfile], db_path: Path,
+    rows: tuple[SecondaryListing, ...], profiles: dict[str, ListingProfile], db_path: Path, *,
+    newest_first: bool, basis: DateBasis | None,
 ) -> None:
     st.caption("Bis zu 45 Min. mit dem ÖPNV ab Ostbahnhof für B oder ab Hauptbahnhof für C. Passt beides, gilt B.")
-    if not rows:
-        st.info(f"Keine Angebote der Kategorie B oder C in den letzten {hours} Stunden.")
+    category = st.selectbox("ÖPNV-Kategorie", ("B und C", "B", "C"), key="secondary_offer_category",
+                            on_change=_reset_offer_pages)
+    filtered = [row for row in rows if category == "B und C" or row.tier.upper() == category]
+    if not filtered:
+        st.info("Keine Angebote mit diesen Filtern.")
         return
-    page = _offer_page(sorted(rows, key=lambda row: row.tier), "secondary")
-    for tier in ("b", "c"):
-        offers = [row for row in page if row.tier == tier]
-        if not offers:
-            continue
-        st.subheader(f"Kategorie {tier.upper()}", anchor=False)
-        for row in offers:
-            station = "Hauptbahnhof" if row.station == "Hbf" else row.station
-            with st.container(border=True):
-                profile = profiles.get(row.id)
-                title = (profile.title if profile else None) or row.title or _headline(row.url)
-                _listing_card(profile, title=title, platform=row.platform,
-                              status="", date_label=f"{row.basis.capitalize()} · {_date(row.fresh_at)}",
-                              route=(f"Ab {station}", f"{row.minutes} Min."), map_key=f"secondary_map_{row.id}")
-                _offer_actions(db_path, row.id, title, row.url, view="secondary")
+    for row in _daily_offer_page(filtered, "secondary", newest_first, basis):
+        station = "Hauptbahnhof" if row.station == "Hbf" else row.station
+        with st.container(border=True):
+            profile = profiles.get(row.id)
+            title = (profile.title if profile else None) or row.title or _headline(row.url)
+            _listing_card(profile, title=title, platform=row.platform, status=f"Kategorie {row.tier.upper()}",
+                          date_label=_offer_date_label(row), route=(f"Ab {station}", f"{row.minutes} Min."),
+                          map_key=f"secondary_map_{row.id}")
+            _offer_actions(db_path, row.id, title, row.url, view="secondary")
 
 
 def _hidden_offers(rows: tuple[HiddenListing, ...], db_path: Path) -> None:
@@ -743,13 +810,34 @@ def main() -> None:
     with st.sidebar:
         st.header("MietRadar")
         st.button("Aktualisieren", icon=":material/refresh:")
-        date_basis, date_window = _date_filter(now.astimezone(BERLIN).date())
-        provider = st.selectbox("Anbietertyp", tuple(PROVIDER_FILTER_LABELS), format_func=PROVIDER_FILTER_LABELS.__getitem__)
+        provider = st.selectbox("Anbietertyp", tuple(PROVIDER_FILTER_LABELS),
+                                format_func=PROVIDER_FILTER_LABELS.__getitem__, on_change=_reset_offer_pages)
         logout_button()
+
+    today = now.astimezone(BERLIN).date()
+    periods = {
+        "current": f"Letzte {hours} Stunden", "today": "Heute", "yesterday": "Gestern",
+        "weekend": "Dieses Wochenende" if today.weekday() >= 5 else "Letztes Wochenende",
+        "week": "Letzte 7 Tage", "custom": "Eigener Zeitraum",
+    }
+    period_column, platform_column, sort_column = st.columns(3)
+    selected_period = period_column.selectbox("Zeitraum", tuple(periods), format_func=periods.__getitem__,
+                                              key="offer_period", on_change=_reset_offer_pages)
+    platform = platform_column.selectbox("Plattform", ("Alle", "WG-Gesucht", "Kleinanzeigen"),
+                                         key="offer_platform", on_change=_reset_offer_pages)
+    newest_first = sort_column.selectbox("Sortierung", ("Neueste zuerst", "Älteste zuerst"),
+                                          key="offer_order", on_change=_reset_offer_pages) == "Neueste zuerst"
+    date_basis, date_window = _date_filter(selected_period, today)
+    only_matches = False
+    if date_basis is not None:
+        only_matches = st.checkbox("Nur passende Angebote", value=True, key="offer_only_matches",
+                                   help="Zeigt Treffer der ÖPNV-Kategorien A*, A, B und C.",
+                                   on_change=_reset_offer_pages)
 
     db_path = directory / "munich_radar.sqlite3"
     data = load_dashboard(db_path, now=now, max_age_hours=hours,
-                          posting_window=date_window, date_basis=date_basis or "published")
+                          posting_window=date_window, date_basis=date_basis or "published", newest_first=newest_first,
+                          only_matches=only_matches)
     if data.status == "missing":
         st.info("MietRadar hat hier noch keine Datenbank angelegt. Starte den Worker für den ersten Suchlauf.")
         return
@@ -757,6 +845,10 @@ def main() -> None:
         st.warning("Die MietRadar-Daten konnten gerade nicht gelesen werden. Aktualisiere die Seite in Kürze.")
         return
     data = filter_listing_providers(data, provider)
+    current_rows = tuple(row for row in data.matches if platform == "Alle" or row.platform == platform)
+    dated_rows = tuple(row for row in data.dated_listings if platform == "Alle" or row.platform == platform)
+    secondary_rows = data.secondary_offers if date_basis is None else data.dated_secondary_offers
+    secondary_rows = tuple(row for row in secondary_rows if platform == "Alle" or row.platform == platform)
     if notice := st.session_state.pop(_REVIEW_NOTICE, None):
         st.success(notice)
     if visibility_notice := st.session_state.pop(_VISIBILITY_NOTICE, None):
@@ -769,10 +861,10 @@ def main() -> None:
     matches, drafts, pending = st.columns(3)
     if date_basis:
         label = "Zuerst erfasste Angebote" if date_basis == "first_seen" else "Veröffentlichte Angebote"
-        matches.metric(label, len(data.dated_listings), border=True)
+        matches.metric(label, len(dated_rows), border=True)
     else:
-        matches.metric("Neue Angebote", len(data.matches), border=True)
-    drafts.metric("Bewerbungsentwürfe", sum(bool(row.message) for row in data.matches), border=True)
+        matches.metric("Neue Angebote", len(current_rows), border=True)
+    drafts.metric("Bewerbungsentwürfe", sum(bool(row.message) for row in current_rows), border=True)
     pending.metric("Adressen zur Prüfung", len(data.address_checks), border=True)
     offers, applications, map_tab, secondary, address, replies, activity, hidden = st.tabs(
         ["Angebote", "Bewerbungen", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf", "Ausgeblendet"],
@@ -790,10 +882,12 @@ def main() -> None:
             else:
                 _credit_proof(db_path, attachment)
         if date_basis:
-            _dated_offers(data.dated_listings, date_window, date_basis, data.wg_scan, data.listing_profiles, db_path,
-                          provider_filtered=provider != "all", show_maps=bool(offers.open))
+            _dated_offers(dated_rows, date_window, date_basis, data.wg_scan, data.listing_profiles, db_path,
+                          newest_first=newest_first, current_matches={row.id: row for row in current_rows}, hours=hours,
+                          review_available=data.application_reviews_available, reviewed_send=reviewed_send,
+                          attachment=attachment, show_maps=bool(offers.open))
         else:
-            _matches(data.matches, hours, data.wg_scan, data.listing_profiles, db_path,
+            _matches(current_rows, hours, data.wg_scan, data.listing_profiles, db_path, newest_first=newest_first,
                      review_available=data.application_reviews_available,
                      reviewed_send=reviewed_send, attachment=attachment, show_maps=bool(offers.open))
     if applications.open:
@@ -801,10 +895,11 @@ def main() -> None:
             _sent_applications(data.sent_applications)
     if map_tab.open:
         with map_tab:
-            _listing_map(map_listings(data, date_filtered=date_basis is not None), db_path)
+            map_rows = map_listings(data, date_filtered=date_basis is not None)
+            _listing_map(tuple(row for row in map_rows if platform == "Alle" or row.platform == platform), db_path)
     if secondary.open:
         with secondary:
-            _secondary_offers(data.secondary_offers, hours, data.listing_profiles, db_path)
+            _secondary_offers(secondary_rows, data.listing_profiles, db_path, newest_first=newest_first, basis=date_basis)
     with address:
         _addresses(data.address_checks, data.listing_profiles, db_path)
     with replies:
