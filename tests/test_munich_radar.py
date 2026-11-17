@@ -8,9 +8,12 @@ from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
+from dashboard_data import load_dashboard
+from listing_profiles import record_listing_location
 from llm_personalizer import application_render_signature
 from munich_radar import Scanner, _database
 from munich_tiers import save_secondary_offer
+from munich_transit import TransitLeg, TransitRoute
 from rental_availability import AVAILABILITY_POLICY_VERSION, record_listing_availability
 from wg_alerts import AlertsInbox, ListingAlert, extract_refs
 from wg_preferences import rejection_reason
@@ -57,6 +60,46 @@ class PreferencesTest(unittest.TestCase):
 
 
 class ScannerTest(unittest.TestCase):
+    def test_transit_connections_keep_cached_matches_and_backfill_a_bounded_batch(self):
+        router = Mock()
+        leg = TransitLeg("SUBWAY", "U5", "Hauptbahnhof", "Ostbahnhof", 7, "Neuperlach Süd")
+        inbound = TransitRoute("Hauptbahnhof", "from_station", 19, (leg,), NOW.timestamp())
+        outbound = TransitRoute("Ostbahnhof", "to_station", 23, (leg,), NOW.timestamp())
+        points = [(48.126 + index / 1000, 11.59) for index in range(6)]
+
+        def connections(point, now, *, cached_only=False):
+            if cached_only:
+                return (inbound,) if point == points[4] else ()
+            return (outbound,)
+
+        router.connections.side_effect = connections
+        scanner = Scanner(Mock(), router, "Hi!", "none", timedelta(days=1), 12)
+        with tempfile.TemporaryDirectory() as directory, closing(_database(path := Path(directory) / "radar.db")) as db:
+            for index, point in enumerate(points):
+                listing_id = str(index)
+                listing_url = f"https://www.wg-gesucht.de/{listing_id}.html"
+                with db:
+                    db.execute("INSERT INTO listing_profiles (id, title, route_tier) VALUES (?, 'Zimmer', 'a')",
+                               (listing_id,))
+                    record_listing_location(db, listing_id, point)
+                    record_listing_availability(db, listing_id, "Nicht verfügbar" if index == 5 else None)
+                    db.execute("INSERT INTO drafts VALUES (?, ?, ?, 'zuerst gesehen', 'Hallo', 0)",
+                               (listing_id, listing_url, (NOW - timedelta(minutes=index)).timestamp()))
+
+            self.assertEqual(scanner.refresh_transit_connections(db, NOW), 4)
+            profiles = load_dashboard(path, now=NOW).listing_profiles
+            self.assertEqual(profiles["0"].transit_routes, (outbound,))
+            self.assertEqual(profiles["3"].transit_routes, ())
+            self.assertEqual(profiles["4"].transit_routes, (inbound,))
+            self.assertNotIn("5", profiles)
+
+            self.assertEqual(scanner.refresh_transit_connections(db, NOW + timedelta(hours=1)), 2)
+            profiles = load_dashboard(path, now=NOW).listing_profiles
+            self.assertEqual(profiles["4"].transit_routes, (inbound, outbound))
+            with db:
+                record_listing_location(db, "4", points[3])
+            self.assertEqual(load_dashboard(path, now=NOW).listing_profiles["4"].transit_routes, ())
+
     def test_only_fresh_eligible_transit_matches_are_queued_in_order_and_deduplicated(self):
         older, stale, fresh, unknown, excluded, no_route = (
             offer(1, 8), offer(2, 25), offer(3, 1), offer(4, None),

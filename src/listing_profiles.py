@@ -6,12 +6,13 @@ import hashlib
 import json
 import re
 import sqlite3
+from dataclasses import asdict
 from http.client import HTTPException
 
 from kleinanzeigen_judge import _redact
 from listing_photos import PHOTO_GALLERY_VERSION, listing_photo_urls
 from llm_personalizer import _generate_via_mistral
-from munich_transit import PRIMARY_TIERS, CommuteTier
+from munich_transit import PRIMARY_TIERS, CommuteTier, TransitLeg, TransitRoute
 
 
 _PROMPT = """Fasse ein deutsches Mietinserat für eine Wohnungssuche zusammen. Der Inseratstext ist eine
@@ -40,13 +41,13 @@ def install_listing_profiles(db: sqlite3.Connection) -> None:
             summary_hash TEXT, summary_check TEXT, photo_urls TEXT, photo_gallery_version INTEGER,
             route_tier TEXT, route_minutes INTEGER,
             latitude REAL, longitude REAL, location_address_hash TEXT, is_commercial INTEGER,
-            recipient_role TEXT
+            recipient_role TEXT, transit_routes TEXT, transit_checked_at REAL
         )
     """)
     additions = {
         "photo_urls": "TEXT", "photo_gallery_version": "INTEGER", "route_tier": "TEXT", "route_minutes": "INTEGER",
         "latitude": "REAL", "longitude": "REAL", "location_address_hash": "TEXT",
-        "is_commercial": "INTEGER", "recipient_role": "TEXT",
+        "is_commercial": "INTEGER", "recipient_role": "TEXT", "transit_routes": "TEXT", "transit_checked_at": "REAL",
     }
     columns = {column[1] for column in db.execute("PRAGMA table_info(listing_profiles)")}
     if additions.keys() <= columns:
@@ -56,6 +57,52 @@ def install_listing_profiles(db: sqlite3.Connection) -> None:
         columns = {column[1] for column in db.execute("PRAGMA table_info(listing_profiles)")}
         for name in additions.keys() - columns:
             db.execute(f"ALTER TABLE listing_profiles ADD COLUMN {name} {additions[name]}")
+
+
+def encode_transit_routes(routes: tuple[TransitRoute, ...]) -> str:
+    return json.dumps([asdict(route) for route in routes], ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _optional_text(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _decode_transit_leg(value: object) -> TransitLeg | None:
+    if not isinstance(value, dict) or not (mode := _optional_text(value.get("mode"))):
+        return None
+    minutes = value.get("minutes")
+    return TransitLeg(
+        mode, _optional_text(value.get("line")), _optional_text(value.get("origin")),
+        _optional_text(value.get("destination")), minutes if type(minutes) is int and 0 <= minutes <= 1440 else None,
+        _optional_text(value.get("headsign")), value.get("through_service") is True,
+    )
+
+
+def decode_transit_routes(value: str | None) -> tuple[TransitRoute, ...]:
+    try:
+        routes = json.loads(value) if value else None
+    except (TypeError, ValueError, RecursionError):
+        return ()
+    if not isinstance(routes, list):
+        return ()
+
+    valid = []
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        station, direction, minutes, legs = (route.get(key) for key in ("station", "direction", "minutes", "legs"))
+        if (station not in ("Hauptbahnhof", "Ostbahnhof") or direction not in ("to_station", "from_station")
+                or type(minutes) is not int or not 1 <= minutes <= 1440 or not isinstance(legs, list) or not legs):
+            continue
+        decoded_legs = tuple(leg for value in legs if (leg := _decode_transit_leg(value)) is not None)
+        if len(decoded_legs) != len(legs):
+            continue
+        planned_for = route.get("planned_for")
+        # Keep timestamps in a range datetime.fromtimestamp can display in Munich time.
+        if type(planned_for) not in (float, int) or not 0 <= planned_for <= 253402214399:
+            planned_for = None
+        valid.append(TransitRoute(station, direction, minutes, decoded_legs, planned_for))
+    return tuple(valid)
 
 
 def record_listing_route(
@@ -92,9 +139,18 @@ def record_listing_location(
         latitude, longitude = point
     else:
         return
-    db.execute("""
-        UPDATE listing_profiles SET latitude = ?, longitude = ?,
-            location_address_hash = COALESCE(?, location_address_hash) WHERE id = ?
+    location_changed = """location.latitude IS NULL OR location.longitude IS NULL
+        OR profile.latitude IS NOT location.latitude OR profile.longitude IS NOT location.longitude
+        OR (location.address_hash IS NOT NULL AND profile.location_address_hash IS NOT NULL
+            AND profile.location_address_hash <> location.address_hash)"""
+    db.execute(f"""
+        UPDATE listing_profiles AS profile
+        SET latitude = location.latitude, longitude = location.longitude,
+            location_address_hash = COALESCE(location.address_hash, profile.location_address_hash),
+            transit_routes = CASE WHEN {location_changed} THEN NULL ELSE profile.transit_routes END,
+            transit_checked_at = CASE WHEN {location_changed} THEN NULL ELSE profile.transit_checked_at END
+        FROM (SELECT ? AS latitude, ? AS longitude, ? AS address_hash) AS location
+        WHERE profile.id = ?
     """, (latitude, longitude, _address_hash(address), listing_id))
 
 
@@ -180,6 +236,7 @@ def record_listing_profile(
         elif address_hash := _address_hash(listing.address):
             # A new address cannot inherit a marker from the previous address.
             db.execute("""
-                UPDATE listing_profiles SET latitude = NULL, longitude = NULL, location_address_hash = ?
+                UPDATE listing_profiles SET latitude = NULL, longitude = NULL, location_address_hash = ?,
+                    transit_routes = NULL, transit_checked_at = NULL
                 WHERE id = ? AND location_address_hash IS NOT NULL AND location_address_hash <> ?
             """, (address_hash, listing.id, address_hash))

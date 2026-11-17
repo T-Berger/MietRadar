@@ -19,7 +19,8 @@ DEFAULT_TRANSIT_API_URL = "https://api.transitous.org/api"
 # Station entrances as coordinates keep them independent of feed-specific stop IDs.
 HAUPTBAHNHOF = "48.14021,11.55853"
 OSTBAHNHOF = "48.12806,11.60365"
-STATIONS = (HAUPTBAHNHOF, OSTBAHNHOF)
+_STATION_NAMES = {HAUPTBAHNHOF: "Hauptbahnhof", OSTBAHNHOF: "Ostbahnhof"}
+STATIONS = tuple(_STATION_NAMES)
 USER_AGENT = "MietRadar/1.0 (+https://github.com/T-Berger/MietRadar)"
 MUNICH_TIME = ZoneInfo("Europe/Berlin")
 PRIORITY_DURATION_SECONDS = 20 * 60
@@ -27,6 +28,7 @@ MAX_DURATION_SECONDS = 30 * 60
 SECONDARY_DURATION_SECONDS = 45 * 60
 PRIMARY_TIERS = frozenset({"a*", "a"})
 CommuteTier = Literal["a*", "a", "b", "c", "outside"]
+TransitDirection = Literal["to_station", "from_station"]
 MAX_REQUESTS_PER_DAY = 300
 _DAY = 24 * 60 * 60
 _CITY_NAMES = {"münchen", "muenchen", "munich"}
@@ -124,9 +126,57 @@ def _route_seconds(itinerary, departure: datetime) -> float | None:
 
 
 @dataclass(frozen=True)
+class TransitLeg:
+    mode: str
+    line: str | None
+    origin: str | None
+    destination: str | None
+    minutes: int | None
+    headsign: str | None = None
+    through_service: bool = False
+
+
+@dataclass(frozen=True)
+class TransitRoute:
+    station: str
+    direction: TransitDirection
+    minutes: int
+    legs: tuple[TransitLeg, ...]
+    planned_for: float | None = None
+
+
+def _transit_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return " ".join(value.split())[:160] or None
+
+
+def _stop_name(place: object) -> str | None:
+    name = _transit_text(place.get("name")) if isinstance(place, dict) else None
+    return None if name in {"START", "END"} else name
+
+
+def _transit_leg(leg: dict) -> TransitLeg:
+    duration = leg.get("duration")
+    minutes = None
+    if type(duration) in (int, float) and 0 <= duration <= SECONDARY_DURATION_SECONDS:
+        minutes = math.ceil(duration / 60)
+    return TransitLeg(
+        mode=leg["mode"],
+        line=_transit_text(leg.get("routeShortName")) or _transit_text(leg.get("displayName")),
+        origin=_stop_name(leg.get("from")),
+        destination=_stop_name(leg.get("to")),
+        minutes=minutes,
+        headsign=_transit_text(leg.get("headsign")),
+        through_service=leg.get("interlineWithPreviousLeg") is True,
+    )
+
+
+@dataclass(frozen=True)
 class _StationRoutes:
     fastest_seconds: float = math.inf
     incomplete: bool = False
+    legs: tuple[TransitLeg, ...] = ()
 
     def within(self, limit: int) -> bool | None:
         if self.fastest_seconds <= limit:
@@ -204,6 +254,38 @@ class TransitRouter:
                 return tier, math.ceil(routes.fastest_seconds / 60)
         return "outside", None
 
+    def connections(
+        self, coordinates: tuple[float, float], now: datetime, *, cached_only: bool = False,
+    ) -> tuple[TransitRoute, ...]:
+        """Find scheduled routes in both directions for a known Munich location."""
+        latitude, longitude = coordinates
+        if not 47.99 <= latitude <= 48.30 or not 11.30 <= longitude <= 11.75:
+            return ()
+        point = f"{latitude:.7f},{longitude:.7f}"
+        departure = _next_weekday_departure(now)
+        planned_for = departure.timestamp()
+        reserve_requests = MAX_REQUESTS_PER_DAY // 4
+        routes = []
+        directions: tuple[TransitDirection, ...] = ("to_station", "from_station")
+        for direction in directions:
+            for station, name in _STATION_NAMES.items():
+                origin, destination = (point, station) if direction == "to_station" else (station, point)
+                result = None
+                if direction == "to_station":
+                    short = self._routes_between(origin, destination, departure, MAX_DURATION_SECONDS, cached_only=True)
+                    if short.fastest_seconds <= MAX_DURATION_SECONDS:
+                        result = short
+                if result is None:
+                    result = self._routes_between(
+                        origin, destination, departure, SECONDARY_DURATION_SECONDS,
+                        cached_only=cached_only, reserve_requests=reserve_requests,
+                    )
+                if result.fastest_seconds <= SECONDARY_DURATION_SECONDS:
+                    routes.append(TransitRoute(
+                        name, direction, math.ceil(result.fastest_seconds / 60), result.legs, planned_for,
+                    ))
+        return tuple(routes)
+
     def _coordinates(self, origin: str) -> str | None:
         address = _ADDRESS.fullmatch(" ".join((origin or "").split()))
         if not address or address["city"].casefold() not in _CITY_NAMES:
@@ -225,11 +307,11 @@ class TransitRouter:
             cache.pop(next(iter(cache)))
         cache[key] = (expires_at, value)
 
-    def _get_json(self, endpoint: str, params: dict[str, str]):
+    def _get_json(self, endpoint: str, params: dict[str, str], *, reserve_requests: int = 0):
         now = time.monotonic()
         while self._requests and self._requests[0] <= now - _DAY:
             self._requests.popleft()
-        if now < self._retry_after or len(self._requests) >= MAX_REQUESTS_PER_DAY:
+        if now < self._retry_after or len(self._requests) >= MAX_REQUESTS_PER_DAY - reserve_requests:
             return None
 
         request = Request(
@@ -249,11 +331,16 @@ class TransitRouter:
         except (OSError, ValueError, HTTPException):
             return None
 
-    def _routes_between(self, origin: str, destination: str, departure: datetime, limit: int) -> _StationRoutes:
+    def _routes_between(
+        self, origin: str, destination: str, departure: datetime, limit: int,
+        *, cached_only: bool = False, reserve_requests: int = 0,
+    ) -> _StationRoutes:
         clock = time.monotonic()
         key = (origin, destination, departure, limit)
         if (cached := self._routes.get(key)) is not None and cached[0] > clock:
             return cached[1]
+        if cached_only:
+            return _StationRoutes(incomplete=True)
 
         payload = self._get_json("v6/plan", {
             "fromPlace": origin,
@@ -264,18 +351,20 @@ class TransitRouter:
             "maxTravelTime": str(limit // 60),
             "searchWindow": str(limit),
             "useRoutedTransfers": "true",
-        })
+        }, reserve_requests=reserve_requests)
         if not isinstance(payload, dict) or not isinstance(payload.get("itineraries"), list):
             return _StationRoutes(incomplete=True)
         fastest = math.inf
         incomplete = False
+        fastest_legs = ()
         for itinerary in payload["itineraries"]:
             seconds = _route_seconds(itinerary, departure)
             if seconds is None:
                 incomplete = True
-            else:
-                fastest = min(fastest, seconds)
-        result = _StationRoutes(fastest, incomplete)
+            elif seconds < fastest:
+                fastest = seconds
+                fastest_legs = itinerary["legs"]
+        result = _StationRoutes(fastest, incomplete, tuple(_transit_leg(leg) for leg in fastest_legs))
         if not incomplete or fastest <= limit:
             self._cache(self._routes, key, clock + 600, result)
         return result

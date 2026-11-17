@@ -49,6 +49,10 @@ RENT_LABELS = {"warm": "Warmmiete", "cold": "Kaltmiete", "total": "Gesamtmiete"}
 FIT_LABELS = {"strong": "Passt gut", "possible": "Könnte passen", "unclear": "Noch unklar"}
 RECIPIENT_LABELS = {"manager": "Verwaltung/Vermietung", "roommate": "Mitbewohner"}
 COMMERCIAL_LABEL = "Gewerblicher Anbieter"
+TRANSIT_MODE_LABELS = {
+    "WALK": "Zu Fuß", "BUS": "Bus", "TRAM": "Tram", "SUBWAY": "U-Bahn", "SUBURBAN": "S-Bahn",
+    "REGIONAL_RAIL": "Regionalzug",
+}
 PROVIDER_FILTER_LABELS: dict[ProviderFilter, str] = {
     "all": "Alle Anbieter",
     "commercial": "Gewerbliche Anbieter",
@@ -102,6 +106,17 @@ INTRO = """
   .radar-listing__section .radar-listing__badge { display: inline-block; margin: .05rem .4rem .15rem 0; }
   .radar-listing__section .radar-fit-possible { background: #fcf1d7; color: #664713; }
   .radar-listing__section .radar-fit-unclear { background: #efeaed; color: #51434e; }
+  .radar-listing__routes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(17rem, 100%), 1fr));
+    align-items: start; gap: .6rem; }
+  .radar-listing__route { background: rgba(78, 133, 123, .12); border-radius: .6rem; padding: .65rem .75rem; }
+  .radar-listing__route summary { cursor: pointer; overflow-wrap: anywhere; }
+  .radar-listing__route-duration { white-space: nowrap; }
+  .radar-listing__route-preview { display: block; margin-top: .18rem; font-size: .84rem; }
+  .radar-listing__legs { margin: .45rem 0 0; padding-left: 1.15rem; font-size: .84rem; }
+  .radar-listing__legs li + li { margin-top: .3rem; }
+  .radar-listing__leg-stops { display: block; opacity: .86; overflow-wrap: anywhere; }
+  .radar-listing .radar-listing__transit-time { margin-bottom: .45rem; }
+  .radar-listing .radar-listing__route-time { margin-top: .45rem; }
   .radar-listing .radar-listing__foot { font-size: .8rem; opacity: .86; }
   .radar-listing header .radar-listing__foot { margin-top: .35rem; }
 </style>
@@ -317,6 +332,46 @@ def _listing_photos(photo_urls: tuple[str, ...]) -> str:
     return f'<div class="radar-listing__photos" role="group" aria-label="Inseratsfotos">{"".join(links)}</div>'
 
 
+def _listing_connections(profile: ListingProfile | None) -> str:
+    if not profile or not profile.transit_routes:
+        return ""
+
+    cards = []
+    for route in sorted(profile.transit_routes, key=lambda item: (item.direction != "to_station", item.station)):
+        direction = f"Zum {route.station}" if route.direction == "to_station" else f"Ab {route.station}"
+        heading = (f'<strong>{escape(direction)}</strong> · '
+                   f'<strong class="radar-listing__route-duration">{route.minutes} Min.</strong>')
+        lines = []
+        steps = []
+        for leg in route.legs:
+            mode = TRANSIT_MODE_LABELS.get(leg.mode, "ÖPNV")
+            vehicle = f"{mode} {leg.line}" if leg.line else mode
+            if leg.mode != "WALK":
+                lines.append(leg.line or mode)
+            instruction = f"Im selben Fahrzeug weiter mit {vehicle}" if leg.through_service else vehicle
+            if leg.headsign:
+                instruction += f" Richtung {leg.headsign}"
+            if leg.minutes is not None:
+                instruction += f" · {leg.minutes} Min."
+            stops = " → ".join(filter(None, (leg.origin, leg.destination)))
+            stop_label = f'<span class="radar-listing__leg-stops">{escape(stops)}</span>' if stops else ""
+            steps.append(f'<li>{escape(instruction)}{stop_label}</li>')
+        preview = f'<span class="radar-listing__route-preview">{escape(" → ".join(lines))}</span>' if lines else ""
+        planned = ""
+        if route.planned_for is not None:
+            planned = (f'<p class="radar-listing__foot radar-listing__route-time">'
+                       f'Berechnet für {_date(route.planned_for)} Uhr</p>')
+        if steps:
+            cards.append(f'<details class="radar-listing__route"><summary>{heading}{preview}</summary>'
+                         f'{planned}<ol class="radar-listing__legs">{"".join(steps)}</ol></details>')
+        else:
+            cards.append(f'<div class="radar-listing__route">{heading}{planned}</div>')
+    return ('<section class="radar-listing__section" aria-label="ÖPNV-Verbindungen">'
+            '<span class="radar-listing__label">ÖPNV-Verbindungen</span>'
+            '<p class="radar-listing__foot radar-listing__transit-time">Beispiel ab 08:00 Uhr (Mo–Fr) · inklusive Wartezeit und Fußweg</p>'
+            f'<div class="radar-listing__routes">{"".join(cards)}</div></section>')
+
+
 def _listing_card(
     profile: ListingProfile | None, *, title: str, platform: str, status: str, date_label: str,
     route: tuple[str, str] | None = None, note: str | None = None, map_key: str | None = None,
@@ -326,7 +381,8 @@ def _listing_card(
     rent_label = RENT_LABELS.get(profile.rent_kind, "Miete") if profile else "Miete"
     facts = _fact(rent_label, _format_value(profile.rent_eur, "€") if profile else None)
     facts += _fact("Fläche", _format_value(profile.area_sqm, "m²") if profile else None)
-    if route:
+    connections = _listing_connections(profile)
+    if route and not connections:
         facts += _fact(*route)
     sections = []
     if profile and profile.summary:
@@ -352,7 +408,7 @@ def _listing_card(
         f'<div class="radar-listing__meta"><span class="radar-listing__source">{escape(platform)}</span>'
         f'{provider}{recipient_badge}{badge}</div>'
         f'<h3>{escape(title)}</h3><p class="radar-listing__foot">{escape(date_label)}</p></header>'
-        f'{photos}<div class="radar-listing__facts">{facts}</div>{"".join(sections)}</article>'
+        f'{connections}{photos}<div class="radar-listing__facts">{facts}</div>{"".join(sections)}</article>'
     )
     if map_key is not None:
         _offer_location_map(profile, title, key=map_key)
@@ -812,6 +868,7 @@ def main() -> None:
         st.button("Aktualisieren", icon=":material/refresh:")
         provider = st.selectbox("Anbietertyp", tuple(PROVIDER_FILTER_LABELS),
                                 format_func=PROVIDER_FILTER_LABELS.__getitem__, on_change=_reset_offer_pages)
+        st.caption("ÖPNV-Daten · [Transitous und Datenquellen](https://transitous.org/sources/)")
         logout_button()
 
     today = now.astimezone(BERLIN).date()
