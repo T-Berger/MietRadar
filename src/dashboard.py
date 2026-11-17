@@ -22,7 +22,8 @@ from application_revision import ApplicationRevisionError, MAX_REVISION_FOCUS_CH
 from dashboard_auth import logout_button, require_authentication
 from dashboard_data import (
     BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, HiddenListing, ListingProfile,
-    MapListing, Match, ProviderFilter, Reply, SecondaryListing, SentApplication, confirm_application_delivery,
+    MapListing, Match, ProviderFilter, QueuedApplication, Reply, SecondaryListing, SentApplication,
+    confirm_application_delivery,
     filter_listing_providers, load_dashboard, map_listings, set_listing_hidden, weekend_dates,
 )
 from listing_profiles import valid_listing_coordinates
@@ -38,9 +39,14 @@ from reviewed_applications import (
 ROOT = Path(__file__).resolve().parent.parent
 STATES = {
     "draft": "Entwurf", "held": "Zurückgehalten", "sent": "Gesendet", "done": "Erledigt",
-    "unconfirmed": "Versand unklar", "already_contacted": "Bereits kontaktiert", "unavailable": "Kontakt nicht verfügbar",
-    "edited": "Entwurf bearbeitet", "queued": "Freigegeben · wartet auf Versand", "failed": "Versand nicht erfolgt",
+    "unconfirmed": "Versand unbestätigt", "already_contacted": "Bereits kontaktiert", "unavailable": "Kontakt nicht verfügbar",
+    "edited": "Entwurf bearbeitet", "queued": "Für Versand freigegeben", "failed": "Versand gestoppt",
 }
+_QUEUE_TAB = "Versandwarteschlange"
+_TAB_KEY = "mietradar_tab"
+_SHOW_QUEUE = "mietradar_show_queue"
+_QUEUE_COLORS = {"queued": "blue", "failed": "red", "unconfirmed": "orange", "unavailable": "red",
+                 "already_contacted": "gray"}
 _REVIEW_NOTICE = "mietradar_application_review_notice"
 _VISIBILITY_NOTICE = "mietradar_listing_visibility_notice"
 OFFERS_PER_PAGE = 4
@@ -542,11 +548,10 @@ def _application(
                     if may_approve:
                         if attachment:
                             st.text(f"Anhang · {attachment.name}")
-                            approve = st.form_submit_button("Text und PDF freigeben und senden", type="primary")
-                            st.caption("MietRadar verschickt genau diesen Text zusammen mit der angezeigten Datei.")
+                            approve = st.form_submit_button("Text und PDF zum Versand freigeben", type="primary")
+                            st.caption("Text und PDF kommen zusammen in die Versandwarteschlange.")
                         else:
-                            approve = st.form_submit_button("Freigeben und senden", type="primary")
-                            st.caption("MietRadar verschickt genau diesen Text.")
+                            approve = st.form_submit_button("Zum Versand freigeben", type="primary")
                     elif editable and reviewed_send:
                         st.caption("Das Zeitfenster für den Versand ist abgelaufen.")
                     elif editable:
@@ -574,8 +579,8 @@ def _application(
                     attachment_digest=attachment.digest if approve and attachment else None,
                 )
                 if result == "queued":
-                    notice = ("Deine Bewerbung mit Anhang wurde zum Versand freigegeben." if attachment
-                              else "Deine Nachricht wurde zum Versand freigegeben.")
+                    notice = "Bewerbung freigegeben und in die Versandwarteschlange aufgenommen."
+                    st.session_state[_SHOW_QUEUE] = True
                 else:
                     notice = "Entwurf gespeichert."
         except ApplicationReviewError as error:
@@ -653,6 +658,14 @@ def _offer_date_label(row: Match | DatedListing | SecondaryListing) -> str:
     return posting
 
 
+def _application_status(row: Match) -> str:
+    if row.judge_approved is False:
+        return "Freigegeben · Text zurückgehalten" if row.state == "queued" else "Text zurückgehalten"
+    if row.state == "queued" and row.review_reason:
+        return "Freigegeben · Versand verzögert"
+    return STATES.get(row.state, "Entwurf")
+
+
 def _render_match(
     row: Match, profile: ListingProfile | None, db_path: Path, hours: int, *, view: str,
     review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
@@ -666,11 +679,7 @@ def _render_match(
                 date_label += " · Versand nur nach Freigabe"
             else:
                 date_label += " · nur als Entwurf"
-        status = STATES.get(row.state, "Entwurf")
-        if row.judge_approved is False:
-            status = "Freigegeben · Text zurückgehalten" if row.state == "queued" else "Text zurückgehalten"
-        elif row.state == "queued" and row.review_reason:
-            status = "Freigegeben · Versand verzögert"
+        status = _application_status(row)
         _listing_card(
             profile, title=_headline(row.url), platform=row.platform,
             status=f"{tier} · {status}", date_label=f"{date_label} · {row.id}", route=route,
@@ -678,8 +687,11 @@ def _render_match(
         )
         _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
                        row.url, view=view)
-        _application(row, profile, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
-                     attachment=attachment)
+        if row.platform == "WG-Gesucht" and row.state in {"queued", "failed", "unconfirmed"}:
+            st.caption(f"Versanddetails findest du unter „{_QUEUE_TAB}“.")
+        else:
+            _application(row, profile, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
+                         attachment=attachment)
 
 
 def _matches(
@@ -833,10 +845,54 @@ def _hidden_offers(rows: tuple[HiddenListing, ...], db_path: Path) -> None:
             _offer_actions(db_path, row.id, row.title, row.url, view="hidden", hidden=True)
 
 
-def _sent_applications(rows: tuple[SentApplication, ...]) -> None:
+def _application_queue(
+    rows: tuple[QueuedApplication, ...], profiles: dict[str, ListingProfile], db_path: Path, hours: int, *,
+    review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
+    wg_on_mac: bool, wg_inbox_status: tuple[float, bool] | None,
+) -> None:
+    if wg_on_mac:
+        if wg_inbox_status is None:
+            st.caption("Vom Mac liegt noch kein Postfachabgleich vor.")
+        else:
+            checked_at, available = wg_inbox_status
+            st.caption(f"Letzter Postfachabgleich vom Mac · {_date(checked_at)}")
+            if not available:
+                st.warning("Das WG-Gesucht-Postfach auf dem Mac ist gerade nicht erreichbar.")
+    if not rows:
+        st.info("Keine Bewerbungen in der Versandwarteschlange.")
+        return
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=min(hours, 24))).timestamp()
+    for item in rows:
+        row = item.application
+        with st.container(border=True):
+            st.text(item.title or _headline(row.url))
+            if item.relay_claimed:
+                st.badge("Vom Mac übernommen", color="blue")
+                date_label = "Versand begonnen"
+            else:
+                status = _application_status(row) if row.state == "queued" else STATES[row.state]
+                color = _QUEUE_COLORS[row.state]
+                if row.state == "queued" and row.fresh_at < cutoff:
+                    status, color = "Versandfenster abgelaufen", "orange"
+                st.badge(status, color=color)
+                date_label = "Freigabe" if row.state == "queued" else "Stand"
+            st.caption(f"{row.platform} · {date_label} {_date(item.updated_at)}")
+            _location_link(row.url)
+            if item.relay_claimed:
+                if row.message:
+                    with st.expander("Freigegebenen Text anzeigen"):
+                        st.code(row.message, language=None, wrap_lines=True)
+                continue
+            _application(row, profiles.get(row.id), db_path, hours, review_available=review_available,
+                         reviewed_send=reviewed_send, attachment=attachment)
+
+
+def _sent_applications(rows: tuple[SentApplication, ...], *, has_queue: bool) -> None:
     st.subheader("Gesendete Bewerbungen", anchor=False)
     if not rows:
         st.info("MietRadar hat noch keinen bestätigten Versand erfasst.")
+        if has_queue:
+            st.caption(f"Freigaben und ihre Versanddetails findest du unter „{_QUEUE_TAB}“.")
         return
     for row in rows:
         with st.container(border=True):
@@ -958,6 +1014,8 @@ def main() -> None:
     secondary_rows = tuple(row for row in secondary_rows if platform == "Alle" or row.platform == platform)
     if notice := st.session_state.pop(_REVIEW_NOTICE, None):
         st.success(notice)
+    if st.session_state.pop(_SHOW_QUEUE, False):
+        st.session_state[_TAB_KEY] = _QUEUE_TAB
     if visibility_notice := st.session_state.pop(_VISIBILITY_NOTICE, None):
         success, message = visibility_notice
         if success:
@@ -973,21 +1031,22 @@ def main() -> None:
         matches.metric("Neue Angebote", len(current_rows), border=True)
     drafts.metric("Bewerbungsentwürfe", sum(bool(row.message) for row in current_rows), border=True)
     pending.metric("Adressen zur Prüfung", len(data.address_checks), border=True)
-    offers, applications, map_tab, secondary, address, replies, activity, hidden = st.tabs(
-        ["Angebote", "Bewerbungen", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf", "Ausgeblendet"],
-        key="mietradar_tab", on_change="rerun",
+    offers, queue, applications, map_tab, secondary, address, replies, activity, hidden = st.tabs(
+        ["Angebote", _QUEUE_TAB, "Bewerbungen", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf",
+         "Ausgeblendet"], key=_TAB_KEY, on_change="rerun",
     )
-    with offers:
-        attachment = None
-        reviewed_send = os.getenv("MUNICH_REVIEWED_SEND", "").strip().lower() == "true"
-        if reviewed_send and data.application_reviews_available:
-            try:
-                attachment = load_application_attachment(db_path)
-            except ApplicationReviewError as error:
-                st.warning(str(error))
-                reviewed_send = False
-            else:
+    attachment = None
+    reviewed_send = os.getenv("MUNICH_REVIEWED_SEND", "").strip().lower() == "true"
+    if reviewed_send and data.application_reviews_available:
+        try:
+            attachment = load_application_attachment(db_path)
+        except ApplicationReviewError as error:
+            st.warning(str(error))
+            reviewed_send = False
+        else:
+            with offers:
                 _credit_proof(db_path, attachment)
+    with offers:
         if date_basis:
             _dated_offers(dated_rows, date_window, date_basis, data.wg_scan, data.listing_profiles, db_path,
                           newest_first=newest_first, current_matches={row.id: row for row in current_rows}, hours=hours,
@@ -997,9 +1056,15 @@ def main() -> None:
             _matches(current_rows, hours, data.wg_scan, data.listing_profiles, db_path, newest_first=newest_first,
                      review_available=data.application_reviews_available,
                      reviewed_send=reviewed_send, attachment=attachment, show_maps=bool(offers.open))
+    wg_on_mac = bool(os.getenv("MUNICH_WG_RELAY_TOKEN", "").strip())
+    if queue.open:
+        with queue:
+            _application_queue(data.application_queue, data.listing_profiles, db_path, hours,
+                               review_available=data.application_reviews_available, reviewed_send=reviewed_send,
+                               attachment=attachment, wg_on_mac=wg_on_mac, wg_inbox_status=data.wg_inbox_status)
     if applications.open:
         with applications:
-            _sent_applications(data.sent_applications)
+            _sent_applications(data.sent_applications, has_queue=bool(data.application_queue))
     if map_tab.open:
         with map_tab:
             map_rows = map_listings(data, date_filtered=date_basis is not None)
@@ -1011,7 +1076,7 @@ def main() -> None:
         _addresses(data.address_checks, data.listing_profiles, db_path)
     with replies:
         _replies(data.replies, wg_enabled=os.getenv("MUNICH_WG_REPLY_DRAFTS", "").strip().lower() == "true",
-                 wg_status=data.wg_inbox_status, wg_on_mac=bool(os.getenv("MUNICH_WG_RELAY_TOKEN", "").strip()))
+                 wg_status=data.wg_inbox_status, wg_on_mac=wg_on_mac)
     with activity:
         _activity(data.activity)
     if hidden.open:

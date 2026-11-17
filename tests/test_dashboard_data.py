@@ -132,6 +132,85 @@ class DashboardDataTest(unittest.TestCase):
         data = load_dashboard(self.path, now=NOW)
         self.assertEqual([(row.id, row.sent_at) for row in data.sent_applications], [("12", NOW.timestamp())])
 
+    def test_shows_queue_history_independent_of_listing_filters(self):
+        now = NOW.timestamp()
+        older = (NOW - timedelta(days=3)).timestamp()
+        text = "Hallo, ich würde mir das Zimmer gern ansehen."
+        digest = sha256(text.encode()).hexdigest()
+        url = "https://www.wg-gesucht.de/12.html"
+        with closing(_database(self.path)) as db, db:
+            db.executemany("INSERT INTO drafts VALUES (?, ?, ?, 'Veröffentlicht', ?, ?)", [
+                ("12", url + "?ref=search", older, text, 0),
+                ("13", "https://www.wg-gesucht.de/13.html", older, None, 0),
+                ("14", "https://www.wg-gesucht.de/14.html", older, None, 1),
+                ("15", "https://www.wg-gesucht.de/15.html", older, text, 0),
+                ("16", "https://www.wg-gesucht.de/16.html", older, None, 1),
+                ("17", "https://www.wg-gesucht.de/17.html", older, None, 1),
+            ])
+            db.executemany("INSERT INTO application_reviews VALUES (?, ?, ?, ?, ?, ?)", [
+                ("12", digest, "queued", "Der Mac antwortet gerade nicht.", older, "pdf-digest"),
+                ("13", digest, "failed", "Versandzeitfenster abgelaufen.", now - 4, None),
+                ("14", digest, "queued", None, older, None),
+                ("15", digest, "queued", "Überholter Grund", older, None),
+                ("16", digest, "queued", None, older, None),
+            ])
+            db.executemany("INSERT INTO delivery VALUES (?, ?, ?, NULL)", [
+                ("14", "sent", now), ("15", "unavailable", now - 2),
+                ("16", "already_contacted", now - 3), ("17", "already_contacted", now - 1),
+            ])
+            db.execute("INSERT INTO outgoing_checks VALUES ('12', 'application', ?, 1, 'Text geprüft.', ?)",
+                       (digest, now))
+            db.execute("INSERT INTO listing_profiles (id, title) VALUES ('12', 'Zimmer am Park')")
+        set_listing_hidden(self.path, "12", True, title="Zimmer am Park", url=url)
+
+        original = self.path.read_bytes()
+        data = filter_listing_providers(load_dashboard(self.path, now=NOW), "commercial")
+        queue = data.application_queue
+        self.assertEqual([(row.application.id, row.application.state, row.updated_at) for row in queue], [
+            ("12", "queued", older), ("15", "unavailable", now - 2),
+            ("16", "already_contacted", now - 3), ("13", "failed", now - 4),
+        ])
+        pending = queue[0].application
+        self.assertEqual((queue[0].title, pending.url, pending.message, pending.attachment_digest),
+                         ("Zimmer am Park", url, text, "pdf-digest"))
+        self.assertEqual((pending.review_reason, pending.judge_approved, pending.judge_reason),
+                         ("Der Mac antwortet gerade nicht.", True, "Text geprüft."))
+        self.assertIsNone(queue[1].application.review_reason)
+        self.assertEqual(queue[-1].application.review_reason, "Versandzeitfenster abgelaufen.")
+        self.assertIsNone(queue[-1].application.message)
+        self.assertEqual([row.id for row in data.sent_applications], ["14"])
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_queue_distinguishes_active_mac_claims_from_unconfirmed_attempts(self):
+        now = NOW.timestamp()
+        text = "Hallo, ich interessiere mich für das Zimmer."
+        with closing(_database(self.path)) as db, db:
+            db.execute("""CREATE TABLE wg_relay_preparations (
+                id TEXT PRIMARY KEY, revision TEXT, expires_at REAL, claimed_at REAL, outcome TEXT
+            )""")
+            db.executemany("INSERT INTO drafts VALUES (?, ?, ?, 'Veröffentlicht', ?, 0)", [
+                ("12", "https://www.wg-gesucht.de/12.html", now - 600, text),
+                ("13", "https://www.wg-gesucht.de/99.html", now - 600, text),
+            ])
+            db.executemany("INSERT INTO application_reviews VALUES (?, ?, 'queued', NULL, ?, NULL)", [
+                ("12", sha256(text.encode()).hexdigest(), now - 60), ("13", sha256(b"Previous").hexdigest(), now - 65),
+            ])
+            db.executemany("INSERT INTO delivery VALUES (?, 'unconfirmed', ?, ?)", [
+                ("12", now - 15, now - 15), ("13", now - 20, now - 20), ("ka-55", now - 10, now - 10),
+            ])
+            db.executemany("INSERT INTO wg_relay_preparations VALUES (?, 'revision', ?, ?, ?)", [
+                ("12", now + 10, now - 15, None), ("13", now + 10, now - 20, "UNCONFIRMED"),
+            ])
+            db.execute("""INSERT INTO wg_observations(id, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)""",
+                       ("13", "https://www.wg-gesucht.de/13.html", now - 600, now - 600))
+
+        queue = load_dashboard(self.path, now=NOW).application_queue
+        self.assertEqual([(item.application.id, item.relay_claimed) for item in queue], [("12", True), ("13", False)])
+        self.assertEqual(queue[0].application.message, text)
+        self.assertEqual(queue[1].application.url, "https://www.wg-gesucht.de/13.html")
+        self.assertIsNone(queue[1].application.message)
+        self.assertFalse(load_dashboard(self.path, now=NOW + timedelta(seconds=11)).application_queue[0].relay_claimed)
+
     def test_shows_exact_queued_text_verdict_separately_from_browser_delay(self):
         now = NOW.timestamp()
         message = "Hallo"
