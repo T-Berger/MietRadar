@@ -193,11 +193,12 @@ class OutgoingJudgeTest(unittest.TestCase):
         system, payload, _ = complete.call_args.args
         self.assertIn("Sie-Anrede", system)
         self.assertNotIn("Ein gemeinsamer Kochabend klingt gut", system)
-        self.assertEqual(json.loads(payload)["vorstellung"], "Mein Name ist Alex Neumann. Ich arbeite als Architekt.")
+        self.assertEqual(json.loads(payload)["vorstellung"], "Ich bin Alex Neumann und arbeite als Architekt.")
 
     def test_checks_generated_drafts_with_the_tone_of_the_contact_role(self):
-        intro = "Ich bin Alex Neumann, 31. Ich arbeite als Architekt. In meiner Freizeit koche ich gern."
-        practical_intro = "Mein Name ist Alex Neumann. Ich arbeite als Architekt."
+        hobby = "In meiner Freizeit koche ich gern."
+        intro = f"Ich bin Alex Neumann, 31. Ich arbeite als Architekt. {hobby} Nach Feierabend zeichne ich gern."
+        practical_intro = "Ich bin Alex Neumann und arbeite als Architekt."
         for role, expected_tone, expected_intro in (
             ("manager", "Sie-Anrede", practical_intro),
             ("roommate", "wie man einer WG direkt schreiben würde", intro),
@@ -208,10 +209,14 @@ class OutgoingJudgeTest(unittest.TestCase):
             ) as complete:
                 draft = personalise_message(
                     "Hi zusammen,\n\n{LLM_TEXT}\n\nViele Grüße\nAlex Neumann", "", provider="none",
-                    recipient_role=role, applicant_intro=intro,
+                    recipient_role=role, applicant_intro=intro, listing_type="wg",
                 )
                 verdict = judge_outgoing(draft, recipient_role=role, applicant_intro=intro, provider="mistral")
                 self.assertTrue(verdict.approved, verdict.reason)
                 system, payload, _ = complete.call_args.args
                 self.assertIn(expected_tone, system)
                 self.assertEqual(json.loads(payload)["vorstellung"], expected_intro)
+                if role == "unknown":
+                    self.assertIn("Eine konkrete Frage zur Besichtigung zeigt bereits Interesse", system)
+                    self.assertEqual(json.loads(payload)["verwendete_profilangaben"], [hobby])
+                    self.assertNotIn("zeichne", payload)
