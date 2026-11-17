@@ -81,6 +81,8 @@ class Match:
     attachment_digest: str | None = None
     judge_approved: bool | None = None
     judge_reason: str | None = None
+    published_at: float | None = None
+    first_seen_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,9 @@ class DatedListing:
     url: str | None
     day: date
     matched: bool
+    published_at: float | None = None
+    published_day: date | None = None
+    first_seen_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,9 @@ class SecondaryListing:
     tier: str
     station: str
     minutes: int
+    published_at: float | None = None
+    published_day: date | None = None
+    first_seen_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -347,6 +355,26 @@ def _parse_day(raw: str | None) -> date | None:
         return None
 
 
+def _observation_dates(db: sqlite3.Connection, tables: set[str], listing_id: str) -> tuple[str, str, str, str]:
+    columns = _columns(db, "wg_observations") if "wg_observations" in tables else set()
+    join = f"LEFT JOIN wg_observations o ON o.id = {listing_id}" if "id" in columns else ""
+    published = "o.published_at" if join and "published_at" in columns else "NULL"
+    day = "o.published_day" if join and "published_day" in columns else "NULL"
+    seen = "o.first_seen_at" if join and "first_seen_at" in columns else "NULL"
+    return join, published, day, seen
+
+
+def _listing_dates(
+    stamp: float, basis: str, published_at: float | None, day_string: str | None, first_seen_at: float | None,
+) -> tuple[float | None, date | None, float | None]:
+    published_day = _parse_day(day_string)
+    if published_at is None and published_day is None and basis.casefold() == "veröffentlicht":
+        published_at = stamp
+    if first_seen_at is None and basis.casefold() == "zuerst gesehen":
+        first_seen_at = stamp
+    return published_at, published_day, first_seen_at
+
+
 def _availability_filter(db: sqlite3.Connection, tables: set[str], listing_id: str) -> str:
     if "listing_availability" not in tables:
         return "1"
@@ -404,9 +432,7 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
     review_state, review_reason = ("r.state", "r.reason") if review_join else ("NULL", "NULL")
     attachment_digest = ("r.attachment_digest" if review_join and
                          "attachment_digest" in _columns(db, "application_reviews") else "NULL")
-    observations = _columns(db, "wg_observations") if "wg_observations" in tables else set()
-    observation_join = "LEFT JOIN wg_observations o ON o.id = d.id" if {"id", "published_day"} <= observations else ""
-    day = "o.published_day" if observation_join else "NULL"
+    observation_join, published_at, publication_day, first_seen_at = _observation_dates(db, tables, "d.id")
     available = _availability_filter(db, tables, "d.id")
     secondary_filter = ""
     parameters = [cutoff, until]
@@ -418,8 +444,9 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
         parameters.extend((cutoff, until))
     parameters.append(RESULT_LIMIT)
     rows = db.execute(f"""
-        SELECT d.id, d.url, d.fresh_at, d.basis, d.message, {state}, {reason}, {approved}, {day},
-               {review_state}, {review_reason}, {attachment_digest}, {check_hash}
+        SELECT d.id, d.url, d.fresh_at, d.basis, d.message, {state}, {reason}, {approved},
+               {review_state}, {review_reason}, {attachment_digest}, {check_hash},
+               {published_at}, {publication_day}, {first_seen_at}
         FROM drafts d {delivery_join} {check_join} {observation_join} {review_join}
         WHERE d.fresh_at BETWEEN ? AND ?
           AND ((d.done = 0 AND d.message IS NOT NULL) OR {state} IS NOT NULL)
@@ -429,8 +456,8 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
         ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
     """, parameters)
     matches = []
-    for (listing_id, url, stamp, basis, message, delivery, check_reason, approved, day_string,
-         review, outcome_reason, attachment, message_hash) in rows:
+    for (listing_id, url, stamp, basis, message, delivery, check_reason, approved,
+         review, outcome_reason, attachment, message_hash, published, day_string, seen) in rows:
         exact_check = (
             delivery is None and message is not None and approved in (0, 1)
             and message_hash == sha256(message.encode("utf-8")).hexdigest()
@@ -439,12 +466,13 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
         reason = outcome_reason if review and delivery is None else None
         if delivery or (not review and not has_check_hash):
             reason = check_reason
+        published, day, seen = _listing_dates(stamp, basis, published, day_string, seen)
         matches.append(Match(
             listing_id, "Kleinanzeigen" if listing_id.startswith("ka-") else "WG-Gesucht",
             _platform_url(url), stamp, basis, message if delivery is None else None,
             delivery or review or ("held" if held else "draft"), reason,
-            _parse_day(day_string), attachment, bool(approved) if exact_check else None,
-            check_reason if exact_check else None,
+            day, attachment, bool(approved) if exact_check else None,
+            check_reason if exact_check else None, published, seen,
         ))
     return tuple(matches)
 
@@ -464,6 +492,7 @@ def _secondary_offers(
     db: sqlite3.Connection, tables: set[str], cutoff: float, until: float, *, ids: tuple[str, ...] | None = None,
 ) -> tuple[SecondaryListing, ...]:
     available = _availability_filter(db, tables, "m.id")
+    observation_join, published_at, publication_day, first_seen_at = _observation_dates(db, tables, "m.id")
     if ids == ():
         return ()
     if ids is None:
@@ -472,14 +501,17 @@ def _secondary_offers(
         scope = f"m.fresh_at <= ? AND m.id IN ({', '.join('?' for _ in ids)})"
         params = (until, *ids)
     rows = db.execute(f"""
-        SELECT m.id, m.url, m.title, m.fresh_at, m.basis, m.tier, m.station, m.minutes FROM munich_secondary_offers m
+        SELECT m.id, m.url, m.title, m.fresh_at, m.basis, m.tier, m.station, m.minutes,
+               {published_at}, {publication_day}, {first_seen_at}
+        FROM munich_secondary_offers m {observation_join}
         WHERE {scope} AND m.minutes BETWEEN 1 AND 45 AND {available} AND {_not_hidden(tables, 'm.id')}
         ORDER BY m.fresh_at DESC, m.id DESC LIMIT ?
     """, (*params, RESULT_LIMIT))
     return tuple(
         SecondaryListing(item, "Kleinanzeigen" if item.startswith("ka-") else "WG-Gesucht",
-                         _platform_url(url), title, stamp, basis, tier, station, minutes)
-        for item, url, title, stamp, basis, tier, station, minutes in rows
+                         _platform_url(url), title, stamp, basis, tier, station, minutes,
+                         *_listing_dates(stamp, basis, published, day, seen))
+        for item, url, title, stamp, basis, tier, station, minutes, published, day, seen in rows
     )
 
 
@@ -569,6 +601,7 @@ def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[s
 
 def _dated_listings(
     db: sqlite3.Connection, tables: set[str], window: tuple[date, date], now: datetime, basis: DateBasis,
+    *, newest_first: bool,
 ) -> tuple[DatedListing, ...]:
     start_day, end_day = window
     end_day = min(end_day, now.astimezone(BERLIN).date())
@@ -578,10 +611,13 @@ def _dated_listings(
     start = datetime.combine(start_day, time.min, BERLIN).timestamp()
     stop = datetime.combine(end_day + timedelta(days=1), time.min, BERLIN).timestamp()
     timestamp_params = (start, stop, now.timestamp(), RESULT_LIMIT)
+    direction = "DESC" if newest_first else "ASC"
     has_drafts = "drafts" in tables
     observation_columns = _columns(db, "wg_observations") if "wg_observations" in tables else set()
     has_observations = {"id", "url", "published_at"} <= observation_columns
     has_observation_day = "published_day" in observation_columns
+    observation_day = "o.published_day" if has_observation_day else "NULL"
+    first_seen = "o.first_seen_at" if "first_seen_at" in observation_columns else "NULL"
     matched = "EXISTS (SELECT 1 FROM drafts d WHERE d.id = o.id)" if has_drafts else "0"
     observations_filter = _availability_filter(db, tables, "o.id")
     visible_observation = _not_hidden(tables, "o.id")
@@ -593,61 +629,71 @@ def _dated_listings(
         unknown_draft = """
             AND NOT EXISTS (SELECT 1 FROM drafts d WHERE d.id = o.id AND lower(d.basis) = 'veröffentlicht')
         """ if has_drafts else ""
+        unknown_secondary = """
+            AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers m WHERE m.id = o.id AND lower(m.basis) = 'veröffentlicht')
+        """ if "munich_secondary_offers" in tables else ""
         rows = db.execute(f"""
             SELECT o.id, o.url, o.first_seen_at, {matched}
             FROM wg_observations o
             WHERE o.first_seen_at >= ? AND o.first_seen_at < ? AND o.first_seen_at <= ?
-            AND o.published_at IS NULL AND {observations_filter} AND {visible_observation} {unknown_day} {unknown_draft}
-            ORDER BY o.first_seen_at DESC, o.id DESC LIMIT ?
+            AND o.published_at IS NULL AND {observations_filter} AND {visible_observation}
+            {unknown_day} {unknown_draft} {unknown_secondary}
+            ORDER BY o.first_seen_at {direction}, o.id {direction} LIMIT ?
         """, timestamp_params)
-        return tuple(DatedListing(item, "WG-Gesucht", _platform_url(url), datetime.fromtimestamp(stamp, BERLIN).date(), bool(is_match))
+        return tuple(DatedListing(item, "WG-Gesucht", _platform_url(url), datetime.fromtimestamp(stamp, BERLIN).date(),
+                                  bool(is_match), first_seen_at=stamp)
                      for item, url, stamp, is_match in rows)
 
-    candidates: dict[str, tuple[float, DatedListing]] = {}
+    candidates: dict[str, DatedListing] = {}
     if has_observations:
-        for item, url, stamp, is_match in db.execute(f"""
-            SELECT o.id, o.url, o.published_at, {matched}
+        for item, url, stamp, day_string, seen, is_match in db.execute(f"""
+            SELECT o.id, o.url, o.published_at, {observation_day}, {first_seen}, {matched}
             FROM wg_observations o WHERE o.published_at >= ? AND o.published_at < ? AND o.published_at <= ?
             AND {observations_filter} AND {visible_observation}
-            ORDER BY o.published_at DESC, o.id DESC LIMIT ?
+            ORDER BY o.published_at {direction}, o.id {direction} LIMIT ?
         """, timestamp_params):
             day = datetime.fromtimestamp(stamp, BERLIN).date()
-            candidates[item] = (stamp, DatedListing(item, "WG-Gesucht", _platform_url(url), day, bool(is_match)))
+            candidates[item] = DatedListing(item, "WG-Gesucht", _platform_url(url), day, bool(is_match),
+                                            stamp, _parse_day(day_string), seen)
 
         if has_observation_day:
-            for item, url, day_string, is_match in db.execute(f"""
-                SELECT o.id, o.url, o.published_day, {matched}
+            for item, url, day_string, seen, is_match in db.execute(f"""
+                SELECT o.id, o.url, o.published_day, {first_seen}, {matched}
                 FROM wg_observations o WHERE o.published_at IS NULL AND o.published_day BETWEEN ? AND ?
                 AND {observations_filter} AND {visible_observation}
-                ORDER BY o.published_day DESC, o.id DESC LIMIT ?
+                ORDER BY o.published_day {direction}, o.id {direction} LIMIT ?
             """, (start_day.isoformat(), end_day.isoformat(), RESULT_LIMIT)):
                 if day := _parse_day(day_string):
-                    candidates[item] = (0, DatedListing(item, "WG-Gesucht", _platform_url(url), day, bool(is_match)))
+                    candidates[item] = DatedListing(item, "WG-Gesucht", _platform_url(url), day, bool(is_match),
+                                                    published_day=day, first_seen_at=seen)
 
-    if has_drafts:
-        fallback = ""
-        drafts_filter = _availability_filter(db, tables, "d.id")
-        if has_observations:
-            day_clause = " OR o.published_day IS NOT NULL" if has_observation_day else ""
-            fallback = f"""AND NOT EXISTS (SELECT 1 FROM wg_observations o WHERE o.id = d.id
-                            AND (o.published_at IS NOT NULL{day_clause}))"""
-        for item, url, stamp in db.execute(f"""
-            SELECT d.id, d.url, d.fresh_at FROM drafts d
+    for table in ("drafts", "munich_secondary_offers"):
+        if table not in tables:
+            continue
+        observation_join, published, day_string, seen = _observation_dates(db, tables, "d.id")
+        tier_filter = "AND d.minutes BETWEEN 1 AND 45" if table == "munich_secondary_offers" else ""
+        for item, url, stamp, first_seen_at in db.execute(f"""
+            SELECT d.id, d.url, d.fresh_at, {seen} FROM {table} d {observation_join}
             WHERE lower(d.basis) = 'veröffentlicht' AND d.fresh_at >= ? AND d.fresh_at < ? AND d.fresh_at <= ?
-            AND {drafts_filter} AND {_not_hidden(tables, 'd.id')} {fallback}
-            ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
+            AND {published} IS NULL AND {day_string} IS NULL {tier_filter}
+            AND {_availability_filter(db, tables, 'd.id')} AND {_not_hidden(tables, 'd.id')}
+            ORDER BY d.fresh_at {direction}, d.id {direction} LIMIT ?
         """, timestamp_params):
             day = datetime.fromtimestamp(stamp, BERLIN).date()
             platform = "Kleinanzeigen" if item.startswith("ka-") else "WG-Gesucht"
-            candidates[item] = (stamp, DatedListing(item, platform, _platform_url(url), day, True))
+            if item not in candidates:
+                candidates[item] = DatedListing(item, platform, _platform_url(url), day, table == "drafts",
+                                                stamp, first_seen_at=first_seen_at)
 
-    ordered = sorted(candidates.values(), key=lambda row: (row[1].day, row[0], row[1].id), reverse=True)
-    return tuple(listing for _, listing in ordered[:RESULT_LIMIT])
+    unknown_time = float("-inf" if newest_first else "inf")
+    ordered = sorted(candidates.values(), key=lambda row: (row.day, row.published_at if row.published_at is not None
+                                                           else unknown_time, row.id), reverse=newest_first)
+    return tuple(ordered[:RESULT_LIMIT])
 
 
 def load_dashboard(
     db_path: Path | str, *, now: datetime | None = None, max_age_hours: int = 24,
-    posting_window: tuple[date, date] | None = None, date_basis: DateBasis = "published",
+    posting_window: tuple[date, date] | None = None, date_basis: DateBasis = "published", newest_first: bool = True,
 ) -> DashboardData:
     """Read current matches, confirmed applications, and recent replies and activity."""
     if not 1 <= max_age_hours <= 72:
@@ -667,7 +713,8 @@ def load_dashboard(
             tables = _available_tables(db)
             matches = _matches(db, tables, cutoff, until)
             address_checks = _address_checks(db, tables, cutoff, until) if "klein_review" in tables else ()
-            dated_listings = _dated_listings(db, tables, posting_window, now, date_basis) if posting_window else ()
+            dated_listings = (_dated_listings(db, tables, posting_window, now, date_basis, newest_first=newest_first)
+                              if posting_window else ())
             secondary_offers = _secondary_offers(db, tables, cutoff, until) if "munich_secondary_offers" in tables else ()
             dated_secondary_offers = _secondary_offers(db, tables, cutoff, until, ids=tuple(
                 row.id for row in dated_listings
