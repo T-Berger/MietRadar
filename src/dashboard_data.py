@@ -39,6 +39,7 @@ _TABLE_COLUMNS = {
     "wg_observations": {"last_seen_at"},
     "munich_secondary_offers": {"id", "url", "title", "fresh_at", "basis", "tier", "station", "minutes"},
     "listing_availability": {"id", "reason"},
+    "listing_credit_proof": {"id", "checked_at", "required"},
     "listing_profiles": {"id", "title", "rent_eur", "rent_kind", "area_sqm", "summary", "fit", "fit_reason"},
     "dashboard_hidden_listings": {"id", "url", "title", "hidden_at"},
 }
@@ -48,6 +49,7 @@ RESULT_LIMIT = 100
 BERLIN = ZoneInfo("Europe/Berlin")
 DateBasis = Literal["published", "first_seen"]
 ProviderFilter = Literal["all", "commercial", "other"]
+CreditProof = Literal["requested", "required"]
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,7 @@ class MapListing:
     area_sqm: float | None
     is_commercial: bool = False
     recipient_role: RecipientRole = "unknown"
+    credit_proof: CreditProof | None = None
 
 
 @dataclass(frozen=True)
@@ -211,6 +214,13 @@ class DashboardData:
     hidden_listings: tuple[HiddenListing, ...] = ()
     sent_applications: tuple[SentApplication, ...] = ()
     application_queue: tuple[QueuedApplication, ...] = ()
+    credit_proof_required: frozenset[str] = frozenset()
+    credit_proof_requested: frozenset[str] = frozenset()
+
+    @property
+    def credit_proofs(self) -> dict[str, CreditProof]:
+        return {**dict.fromkeys(self.credit_proof_requested, "requested"),
+                **dict.fromkeys(self.credit_proof_required, "required")}
 
 
 def filter_listing_providers(data: DashboardData, provider: ProviderFilter) -> DashboardData:
@@ -235,6 +245,7 @@ def map_listings(data: DashboardData, *, date_filtered: bool = False) -> tuple[M
     """Return eligible A*–C listings, including those still waiting for a verified map point."""
     secondary_rows = (*data.secondary_offers, *data.dated_secondary_offers) if date_filtered else data.secondary_offers
     secondary_by_id = {row.id: row for row in secondary_rows if row.tier in {"b", "c"}}
+    credit_proofs = data.credit_proofs
     candidates = (data.dated_listings if date_filtered else
                   sorted((*data.matches, *data.secondary_offers), key=lambda row: row.fresh_at, reverse=True))
     listings = {}
@@ -258,7 +269,7 @@ def map_listings(data: DashboardData, *, date_filtered: bool = False) -> tuple[M
             row.id, row.url, row.platform, title or "Mietangebot", tier, minutes, station, latitude, longitude,
             profile.rent_eur if profile else None, profile.rent_kind if profile else None,
             profile.area_sqm if profile else None, bool(profile and profile.is_commercial),
-            profile.recipient_role if profile else "unknown",
+            profile.recipient_role if profile else "unknown", credit_proofs.get(row.id),
         )
     return tuple(listings.values())
 
@@ -447,7 +458,7 @@ def _application_queue(db: sqlite3.Connection, tables: set[str], until: float) -
         ))""" if review_columns else ""
         entries.append(f"""
             SELECT s.id, s.state, s.recorded_at, {attempt} FROM delivery s
-            WHERE s.state = 'unconfirmed' {reviewed_outcome}
+            WHERE s.state IN ('unconfirmed', 'credit_proof_required') {reviewed_outcome}
         """)
     if not entries:
         return ()
@@ -539,7 +550,7 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
         FROM drafts d {delivery_join} {check_join} {observation_join} {review_join}
         WHERE d.fresh_at BETWEEN ? AND ?
           AND ((d.done = 0 AND d.message IS NOT NULL) OR {state} IS NOT NULL)
-          AND ({available} OR {state} IN ('sent', 'already_contacted', 'unconfirmed'))
+          AND ({available} OR {state} IN ('sent', 'already_contacted', 'unconfirmed', 'credit_proof_required'))
           AND {_not_hidden(tables, 'd.id')}
           {secondary_filter}
         ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
@@ -652,6 +663,21 @@ def _wg_scan(db: sqlite3.Connection, tables: set[str]) -> tuple[float, int] | No
         SELECT s.scanned_at, (SELECT COUNT(*) FROM wg_observations WHERE last_seen_at = s.scanned_at)
         FROM wg_inventory_scan s WHERE s.id = 1 AND s.scanned_at IS NOT NULL
     """).fetchone()
+
+
+def _credit_proof_requirements(
+    db: sqlite3.Connection, tables: set[str], listing_ids: set[str], until: float,
+) -> tuple[frozenset[str], frozenset[str]]:
+    wg_ids = sorted(listing_id for listing_id in listing_ids if listing_id.isascii() and listing_id.isdecimal())
+    if "listing_credit_proof" not in tables or not wg_ids:
+        return frozenset(), frozenset()
+    placeholders = ", ".join("?" for _ in wg_ids)
+    rows = db.execute(f"""
+        SELECT id, required FROM listing_credit_proof
+        WHERE id IN ({placeholders}) AND required IN (0, 1) AND checked_at BETWEEN 0 AND ?
+    """, (*wg_ids, until)).fetchall()
+    return (frozenset(listing_id for listing_id, required in rows if required),
+            frozenset(listing_id for listing_id, required in rows if not required))
 
 
 def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[str, ListingProfile]:
@@ -817,8 +843,11 @@ def load_dashboard(
                 row.id for row in dated_listings
             )) if dated_listings and "munich_secondary_offers" in tables else ()
             application_queue = _application_queue(db, tables, until)
+            hidden_listings = _hidden_listings(db, tables)
             visible_ids = {row.id for group in (matches, address_checks, dated_listings, secondary_offers) for row in group}
             visible_ids.update(item.application.id for item in application_queue)
+            proof_ids = visible_ids | {row.id for row in hidden_listings}
+            credit_proof_required, credit_proof_requested = _credit_proof_requirements(db, tables, proof_ids, until)
             return DashboardData(
                 "ready",
                 matches=matches,
@@ -832,9 +861,11 @@ def load_dashboard(
                 application_reviews_available="application_reviews" in tables,
                 wg_inbox_status=_wg_inbox_status(db, tables),
                 dated_secondary_offers=dated_secondary_offers,
-                hidden_listings=_hidden_listings(db, tables),
+                hidden_listings=hidden_listings,
                 sent_applications=_sent_applications(db, tables, until),
                 application_queue=application_queue,
+                credit_proof_required=credit_proof_required,
+                credit_proof_requested=credit_proof_requested,
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")

@@ -114,16 +114,18 @@ class DashboardDataTest(unittest.TestCase):
                 ("12", "https://www.wg-gesucht.de/12.html", attempted),
                 ("13", "https://www.wg-gesucht.de/14.html", attempted),
                 ("14", "https://www.wg-gesucht.de/14.html", attempted),
+                ("15", "https://www.wg-gesucht.de/15.html", attempted),
                 ("ka-55", "https://www.kleinanzeigen.de/s-anzeige/wohnung/55-203-650", attempted),
             ])
             db.executemany("INSERT INTO delivery VALUES (?, ?, ?, ?)", [
                 ("12", "unconfirmed", attempted, attempted),
                 ("13", "unconfirmed", attempted, attempted),
+                ("15", "credit_proof_required", attempted, attempted),
                 ("ka-55", "unconfirmed", attempted, attempted),
             ])
 
         self.assertTrue(confirm_application_delivery(self.path, "12", now=NOW))
-        for listing_id in ("12", "13", "14", "ka-55", "99"):
+        for listing_id in ("12", "13", "14", "15", "ka-55", "99"):
             self.assertFalse(confirm_application_delivery(self.path, listing_id, now=NOW + timedelta(minutes=1)))
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT state, recorded_at, attempted_at FROM delivery WHERE id = '12'").fetchone(),
@@ -179,6 +181,47 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(queue[-1].application.review_reason, "Versandzeitfenster abgelaufen.")
         self.assertIsNone(queue[-1].application.message)
         self.assertEqual([row.id for row in data.sent_applications], ["14"])
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_distinguishes_requested_credit_proof_from_confirmed_blockers_in_offers_and_queue(self):
+        now = NOW.timestamp()
+        older = (NOW - timedelta(days=2)).timestamp()
+        with closing(_database(self.path)) as db, db:
+            db.execute("""CREATE TABLE IF NOT EXISTS listing_credit_proof (
+                id TEXT PRIMARY KEY, checked_at REAL NOT NULL, required INTEGER NOT NULL
+            )""")
+            db.executemany("INSERT INTO listing_credit_proof (id, checked_at, required) VALUES (?, ?, ?)", [
+                ("12", now, 1), ("13", now, 0), ("14", now, 1), ("15", now, 1),
+                ("16", now, 1), ("17", now, 1), ("18", now + 1, 1), ("19", now, 1), ("ka-55", now, 1), ("20", now, 1),
+            ])
+            db.executemany("INSERT INTO drafts VALUES (?, ?, ?, 'Veröffentlicht', 'Hallo', 0)", [
+                (listing_id, f"https://www.wg-gesucht.de/{listing_id}.html", stamp)
+                for listing_id, stamp in (("12", now), ("13", now), ("16", older), ("17", now), ("18", now), ("19", now))
+            ])
+            db.execute("""INSERT INTO drafts VALUES ('ka-55', 'https://www.kleinanzeigen.de/55', ?,
+                          'Suchalarm', 'Hallo', 0)""", (now,))
+            db.execute("""INSERT INTO munich_secondary_offers VALUES ('14', 'https://www.wg-gesucht.de/14.html',
+                          'Zimmer in B', ?, 'Veröffentlicht', 'b', 'Ostbahnhof', 42)""", (now,))
+            db.execute("""INSERT INTO application_reviews VALUES ('15', ?, 'failed', 'Bonitätsauskunft erforderlich', ?,
+                          NULL)""", (sha256(b"Hallo").hexdigest(), older))
+            db.execute("""INSERT INTO application_reviews VALUES ('17', ?, 'failed', 'Bonitätsauskunft erforderlich', ?,
+                          NULL)""", (sha256(b"Hallo").hexdigest(), now))
+            db.execute("INSERT INTO delivery VALUES ('17', 'credit_proof_required', ?, ?)", (now, now))
+            for listing_id in ("12", "13", "14", "16", "18", "19", "ka-55"):
+                record_listing_availability(db, listing_id, None)
+        set_listing_hidden(self.path, "19", True, title="Ausgeblendetes Zimmer", url="https://www.wg-gesucht.de/19.html")
+
+        original = self.path.read_bytes()
+        data = load_dashboard(self.path, now=NOW, posting_window=(date(2026, 11, 13), date(2026, 11, 15)))
+        self.assertEqual(data.credit_proof_required, {"12", "14", "15", "16", "17", "19"})
+        self.assertEqual(data.credit_proof_requested, {"13"})
+        self.assertIn("16", {row.id for row in data.dated_listings})
+        self.assertEqual([(row.application.id, row.application.state, row.relay_claimed)
+                          for row in data.application_queue], [
+            ("17", "credit_proof_required", False), ("15", "failed", False),
+        ])
+        self.assertEqual([row.id for row in data.hidden_listings], ["19"])
+        self.assertEqual(next(row for row in map_listings(data) if row.id == "14").credit_proof, "required")
         self.assertEqual(self.path.read_bytes(), original)
 
     def test_queue_distinguishes_active_mac_claims_from_unconfirmed_attempts(self):
@@ -271,6 +314,8 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data.matches[0].url, "https://www.wg-gesucht.de/12.html")
         self.assertEqual(data.address_checks, ())
         self.assertEqual(data.secondary_offers, ())
+        self.assertEqual(data.credit_proof_required, frozenset())
+        self.assertEqual(data.credit_proof_requested, frozenset())
         self.assertEqual(data.listing_profiles["12"].title, "Zimmer am Park")
         self.assertEqual(data.listing_profiles["12"].photo_urls, ())
         self.assertIsNone(data.listing_profiles["12"].route_tier)
