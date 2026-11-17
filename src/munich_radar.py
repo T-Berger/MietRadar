@@ -887,9 +887,10 @@ def main() -> int:
             with ExitStack() as sessions:
                 reviewed_send = _switch("MUNICH_REVIEWED_SEND", False)
                 auto_send = not reviewed_send and _switch("MUNICH_AUTOSEND", False)
-                send_in_service = reviewed_send and not os.getenv("MUNICH_WG_RELAY_TOKEN", "").strip()
-                wg_reply_drafts = _switch("MUNICH_WG_REPLY_DRAFTS", False)
-                if send_in_service or auto_send or wg_reply_drafts:
+                wg_on_mac = bool(os.getenv("MUNICH_WG_RELAY_TOKEN", "").strip())
+                send_in_service = reviewed_send and not wg_on_mac
+                read_in_service = _switch("MUNICH_WG_REPLY_DRAFTS", False) and not wg_on_mac
+                if send_in_service or auto_send or read_in_service:
                     try:
                         from wg_delivery import BrowserSender
                     except ModuleNotFoundError as exc:
@@ -906,7 +907,7 @@ def main() -> int:
                         scanner.reviewed_startup_problem = sender.startup_problem
                     elif auto_send:
                         scanner.delivery = queue
-                    if wg_reply_drafts:
+                    if read_in_service:
                         from wg_reply_inbox import WGInboxError, recent_wg_messages
 
                         def wg_reply_reader():

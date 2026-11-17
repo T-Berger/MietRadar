@@ -7,15 +7,16 @@ import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from selenium.common.exceptions import TimeoutException
 
 from munich_delivery import DeliveryOutcome
 from wg_mac_worker import (
-    Relay, RelayError, RelayTemporaryError, UnconfirmedDelivery, _check_browser, _poll_jobs, _write_attachment,
-    process_next, read_token,
+    Relay, RelayError, RelayTemporaryError, UnconfirmedDelivery, _check_browser, _inbox_updates, _poll_jobs,
+    _read_inbox_in_temporary_tab, _write_attachment, process_next, read_token,
 )
+from wg_reply_inbox import WGInboxEntry, WGInboxError
 from wg_source import Listing, WGAccessBlocked, WGListingGone
 
 
@@ -158,6 +159,67 @@ class MacWorkerTests(unittest.TestCase):
                 _poll_jobs(self.relay, self.browser, visible=False)
         process.assert_called_once()
         self.browser._browser.assert_not_called()
+
+    def test_inbox_read_restores_work_tab_without_touching_an_unconfirmed_tab(self):
+        driver = self.browser._browser.return_value
+        driver.current_window_handle = "work"
+        driver.window_handles = ["work", "unconfirmed"]
+
+        def new_window(_kind):
+            driver.window_handles.append("inbox")
+            driver.current_window_handle = "inbox"
+
+        def switch_window(window):
+            driver.current_window_handle = window
+
+        def close_current():
+            self.assertEqual(driver.current_window_handle, "inbox")
+            driver.window_handles.remove("inbox")
+
+        driver.switch_to.new_window.side_effect = new_window
+        driver.switch_to.window.side_effect = switch_window
+        driver.close.side_effect = close_current
+        with patch("wg_mac_worker.recent_wg_messages", side_effect=WGInboxError("Postfach nicht erreichbar")):
+            with self.assertRaises(WGInboxError):
+                _read_inbox_in_temporary_tab(self.browser)
+        self.assertEqual(driver.current_window_handle, "work")
+        self.assertEqual(driver.window_handles, ["work", "unconfirmed"])
+        self.browser.send.assert_not_called()
+
+    def test_inbox_payload_contains_no_url_and_distinguishes_outgoing_messages(self):
+        replies = (WGInboxEntry("2", "https://www.wg-gesucht.de/", "3", "Sonntag passt."),
+                   WGInboxEntry("4", "https://www.wg-gesucht.de/", "5", None))
+        with patch("wg_mac_worker._read_inbox_in_temporary_tab", return_value=replies):
+            self.assertEqual(_inbox_updates(self.browser), [
+                {"entries": [{"conversation_id": "2", "message_id": "3", "text": "Sonntag passt."}]},
+                {"entries": [{"conversation_id": "4", "message_id": "5", "text": None}]},
+            ])
+
+    def test_worker_prioritizes_delivery_and_later_refreshes_inbox_capability(self):
+        events = []
+
+        def next_job(*_args):
+            events.append("job")
+            if len(events) == 1:
+                return True  # An application is ready before the inbox becomes available.
+            if len(events) < 4:
+                return False
+            raise KeyboardInterrupt
+
+        def read_inbox(_sender):
+            events.append("read inbox")
+            return [{"entries": []}]
+
+        self.relay.post.side_effect = [{"ok": True, "inbox": True}, {"ok": True}]
+        with (patch("wg_mac_worker.process_next", side_effect=next_job),
+              patch("wg_mac_worker._inbox_updates", side_effect=read_inbox),
+              patch("wg_mac_worker.time.monotonic", side_effect=[0, 0, 301, 301]),
+              patch("wg_mac_worker.time.sleep"), self.assertLogs("wg_mac_worker", level="INFO") as logs):
+            with self.assertRaises(KeyboardInterrupt):
+                _poll_jobs(self.relay, self.browser, visible=True, inbox_enabled=False)
+        self.assertEqual(events[:4], ["job", "job", "job", "read inbox"])
+        self.assertEqual(self.relay.post.call_args_list, [call("status", {}), call("inbox", {"entries": []})])
+        self.assertIn("Postfach mit Railway abgeglichen", " ".join(logs.output))
 
     def test_withdrawn_approval_prevents_submission(self):
         self.relay.post.side_effect = [

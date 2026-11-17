@@ -675,13 +675,18 @@ def _sent_applications(rows: tuple[SentApplication, ...]) -> None:
             _location_link(row.url)
 
 
-def _replies(rows: tuple[Reply, ...], *, wg_enabled: bool, wg_status: tuple[float, bool] | None) -> None:
+def _replies(
+    rows: tuple[Reply, ...], *, wg_enabled: bool, wg_status: tuple[float, bool] | None, wg_on_mac: bool,
+) -> None:
     st.subheader("Antwortentwürfe", anchor=False)
     if wg_enabled:
         if wg_status is None:
             st.caption("MietRadar hat das WG-Gesucht-Postfach noch nicht geprüft.")
+        elif wg_on_mac and datetime.now(timezone.utc).timestamp() - wg_status[0] > 20 * 60:
+            st.info("MietRadar hat das Postfach auf dem Mac länger nicht geprüft. Prüfe, ob der Mac wach und der Versanddienst aktiv ist.")
         elif not wg_status[1]:
-            st.info("MietRadar kann das WG-Gesucht-Postfach gerade nicht lesen. Prüfe den WG-Gesucht-Login auf Railway.")
+            location = "im MietRadar-Browser auf deinem Mac" if wg_on_mac else "auf Railway"
+            st.info(f"MietRadar kann das WG-Gesucht-Postfach gerade nicht lesen. Prüfe die WG-Gesucht-Anmeldung {location}.")
             _location_link(WG_REPLY_INBOX, "WG-Gesucht-Postfach öffnen")
         else:
             st.caption(f"WG-Gesucht-Postfach zuletzt geprüft · {_date(wg_status[0])}")
@@ -804,7 +809,7 @@ def main() -> None:
         _addresses(data.address_checks, data.listing_profiles, db_path)
     with replies:
         _replies(data.replies, wg_enabled=os.getenv("MUNICH_WG_REPLY_DRAFTS", "").strip().lower() == "true",
-                 wg_status=data.wg_inbox_status)
+                 wg_status=data.wg_inbox_status, wg_on_mac=bool(os.getenv("MUNICH_WG_RELAY_TOKEN", "").strip()))
     with activity:
         _activity(data.activity)
     if hidden.open:

@@ -1,4 +1,4 @@
-"""Let a paired Mac deliver exact, reviewed WG-Gesucht applications."""
+"""Sync the inbox and approved applications with a paired Mac."""
 
 from __future__ import annotations
 
@@ -25,13 +25,17 @@ from reviewed_applications import (
     ReviewedApplication, fail_application_review, get_application_attachment, pending_application_reviews,
     review_is_pending, set_application_wait_reason,
 )
+from wg_reply_drafts import sync_wg_reply_drafts
+from wg_reply_inbox import WGInboxEntry, _thread_url
 from wg_source import Listing, listing_recipient_role
 
 
 LOG = logging.getLogger("wg_delivery_relay")
 VALID_TOKEN = re.compile(r"(?:[a-f0-9]{64}|[A-Za-z0-9_-]{43})", re.ASCII)
 REVISION = re.compile(r"[a-f0-9]{64}", re.ASCII)
-LISTING_ID = re.compile(r"[0-9]{1,20}", re.ASCII)
+NUMERIC_ID = re.compile(r"[0-9]{1,20}", re.ASCII)
+DELIVERY_PATHS = {"/v1/status", "/v1/next", "/v1/prepare", "/v1/claim", "/v1/finish"}
+INBOX_PATH = "/v1/inbox"
 MAX_REQUEST_BYTES = 256 * 1024
 PREPARATION_AGE = timedelta(minutes=2)
 RETRY_DELAY = timedelta(minutes=2)
@@ -53,12 +57,32 @@ def _read_job(body: object, *fields: str) -> tuple[str, str]:
     listing_id, revision = job["id"], job["revision"]
     if (
         not isinstance(listing_id, str)
-        or not LISTING_ID.fullmatch(listing_id)
+        or not NUMERIC_ID.fullmatch(listing_id)
         or not isinstance(revision, str)
         or not REVISION.fullmatch(revision)
     ):
         raise ValueError("Invalid approval identifier")
     return listing_id, revision
+
+
+def _read_inbox(body: object) -> tuple[WGInboxEntry, ...] | None:
+    entries = _read_fields(body, {"entries"})["entries"]
+    if entries is None:
+        return None
+    if not isinstance(entries, list) or len(entries) > 1:
+        raise ValueError("An inbox request can contain at most one entry")
+    if not entries:
+        return ()
+    entry = _read_fields(entries[0], {"conversation_id", "message_id", "text"})
+    conversation_id, message_id = entry["conversation_id"], entry["message_id"]
+    if any(not isinstance(item, str) or not NUMERIC_ID.fullmatch(item) for item in (conversation_id, message_id)):
+        raise ValueError("Invalid inbox identifier")
+    message = entry["text"]
+    if message is not None:
+        if not isinstance(message, str) or len(message) > 6000 or "\x00" in message or not message.strip():
+            raise ValueError("Invalid inbox message")
+        message.encode("utf-8")
+    return (WGInboxEntry(conversation_id, _thread_url(conversation_id, message_id), message_id, message),)
 
 
 def _read_public_listing(body: object, item: ReviewedApplication) -> Listing:
@@ -104,7 +128,7 @@ def _read_public_listing(body: object, item: ReviewedApplication) -> Listing:
 class ReviewedDeliveryRelay:
     def __init__(
         self, db_path: Path, scanner: Scanner, token: str, daily_limit: int,
-        *, clock: Callable[[], datetime] = _utcnow,
+        *, clock: Callable[[], datetime] = _utcnow, inbox_enabled: bool = False,
     ):
         if not VALID_TOKEN.fullmatch(token):
             raise ValueError("MUNICH_WG_RELAY_TOKEN muss ein zufällig erzeugtes 256-Bit-Token sein.")
@@ -115,6 +139,8 @@ class ReviewedDeliveryRelay:
         self.daily_limit = daily_limit
         self.clock = clock
         self.lock = Lock()
+        self.inbox_enabled = inbox_enabled
+        self.inbox_lock = Lock()
         self.retry_after: dict[str, datetime] = {}
         with closing(_database(db_path)) as db, db:
             db.execute("""
@@ -312,6 +338,23 @@ class ReviewedDeliveryRelay:
     def dispatch(self, path: str, body: object) -> dict:
         if path == "/v1/status":
             _read_fields(body, set())
+            return {"ok": True, "inbox": True} if self.inbox_enabled else {"ok": True}
+        if path == INBOX_PATH:
+            if not self.inbox_enabled:
+                raise ValueError("Inbox sync is disabled")
+            entries = _read_inbox(body)
+            # Incoming reply review may call the LLM. The delivery lock stays free.
+            with self.inbox_lock, closing(sqlite3.connect(self.db_path, timeout=5)) as db:
+                db.execute("PRAGMA secure_delete = ON")
+                previous = db.execute("SELECT available FROM wg_reply_inbox_status WHERE id = 1").fetchone()
+                provider = self.scanner.outgoing_provider
+                drafted = sync_wg_reply_drafts(db, entries, self.clock(), provider=provider, outgoing_provider=provider)
+            if drafted:
+                LOG.info("WG-Gesucht-Postfach vom Mac gelesen: %s neuer Antwortentwurf.", drafted)
+            elif entries is not None and previous != (1,):
+                LOG.info("WG-Gesucht-Postfach vom Mac erreichbar.")
+            elif entries is None and previous != (0,):
+                LOG.warning("WG-Gesucht-Postfach vom Mac derzeit nicht erreichbar.")
             return {"ok": True}
         handlers = {
             "/v1/next": self._next, "/v1/prepare": self._prepare, "/v1/claim": self._claim, "/v1/finish": self._finish,
@@ -355,7 +398,7 @@ class _RelayHandler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(received, self.server.relay.authorization):
             self._respond(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
-        if self.path not in {"/v1/status", "/v1/next", "/v1/prepare", "/v1/claim", "/v1/finish"}:
+        if self.path not in DELIVERY_PATHS and (self.path != INBOX_PATH or not self.server.relay.inbox_enabled):
             self._respond(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         length_headers = self.headers.get_all("Content-Length") or []
@@ -393,6 +436,7 @@ def main() -> int:
         relay = ReviewedDeliveryRelay(
             data_dir / "munich_radar.sqlite3", _scanner(max_age), os.getenv("MUNICH_WG_RELAY_TOKEN", ""),
             _number("MUNICH_DAILY_SEND_LIMIT", 3, 1, 5),
+            inbox_enabled=_switch("MUNICH_WG_REPLY_DRAFTS", False),
         )
         port = _number("MUNICH_WG_RELAY_PORT", 8765, 1, 65535)
         with _RelayServer(("127.0.0.1", port), relay) as server:
