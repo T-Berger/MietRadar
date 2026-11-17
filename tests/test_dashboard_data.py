@@ -621,3 +621,22 @@ class DashboardDataTest(unittest.TestCase):
         oldest = load_dashboard(self.path, now=NOW, posting_window=window, newest_first=False).dated_listings
         self.assertEqual((latest[0].id, latest[-1].id), ("100", "1"))
         self.assertEqual((oldest[0].id, oldest[-1].id), ("0", "99"))
+
+    def test_historical_matches_are_filtered_before_the_result_limit(self):
+        url = "https://www.wg-gesucht.de/test.html"
+        first_seen = NOW.timestamp() - 102
+        sightings = [(str(index), url, first_seen + index, NOW.timestamp()) for index in range(102)]
+        with closing(_database(self.path)) as db, db:
+            db.executemany("INSERT INTO wg_observations(id, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)",
+                           sightings)
+            db.executemany("INSERT INTO listing_availability(id, policy_version) VALUES (?, ?)",
+                           [(row[0], AVAILABILITY_POLICY_VERSION) for row in sightings])
+            db.execute("INSERT INTO drafts VALUES ('0', ?, ?, 'zuerst gesehen', 'Hallo', 0)", (url, first_seen))
+            db.execute("""INSERT INTO munich_secondary_offers(id, url, title, fresh_at, basis, tier, station, minutes)
+                          VALUES ('1', ?, 'Zimmer', ?, 'zuerst gesehen', 'b', 'Ostbahnhof', 40)""",
+                       (url, first_seen + 1))
+
+        data = load_dashboard(self.path, now=NOW, posting_window=(NOW.date(), NOW.date()),
+                              date_basis="first_seen", only_matches=True)
+        self.assertEqual([row.id for row in data.dated_listings], ["1", "0"])
+        self.assertEqual([row.id for row in data.dated_secondary_offers], ["1"])

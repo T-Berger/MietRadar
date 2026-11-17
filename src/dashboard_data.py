@@ -601,7 +601,7 @@ def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[s
 
 def _dated_listings(
     db: sqlite3.Connection, tables: set[str], window: tuple[date, date], now: datetime, basis: DateBasis,
-    *, newest_first: bool,
+    *, newest_first: bool, only_matches: bool,
 ) -> tuple[DatedListing, ...]:
     start_day, end_day = window
     end_day = min(end_day, now.astimezone(BERLIN).date())
@@ -613,13 +613,18 @@ def _dated_listings(
     timestamp_params = (start, stop, now.timestamp(), RESULT_LIMIT)
     direction = "DESC" if newest_first else "ASC"
     has_drafts = "drafts" in tables
+    has_secondary = "munich_secondary_offers" in tables
     observation_columns = _columns(db, "wg_observations") if "wg_observations" in tables else set()
     has_observations = {"id", "url", "published_at"} <= observation_columns
     has_observation_day = "published_day" in observation_columns
     observation_day = "o.published_day" if has_observation_day else "NULL"
     first_seen = "o.first_seen_at" if "first_seen_at" in observation_columns else "NULL"
     matched = "EXISTS (SELECT 1 FROM drafts d WHERE d.id = o.id)" if has_drafts else "0"
+    secondary_match = """EXISTS (SELECT 1 FROM munich_secondary_offers m
+        WHERE m.id = o.id AND m.tier IN ('b', 'c') AND m.minutes BETWEEN 1 AND 45)""" if has_secondary else "0"
     observations_filter = _availability_filter(db, tables, "o.id")
+    if only_matches:
+        observations_filter += f" AND ({matched} OR {secondary_match})"
     visible_observation = _not_hidden(tables, "o.id")
 
     if basis == "first_seen":
@@ -631,7 +636,7 @@ def _dated_listings(
         """ if has_drafts else ""
         unknown_secondary = """
             AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers m WHERE m.id = o.id AND lower(m.basis) = 'veröffentlicht')
-        """ if "munich_secondary_offers" in tables else ""
+        """ if has_secondary else ""
         rows = db.execute(f"""
             SELECT o.id, o.url, o.first_seen_at, {matched}
             FROM wg_observations o
@@ -694,6 +699,7 @@ def _dated_listings(
 def load_dashboard(
     db_path: Path | str, *, now: datetime | None = None, max_age_hours: int = 24,
     posting_window: tuple[date, date] | None = None, date_basis: DateBasis = "published", newest_first: bool = True,
+    only_matches: bool = False,
 ) -> DashboardData:
     """Read current matches, confirmed applications, and recent replies and activity."""
     if not 1 <= max_age_hours <= 72:
@@ -713,7 +719,8 @@ def load_dashboard(
             tables = _available_tables(db)
             matches = _matches(db, tables, cutoff, until)
             address_checks = _address_checks(db, tables, cutoff, until) if "klein_review" in tables else ()
-            dated_listings = (_dated_listings(db, tables, posting_window, now, date_basis, newest_first=newest_first)
+            dated_listings = (_dated_listings(db, tables, posting_window, now, date_basis,
+                                             newest_first=newest_first, only_matches=only_matches)
                               if posting_window else ())
             secondary_offers = _secondary_offers(db, tables, cutoff, until) if "munich_secondary_offers" in tables else ()
             dated_secondary_offers = _secondary_offers(db, tables, cutoff, until, ids=tuple(

@@ -643,7 +643,7 @@ def _dated_offers(
             filtered.append(row)
     if not filtered:
         if not rows and not sightings:
-            st.info("Für diesen Zeitraum ist kein Einstelldatum bestätigt. Wähle „Zuerst gesehen (Einstelldatum fehlt)“, "
+            st.info("Keine Angebote mit bestätigtem Einstelldatum für diese Filter. Wähle „Zuerst gesehen (Einstelldatum fehlt)“, "
                     "um stattdessen nach der ersten Erfassung durch MietRadar zu filtern.")
         else:
             st.info("Keine Angebote mit diesen Filtern.")
@@ -819,10 +819,16 @@ def main() -> None:
     newest_first = sort_column.selectbox("Sortierung", ("Neueste zuerst", "Älteste zuerst"),
                                           key="offer_order", on_change=_reset_offer_pages) == "Neueste zuerst"
     date_basis, date_window = _date_filter(selected_period, today)
+    only_matches = False
+    if date_basis is not None:
+        only_matches = st.checkbox("Nur passende Angebote", value=True, key="offer_only_matches",
+                                   help="Zeigt Treffer der ÖPNV-Kategorien A*, A, B und C.",
+                                   on_change=_reset_offer_pages)
 
     db_path = directory / "munich_radar.sqlite3"
     data = load_dashboard(db_path, now=now, max_age_hours=hours,
-                          posting_window=date_window, date_basis=date_basis or "published", newest_first=newest_first)
+                          posting_window=date_window, date_basis=date_basis or "published", newest_first=newest_first,
+                          only_matches=only_matches)
     if data.status == "missing":
         st.info("MietRadar hat hier noch keine Datenbank angelegt. Starte den Worker für den ersten Suchlauf.")
         return
