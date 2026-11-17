@@ -385,7 +385,7 @@ class ScannerTest(unittest.TestCase):
         delivery.deliver.assert_not_called()
 
     def test_scan_saves_a_formal_private_management_draft_and_leaves_it_formal_on_refresh(self):
-        listing = replace(offer(1, 1), is_wg=True, recipient_role="manager")
+        listing = replace(offer(1, 1), is_wg=True, recipient_role="manager", contact_name="Frau Dr. Nele Vogel")
         source, router = Mock(), Mock()
         source.inventory_scope = "munich"
         source.candidates.return_value = [ref(listing)]
@@ -402,10 +402,12 @@ class ScannerTest(unittest.TestCase):
                 "SELECT message, recipient_role, is_commercial FROM drafts JOIN listing_profiles USING(id)"
             ).fetchone()
             self.assertEqual((role, commercial), ("manager", None))
-            self.assertTrue(message.startswith("Guten Tag,"))
+            self.assertTrue(message.startswith("Guten Tag Frau Dr. Nele Vogel,"))
             self.assertIn("Architekt", message)
             self.assertIn("In meiner Freizeit koche ich gern.", message)
             self.assertIn("Wann könnte ich Ihr Zimmer besichtigen?", message)
+            self.assertEqual(db.execute("SELECT approved FROM outgoing_checks WHERE id = ?", (listing.id,)).fetchone(),
+                             (1,))
             self.assertEqual(scanner.add_intro_to_current_drafts(db, NOW), 0)
             self.assertEqual(scanner.scan(db, NOW + timedelta(minutes=1), {})["Entwürfe aktualisiert"], 0)
             self.assertEqual(db.execute("SELECT message FROM drafts").fetchone(), (message,))

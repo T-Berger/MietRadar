@@ -137,6 +137,19 @@ Wohnfläche: 75 m²
         self.assertEqual(flat.recipient_role, "manager")
         self.assertFalse(flat.is_commercial)
 
+    def test_contact_name_belongs_to_the_matching_card_or_plain_alert(self):
+        email = EmailMessage()
+        email["From"] = SENDER
+        email.set_content(f"Kontaktperson: Frau Nele Vogel\n{FLAT}\n\n{ROOM}")
+        email.add_alternative(f'''<section><p>Kontaktperson: Ronja Bühler</p>
+          <article><a href="{ROOM}">WG-Zimmer</a></article>
+          <article><a href="{FLAT}">Wohnung</a><div>Anbietertyp: Gewerblich</div></article>
+        </section>''', subtype="html")
+        room, flat = extract_listings(email.as_bytes(), SENDER)
+        self.assertIsNone(room.contact_name)
+        self.assertEqual(flat.recipient_role, "manager")
+        self.assertEqual(flat.contact_name, "Frau Nele Vogel")
+
     def test_keeps_a_move_in_month_found_only_in_the_plain_alternate(self):
         email = EmailMessage()
         email["From"] = SENDER

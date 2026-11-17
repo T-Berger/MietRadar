@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from wg_source import normalize_contact_name
+
 if TYPE_CHECKING:
     from wg_source import RecipientRole
 
@@ -844,10 +846,12 @@ def application_render_signature(
     """Track which template and prompt generated a draft without storing the template."""
     role = _effective_recipient_role(recipient_role, commercial)
     if role in {"manager", "unknown"}:
-        fields = ["rental-recipient-v3", role, provider, template, _RENTAL_QUESTIONS_PROMPT, viewing_slots,
+        fields = ["rental-recipient-v4" if role == "manager" else "rental-recipient-v3",
+                  role, provider, template, _RENTAL_QUESTIONS_PROMPT, viewing_slots,
                   applicant_answers or {}]
     elif first_message or role == "roommate":
-        fields = ["first-message-v6", provider, template, _FIRST_MESSAGE_PROMPT, viewing_slots, applicant_answers or {}]
+        fields = ["first-message-v7" if role == "roommate" else "first-message-v6",
+                  provider, template, _FIRST_MESSAGE_PROMPT, viewing_slots, applicant_answers or {}]
         if role == "roommate":
             fields.append(role)
     else:
@@ -924,13 +928,16 @@ def _missing_application_answers(
 def _short_rental_message(
     template: str, description: str, title: str, offer_type: str, provider: str,
     viewing_slots: tuple[str, ...], applicant_answers: dict[str, str], applicant_intro: str, role: RecipientRole,
+    poster_name: str,
 ) -> str:
     profile = applicant_intro.strip() or applicant_intro_from_template(template)
     short_intro, name = _short_rental_intro(profile, template)
     intro = profile or short_intro
     if role == "manager":
         accommodation = "Ihre Wohnung" if offer_type == "wohnung" else "Ihr Zimmer"
-        greeting, closing = "Guten Tag,", "Mit freundlichen Grüßen"
+        contact = normalize_contact_name(poster_name)
+        greeting = f"Guten Tag {contact}," if contact else "Guten Tag,"
+        closing = "Mit freundlichen Grüßen"
         viewing = f"Wann könnte ich {accommodation} besichtigen?"
     else:
         greeting, closing = "Hallo,", "Viele Grüße"
@@ -1178,7 +1185,7 @@ def personalise_message(
     if role in {"manager", "unknown"}:
         return _short_rental_message(
             template, listing_description, listing_title, offer_type, backend, viewing_slots,
-            applicant_answers or {}, applicant_intro, role,
+            applicant_answers or {}, applicant_intro, role, poster_name,
         )
     if role == "roommate":
         first_message, offer_type = True, "wg"

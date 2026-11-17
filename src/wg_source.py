@@ -35,6 +35,19 @@ _SEARCH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _COMPANY_PROFILE = re.compile(r"/profile/company/[^/]+\.[0-9]+\.html", re.I)
+_CONTACT_PANELS = ".rhs_contact_information, .contact_box_sticky, .bottom_contact_box"
+_CONTACT_NAME_FIELD = re.compile(
+    r"(?:ansprech-?partner(?:in|:in)?|kontakt(?:person|name)?)(?:\s*:\s*(?P<name>.*))?", re.I,
+)
+_CONTACT_NAME_PREFIX = re.compile(r"^(?:(?:Herr|Frau)\s+)?(?:(?:Dr|Prof)\.\s+)*", re.I)
+_CONTACT_NAME_WORD = re.compile(r"[^\W\d_]+(?:[’'-][^\W\d_]+)*")
+_CONTACT_ORGANIZATION = re.compile(
+    r"\b(?:gmbh|ug|ag|kg|gbr|ltd|immobilien\w*|hausverwaltung\w*|verwaltung\w*|"
+    r"management|properties|property|makler\w*|vermieter\w*|team|service|kontakt|profil|"
+    r"privat\w*|gewerblich\w*|nutzer\w*|anbieter\w*|mitglied\w*|wg-gesucht|mitbewohner\w*)\b", re.I,
+)
+_NAME_PARTICLES = {"da", "de", "del", "den", "der", "di", "du", "van", "von", "zu", "zum", "zur"}
+_CONTACT_PLACEHOLDERS = {"frau", "herr", "name", "online", "unbekannt", "verifiziert"}
 _MANAGING_ROLE = (
     r"(?:hausverwaltung|immobilienverwaltung|verwaltung|(?:haus)?verwalter(?:in|:in)?|"
     r"(?:immobilien)?makler(?:in|:in)?|vermieter(?:in|:in)?|eigent[üu]mer(?:in|:in)?)"
@@ -142,6 +155,7 @@ class Listing:
     available_until: date | None = None
     is_commercial: bool = False
     recipient_role: RecipientRole = "unknown"
+    contact_name: str | None = None
 
 
 def _search_url(url):
@@ -420,6 +434,40 @@ def _commercial_provider(soup) -> bool:
     return False
 
 
+def normalize_contact_name(value: str) -> str | None:
+    """Accept a single published person's name, with any explicit title."""
+    if not value or len(value) > 55 or any(character in value for character in "\r\n"):
+        return None
+    name = _clean(value)
+    if not name or _CONTACT_ORGANIZATION.search(name):
+        return None
+    words = _CONTACT_NAME_PREFIX.sub("", name).split()
+    if not 1 <= len(words) <= 6 or (
+        len(words) == 1 and (words[0].isupper() or words[0].casefold() in _CONTACT_PLACEHOLDERS)
+    ):
+        return None
+    if any(not _CONTACT_NAME_WORD.fullmatch(word) or (
+        word[0].islower() and word not in _NAME_PARTICLES
+    ) for word in words):
+        return None
+    return name
+
+
+def _single_contact_name(values: Sequence[str]) -> str | None:
+    names = {name.casefold(): name for value in values if (name := normalize_contact_name(value))}
+    return next(iter(names.values())) if len(names) == 1 else None
+
+
+def listing_contact_name(lines: Sequence[str]) -> str | None:
+    """Read an explicit contact label from a single ad or alert card."""
+    values = []
+    for index, line in enumerate(lines):
+        if field := _CONTACT_NAME_FIELD.fullmatch(_clean(line)):
+            value = field["name"] or (lines[index + 1] if index + 1 < len(lines) else "")
+            values.append(value.rstrip(". "))
+    return _single_contact_name(values)
+
+
 def listing_recipient_role(
     description: str, *, commercial: bool = False, contact_roles: Sequence[str] = (),
 ) -> RecipientRole:
@@ -575,10 +623,8 @@ class WGSource:
             ):
                 raise WGListingGone("WG-Gesucht-Anzeige ist nicht mehr verfügbar.")
             raise WGSourceError("WG-Gesucht hat keine erkennbare Anzeigenseite geliefert.")
-        description = "\n".join(
-            text for index in range(4)
-            if (text := _text(soup.select_one(f"#freitext_{index}")))
-        )
+        description_blocks = [block for index in range(4) if (block := soup.select_one(f"#freitext_{index}"))]
+        description = "\n".join(text for block in description_blocks if (text := _text(block)))
         address, district = _detail_address(soup)
         residents = _detail_group(soup, "Die WG")
         wanted = " · ".join(_detail_group(soup, "Gesucht wird")) or None
@@ -598,10 +644,20 @@ class WGSource:
         is_wg = bool(residents or wanted or urlsplit(listing_url).path.startswith("/wg-zimmer-"))
         rent_eur, rent_kind, area_sqm = _detail_facts(soup, ref.id, is_wg=is_wg)
         commercial = _commercial_provider(soup)
-        contact_roles = [
-            text for panel in soup.select(".rhs_contact_information, .contact_box_sticky, .bottom_contact_box")
-            for text in panel.stripped_strings
-        ]
+        panels = soup.select(_CONTACT_PANELS)
+        contact_roles = [text for panel in panels for text in panel.stripped_strings]
+        contact_name = listing_contact_name(contact_roles)
+        if contact_name is None:
+            contact_name = listing_contact_name([text for block in description_blocks for text in block.stripped_strings])
+        if contact_name is None:
+            person_selector = '[itemtype$="/Person"] [itemprop="name"]'
+            contact_name = _single_contact_name([
+                element.get("content") or _text(element) for panel in panels for element in panel.select(person_selector)
+            ])
+        if contact_name is None and not commercial:
+            contact_name = _single_contact_name([
+                _text(element) for panel in panels for element in panel.select("p.text-bold")
+            ])
         return Listing(
             id=ref.id,
             url=listing_url,
@@ -623,4 +679,5 @@ class WGSource:
             available_until=available_until,
             is_commercial=commercial,
             recipient_role=listing_recipient_role(description, commercial=commercial, contact_roles=contact_roles),
+            contact_name=contact_name,
         )

@@ -47,7 +47,7 @@ _BINDING = re.compile(
 )
 _GREETING_PREFIX = re.compile(
     r"\A(?:hi|hallo|hey|servus|guten\s+(?:tag|abend|morgen)|liebe[rs]?)\b"
-    r"[^\n,!.?]{0,60}(?:[,!.](?=\s|$)|(?=\n))\s*",
+    r"(?:\b(?:dr|prof)\.(?=[ \t])|[^\n,!.?]){0,60}(?:[,!.](?=\s|$)|(?=\n))\s*",
     re.I,
 )
 _NAMED_INTRO = re.compile(

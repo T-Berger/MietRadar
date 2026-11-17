@@ -119,6 +119,30 @@ class PublicPageTests(unittest.TestCase):
                 self.assertFalse(listing.is_commercial)
                 self.assertEqual(listing.recipient_role, expected)
 
+    def test_company_contact_requires_a_published_persons_name(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/wohnungen-in-Muenchen.123.html")
+        for label, expected in (
+            ("<span>Ansprech-partner:</span><span>Frau Dr. Nele Vogel</span>", "Frau Dr. Nele Vogel"),
+            ("<p>Kontakt: Robin von Stein.</p>", "Robin von Stein"),
+            ("<p>Kontaktperson: Frau</p>", None),
+            ("<p>Kontaktperson: Herr</p>", None),
+            ("<p>Kontakt: Hausverwaltung Nord</p>", None),
+            ("", None),
+        ):
+            with self.subTest(label=label):
+                self.stub_pages({ref.url: f"""
+                    <h1 class="detailed-view-title">Wohnung in München</h1>
+                    <div id="freitext_0">Mieterin ist Frau Reger.</div>
+                    <div class="rhs_contact_information">
+                      <p class="text-bold">Münchner Wohnen</p>
+                      <a href="/profile/company/muenchner-wohnen.456.html">Zum Profil</a>
+                      {label}
+                    </div>
+                """})
+                listing = self.source.details(ref)
+                self.assertEqual(listing.recipient_role, "manager")
+                self.assertEqual(listing.contact_name, expected)
+
     def test_visit_order_keeps_update_time_separate_from_publication(self):
         def card(listing_id, age, class_name="", partner=""):
             return f"""

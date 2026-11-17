@@ -690,6 +690,7 @@ class Scanner:
                     provider=self.provider, listing_type="wg" if listing.is_wg else "wohnung", first_message=True,
                     viewing_slots=viewing_slots, applicant_answers=self.applicant_answers,
                     applicant_intro=self.applicant_intro, recipient_role=listing.recipient_role,
+                    poster_name=listing.contact_name or "",
                 )
                 with db:
                     saved = save_application_draft(
