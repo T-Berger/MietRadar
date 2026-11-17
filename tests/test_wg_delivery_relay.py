@@ -38,8 +38,9 @@ class ReviewedDeliveryRelayTest(unittest.TestCase):
         self.scanner.validate_reviewed_listing.return_value = True
         self.relay = self.new_relay()
 
-    def new_relay(self):
-        return ReviewedDeliveryRelay(self.path, self.scanner, TOKEN, 3, clock=lambda: self.now)
+    def new_relay(self, *, inbox_enabled=False):
+        return ReviewedDeliveryRelay(self.path, self.scanner, TOKEN, 3, clock=lambda: self.now,
+                                     inbox_enabled=inbox_enabled)
 
     def draft(self, *, approve=True, attachment=False):
         with self.db:
@@ -94,6 +95,53 @@ class ReviewedDeliveryRelayTest(unittest.TestCase):
         with urlopen(Request(f"{url}/v1/next", data=b"{}", headers={"Authorization": f"Bearer {TOKEN}"}), timeout=2) as response:
             self.assertEqual(response.headers["Cache-Control"], "no-store")
             self.assertEqual(json.load(response), {"job": None})
+
+    def test_mac_inbox_endpoint_is_authenticated_and_opt_in(self):
+        self.assertEqual(self.relay.dispatch("/v1/status", {}), {"ok": True})
+        with self.assertRaises(ValueError):
+            self.relay.dispatch("/v1/inbox", {"entries": []})
+
+        relay = self.new_relay(inbox_enabled=True)
+        self.assertEqual(relay.dispatch("/v1/status", {}), {"ok": True, "inbox": True})
+        server = _RelayServer(("127.0.0.1", 0), relay)
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        self.addCleanup(worker.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/v1/inbox"
+        with self.assertRaises(HTTPError) as error:
+            urlopen(Request(url, data=b'{"entries":[]}'), timeout=2)
+        with closing(error.exception):
+            self.assertEqual(error.exception.code, 401)
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        with urlopen(Request(url, data=b'{"entries":[]}', headers=headers), timeout=2) as response:
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(json.load(response), {"ok": True})
+        self.assertEqual(self.db.execute("SELECT available FROM wg_reply_inbox_status").fetchone(), (1,))
+
+    def test_mac_inbox_records_draft_and_preserves_it_when_unreadable(self):
+        self.scanner.outgoing_provider = "none"
+        relay = self.new_relay(inbox_enabled=True)
+        entry = {"conversation_id": "123", "message_id": "9001",
+                 "text": "Kannst du am Dienstag um 19 Uhr zur Besichtigung kommen?"}
+        for invalid in ([{**entry, "conversation_id": "https://example.com"}], [entry, entry],
+                        [{**entry, "url": "https://example.com"}], [{**entry, "text": "x" * 6001}]):
+            with self.assertRaises(ValueError):
+                relay.dispatch("/v1/inbox", {"entries": invalid})
+        self.assertIsNone(self.db.execute("SELECT id FROM wg_reply_inbox_status").fetchone())
+
+        self.assertEqual(relay.dispatch("/v1/inbox", {"entries": [entry]}), {"ok": True})
+        reply_url = "https://www.wg-gesucht.de/nachricht.html?nachrichten-id=123&list=1#last_message_id_9001"
+        self.assertEqual(self.db.execute("SELECT id, message_id, url FROM wg_reply_drafts").fetchone(),
+                         ("123", "9001", reply_url))
+        self.assertEqual(relay.dispatch("/v1/inbox", {"entries": None}), {"ok": True})
+        self.assertEqual(self.db.execute("SELECT available FROM wg_reply_inbox_status").fetchone(), (0,))
+        self.assertEqual(self.db.execute("SELECT message_id FROM wg_reply_drafts").fetchone(), ("9001",))
+        self.assertEqual(relay.dispatch("/v1/inbox", {"entries": [{**entry, "message_id": "9002", "text": None}]}),
+                         {"ok": True})
+        self.assertIsNone(self.db.execute("SELECT id FROM wg_reply_drafts").fetchone())
+        self.assertIsNone(self.db.execute("SELECT id FROM delivery").fetchone())
 
     def test_prepared_payload_is_exact_and_only_one_claim_can_win(self):
         document = self.draft(attachment=True)

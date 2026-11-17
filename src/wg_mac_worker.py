@@ -17,6 +17,7 @@ import stat
 import sys
 import time
 import unicodedata
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.client import HTTPException
@@ -32,7 +33,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from munich_delivery import DeliveryOutcome
 from reviewed_applications import MAX_APPLICATION_ATTACHMENT_BYTES
 from wg_delivery import BrowserSender
-from wg_reply_inbox import _inbox_state
+from wg_reply_inbox import WGInboxEntry, WGInboxError, _inbox_state, recent_wg_messages
 from wg_source import BASE_URL, DEFAULT_SEARCH_URLS, Listing, ListingRef, WGListingGone, WGSource, WGSourceError
 
 
@@ -50,6 +51,7 @@ _LISTING_LIMITS = {"title": 1024, "description": 65_536, "address": 512, "wanted
 _REQUEST_TIMEOUT = 45
 _POLL_SECONDS = 25
 _RETRY_SECONDS = 60
+_INBOX_POLL_SECONDS = 5 * 60
 
 LOG = logging.getLogger(__name__)
 
@@ -358,12 +360,13 @@ def _check_browser(sender: BrowserSender, *, manual: bool = False, keep_waiting:
     raise RelayError("Das WG-Gesucht-Postfach ist im lokalen Profil nicht erreichbar. Starte zuerst `login`.")
 
 
-def _check_relay(relay: Relay, *, retry: bool) -> None:
+def _check_relay(relay: Relay, *, retry: bool) -> bool:
     while True:
         try:
-            if relay.post("status", {}).get("ok") is not True:
+            status = relay.post("status", {})
+            if status.get("ok") is not True:
                 raise RelayError("Railway hat die Relay-Verbindung nicht bestätigt.")
-            return
+            return status.get("inbox") is True
         except RelayTemporaryError as error:
             if not retry:
                 raise
@@ -371,12 +374,73 @@ def _check_relay(relay: Relay, *, retry: bool) -> None:
             time.sleep(_RETRY_SECONDS)
 
 
-def _poll_jobs(relay: Relay, sender: BrowserSender, *, visible: bool) -> None:
+def _read_inbox_in_temporary_tab(sender: BrowserSender) -> tuple[WGInboxEntry, ...]:
+    driver = sender._browser()
+    previous_window = driver.current_window_handle
+    previous_windows = set(driver.window_handles)
+    inbox_window = None
+    try:
+        driver.switch_to.new_window("tab")
+        inbox_window = driver.current_window_handle
+        if inbox_window in previous_windows:
+            raise WGInboxError("Chrome hat keinen eigenen Tab für das WG-Gesucht-Postfach geöffnet.")
+        return recent_wg_messages(sender)
+    finally:
+        try:
+            if inbox_window and inbox_window not in previous_windows and inbox_window in driver.window_handles:
+                driver.switch_to.window(inbox_window)
+                driver.close()
+        finally:
+            if previous_window in driver.window_handles:
+                driver.switch_to.window(previous_window)
+
+
+def _inbox_updates(sender: BrowserSender) -> list[dict]:
+    try:
+        entries = _read_inbox_in_temporary_tab(sender)
+    except (WGInboxError, OSError, WebDriverException):
+        LOG.warning("Der Mac konnte das WG-Gesucht-Postfach gerade nicht lesen.")
+        return [{"entries": None}]
+    if not entries:
+        return [{"entries": []}]
+    # Railway builds drafts one message at a time. Own messages only signal that a thread was answered.
+    return [{"entries": [{"conversation_id": entry.conversation_id, "message_id": entry.message_id,
+                          "text": entry.text}]} for entry in entries]
+
+
+def _poll_jobs(relay: Relay, sender: BrowserSender, *, visible: bool, inbox_enabled: bool | None = None) -> None:
     source = WGSource(DEFAULT_SEARCH_URLS)
+    next_inbox_read = 0.0
+    inbox_updates: deque[dict] = deque()
+    inbox_sync_ok = False
     while True:
         try:
             more = process_next(relay, sender, source)
-            time.sleep(2 if more else _POLL_SECONDS)
+            if not more:
+                if not inbox_updates and time.monotonic() >= next_inbox_read:
+                    try:
+                        if inbox_enabled is None:
+                            inbox_enabled = _check_relay(relay, retry=False)
+                        if inbox_enabled:
+                            inbox_updates.extend(_inbox_updates(sender))
+                            inbox_sync_ok = inbox_updates[0]["entries"] is not None
+                    except RelayError:
+                        LOG.warning("Railway konnte den Postfach-Abgleich nicht bestätigen.")
+                    finally:
+                        # Recheck the capability later so a server update never requires a Mac restart.
+                        inbox_enabled = None
+                        next_inbox_read = time.monotonic() + _INBOX_POLL_SECONDS
+                if inbox_updates:
+                    try:
+                        if relay.post("inbox", inbox_updates.popleft()).get("ok") is not True:
+                            raise RelayError("Railway hat die Postfach-Aktualisierung nicht bestätigt.")
+                    except RelayError:
+                        # Try the message on the next inbox scan without delaying applications.
+                        inbox_sync_ok = False
+                        LOG.warning("Die Postfach-Aktualisierung konnte nicht an Railway übertragen werden.")
+                    if not inbox_updates and inbox_sync_ok:
+                        LOG.info("WG-Gesucht-Postfach mit Railway abgeglichen.")
+            time.sleep(2 if more or inbox_updates else _POLL_SECONDS)
         except UnconfirmedDelivery as error:
             if not visible:
                 raise
@@ -415,8 +479,7 @@ def main() -> int:
         with _profile_lock(profile, wait=args.command == "run"):
             sender = BrowserSender(profile, headless=args.command != "login" and not args.visible)
             try:
-                if relay:
-                    _check_relay(relay, retry=args.command == "run")
+                inbox_enabled = _check_relay(relay, retry=args.command == "run") if relay else False
                 if args.command == "run":
                     _await_native_profile_release(profile)
                 _check_browser(sender, manual=args.command == "login" or args.visible, keep_waiting=args.visible)
@@ -426,7 +489,7 @@ def main() -> int:
                         print("Railway-Verbindung erfolgreich geprüft.")
                     return 0
                 LOG.info("Mit Railway verbunden. Der lokale WG-Gesucht-Browser ist angemeldet.")
-                _poll_jobs(relay, sender, visible=args.visible)
+                _poll_jobs(relay, sender, visible=args.visible, inbox_enabled=inbox_enabled)
             finally:
                 sender.close()
     except KeyboardInterrupt:
