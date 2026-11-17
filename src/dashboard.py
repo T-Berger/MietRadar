@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from html import escape
+from itertools import groupby
 from math import isfinite, log2
 from pathlib import Path
 from typing import TypeVar
@@ -501,26 +502,34 @@ def _reset_offer_pages() -> None:
         st.session_state.pop(f"{view}_offer_page", None)
 
 
-def _offer_order(
-    rows: Sequence[OfferRow], newest_first: bool, basis: DateBasis | None = None,
-) -> list[OfferRow]:
+def _offer_date(row: Match | DatedListing | SecondaryListing, basis: DateBasis | None) -> tuple[date, float | None]:
+    if basis == "first_seen":
+        stamp, day = row.first_seen_at, None
+    else:
+        stamp, day = row.published_at, row.published_day
+    if stamp is not None:
+        return datetime.fromtimestamp(stamp, BERLIN).date(), stamp
+    if day is not None:
+        return day, None
+    if isinstance(row, DatedListing):
+        return row.day, None
+    stamp = row.first_seen_at if row.first_seen_at is not None else row.fresh_at
+    return datetime.fromtimestamp(stamp, BERLIN).date(), stamp
+
+
+def _daily_offer_page(
+    rows: Sequence[OfferRow], view: str, newest_first: bool, basis: DateBasis | None = None,
+) -> Iterator[OfferRow]:
     direction = -1 if newest_first else 1
 
     def order(row: OfferRow) -> tuple[int, bool, float, str]:
-        if basis == "first_seen":
-            stamp, day = row.first_seen_at, None
-        else:
-            stamp, day = row.published_at, row.published_day
-        if stamp is None and day is None:
-            if isinstance(row, DatedListing):
-                day = row.day
-            else:
-                stamp = row.first_seen_at if row.first_seen_at is not None else row.fresh_at
-        if stamp is not None:
-            day = datetime.fromtimestamp(stamp, BERLIN).date()
+        day, stamp = _offer_date(row, basis)
         return direction * day.toordinal(), stamp is None, direction * (stamp or 0), row.id
 
-    return sorted(rows, key=order)
+    page = _offer_page(sorted(rows, key=order), view)
+    for day, offers in groupby(page, key=lambda row: _offer_date(row, basis)[0]):
+        st.subheader(f"{WEEKDAYS[day.weekday()]}, {day:%d.%m.%Y}", anchor=False)
+        yield from offers
 
 
 def _offer_date_label(row: Match | DatedListing | SecondaryListing) -> str:
@@ -583,7 +592,7 @@ def _matches(
     if not filtered:
         st.info("Keine Angebote mit diesen Filtern.")
         return
-    for row in _offer_page(_offer_order(filtered, newest_first), "current"):
+    for row in _daily_offer_page(filtered, "current", newest_first):
         _render_match(row, profiles.get(row.id), db_path, hours, view="current", review_available=review_available,
                       reviewed_send=reviewed_send, attachment=attachment, show_maps=show_maps)
 
@@ -650,7 +659,7 @@ def _dated_offers(
         return
     if len(rows) == RESULT_LIMIT:
         st.caption(f"Anzeige auf {RESULT_LIMIT} Ergebnisse begrenzt.")
-    for row in _offer_page(_offer_order(filtered, newest_first, basis), "dated"):
+    for row in _daily_offer_page(filtered, "dated", newest_first, basis):
         profile = profiles.get(row.id)
         if match := current_matches.get(row.id):
             _render_match(match, profile, db_path, hours, view="dated", review_available=review_available,
@@ -695,7 +704,7 @@ def _secondary_offers(
     if not filtered:
         st.info("Keine Angebote mit diesen Filtern.")
         return
-    for row in _offer_page(_offer_order(filtered, newest_first, basis), "secondary"):
+    for row in _daily_offer_page(filtered, "secondary", newest_first, basis):
         station = "Hauptbahnhof" if row.station == "Hbf" else row.station
         with st.container(border=True):
             profile = profiles.get(row.id)
