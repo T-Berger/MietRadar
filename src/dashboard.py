@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlsplit
 import streamlit as st
 from dotenv import load_dotenv
 
+from application_revision import ApplicationRevisionError, MAX_REVISION_FOCUS_CHARS, regenerate_application
 from dashboard_auth import logout_button, require_authentication
 from dashboard_data import (
     BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, HiddenListing, ListingProfile,
@@ -25,6 +26,7 @@ from dashboard_data import (
     filter_listing_providers, load_dashboard, map_listings, set_listing_hidden, weekend_dates,
 )
 from listing_profiles import valid_listing_coordinates
+from munich_delivery import application_recipient_role
 from munich_transit import HAUPTBAHNHOF, OSTBAHNHOF
 from reviewed_applications import (
     MAX_APPLICATION_ATTACHMENT_BYTES, ApplicationAttachmentInfo, ApplicationReviewError,
@@ -448,8 +450,8 @@ def _credit_proof(db_path: Path, attachment: ApplicationAttachmentInfo | None) -
 
 
 def _application(
-    row: Match, db_path: Path, hours: int, *, review_available: bool, reviewed_send: bool,
-    attachment: ApplicationAttachmentInfo | None,
+    row: Match, profile: ListingProfile | None, db_path: Path, hours: int, *,
+    review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
 ) -> None:
     if row.state == "unconfirmed" and row.platform == "WG-Gesucht":
         st.warning("Der Versand ließ sich nicht bestätigen. Schau im WG-Gesucht-Postfach nach.")
@@ -472,19 +474,34 @@ def _application(
         st.text(row.review_reason)
     if row.message is None:
         return
-    if row.judge_approved is False:
-        st.warning(row.judge_reason or "Die Textprüfung hat diese Fassung zurückgehalten.")
-    elif row.judge_approved is True:
-        st.caption(row.judge_reason or "Diese Fassung hat die Textprüfung bestanden.")
-
     editable = (review_available and row.platform == "WG-Gesucht" and row.url is not None
                 and row.state not in {"sent", "unconfirmed"})
-    with st.expander("Bewerbung prüfen" if editable else "Bewerbung anzeigen"):
+    can_rewrite = (editable or row.platform == "Kleinanzeigen") and row.state in {"draft", "held", "edited", "failed"}
+    mistral_configured = (os.getenv("MUNICH_LLM_PROVIDER", "none").strip().lower() == "mistral"
+                          and bool(os.getenv("MISTRAL_API_KEY", "").strip()))
+    rewrite_enabled = can_rewrite and mistral_configured
+    version = sha256(row.message.encode("utf-8")).hexdigest()
+    preview_key = f"application-preview-{row.id}"
+    saved_preview = st.session_state.get(preview_key)
+    if saved_preview is not None and (saved_preview[0] != version or not rewrite_enabled):
+        st.session_state.pop(preview_key)
+        saved_preview = None
+    _, revision, preview, focus_default = saved_preview or (version, 0, row.message, "")
+
+    judge_prefix = "Gespeicherte Fassung · " if saved_preview else ""
+    if row.judge_approved is False:
+        st.warning(judge_prefix + (row.judge_reason or "Die Textprüfung hat diese Fassung zurückgehalten."))
+    elif row.judge_approved is True:
+        st.caption(judge_prefix + (row.judge_reason or "Diese Fassung hat die Textprüfung bestanden."))
+
+    with st.expander("Bewerbung prüfen" if editable else "Bewerbung anzeigen", expanded=saved_preview is not None):
         if not editable:
             st.code(row.message, language=None, wrap_lines=True)
-            return
+            if not rewrite_enabled:
+                if can_rewrite:
+                    st.caption("Zum Neuformulieren muss Mistral eingerichtet sein.")
+                return
 
-        version = sha256(row.message.encode("utf-8")).hexdigest()
         try:
             if row.state == "queued":
                 st.code(row.message, language=None, wrap_lines=True)
@@ -499,11 +516,28 @@ def _application(
                 notice = "Die Versandfreigabe wurde zurückgezogen. Dein Entwurf bleibt gespeichert."
             else:
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=min(hours, 24))
-                may_approve = reviewed_send and row.fresh_at >= cutoff.timestamp()
+                may_approve = editable and reviewed_send and row.fresh_at >= cutoff.timestamp()
                 attachment_version = attachment.digest if attachment else "no-attachment"
-                with st.form(f"application-{row.id}-{version}-{attachment_version}", enter_to_submit=False):
-                    message = st.text_area("Deine Nachricht", value=row.message, height=220, max_chars=6000)
-                    save = st.form_submit_button("Entwurf speichern")
+                form_key = f"application-{row.id}-{version}-{attachment_version}-{revision}"
+                if saved_preview:
+                    if editable:
+                        st.caption("Vorschlag · noch nicht gespeichert")
+                    else:
+                        st.caption("Vorschlag zum Kopieren")
+                        st.code(preview, language=None, wrap_lines=True)
+                with st.form(form_key, enter_to_submit=False):
+                    message = (st.text_area("Deine Nachricht", value=preview, height=220, max_chars=6000)
+                               if editable else preview)
+                    focus = ""
+                    rewrite = False
+                    if rewrite_enabled:
+                        focus = st.text_input("Was soll sich ändern? (optional)", value=focus_default,
+                                              placeholder="Zum Beispiel: Den Einzug natürlicher formulieren",
+                                              max_chars=MAX_REVISION_FOCUS_CHARS)
+                        rewrite = st.form_submit_button("Entwurf neu formulieren")
+                    elif can_rewrite:
+                        st.caption("Zum Neuformulieren muss Mistral eingerichtet sein.")
+                    save = st.form_submit_button("Entwurf speichern") if editable else False
                     approve = False
                     if may_approve:
                         if attachment:
@@ -513,10 +547,25 @@ def _application(
                         else:
                             approve = st.form_submit_button("Freigeben und senden", type="primary")
                             st.caption("MietRadar verschickt genau diesen Text.")
-                    elif reviewed_send:
+                    elif editable and reviewed_send:
                         st.caption("Das Zeitfenster für den Versand ist abgelaufen.")
-                    else:
+                    elif editable:
                         st.caption("Der Versand nach Freigabe ist noch nicht eingerichtet.")
+                if rewrite:
+                    try:
+                        with st.spinner("MietRadar formuliert den Entwurf neu …"):
+                            suggestion = regenerate_application(
+                                message, focus, listing_title=profile.title if profile else _headline(row.url),
+                                recipient_role=application_recipient_role(
+                                    profile.recipient_role if profile else None,
+                                    commercial=bool(profile and profile.is_commercial),
+                                ),
+                            )
+                    except ApplicationRevisionError as error:
+                        st.error(str(error))
+                        return
+                    st.session_state[preview_key] = (version, revision + 1, suggestion, focus)
+                    st.rerun()
                 if not (save or approve):
                     return
                 result = review_application(
@@ -535,6 +584,7 @@ def _application(
         except (OSError, sqlite3.Error):
             st.error("Die Änderung konnte gerade nicht gespeichert werden. Versuch es nach dem Aktualisieren erneut.")
             return
+        st.session_state.pop(preview_key, None)
         st.session_state[_REVIEW_NOTICE] = notice
         st.rerun()
 
@@ -628,7 +678,7 @@ def _render_match(
         )
         _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
                        row.url, view=view)
-        _application(row, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
+        _application(row, profile, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
                      attachment=attachment)
 
 

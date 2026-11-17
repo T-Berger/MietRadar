@@ -22,7 +22,7 @@ COPY src/listing_profiles.py src/listing_photos.py ./src/
 COPY src/kleinanzeigen_activity.py src/kleinanzeigen_judge.py src/kleinanzeigen_replies.py ./src/
 COPY src/kleinanzeigen_reply_queue.py src/kleinanzeigen_response.py src/outgoing_judge.py ./src/
 COPY src/judge_smoke.py src/integration_smoke.py ./src/
-COPY src/dashboard.py src/dashboard_auth.py src/dashboard_data.py src/munich_service.py ./src/
+COPY src/dashboard.py src/dashboard_auth.py src/dashboard_data.py src/application_revision.py src/munich_service.py ./src/
 COPY config/llm_persona.txt ./config/
 COPY --chmod=755 scripts/start-mietradar.sh /usr/local/bin/start-mietradar
 
