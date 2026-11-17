@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rental_availability import install_listing_availability
+from wg_credit_proof import CREDIT_PROOF_REQUIRED_REASON, install_listing_credit_proof
 from wg_source import ListingRef
 
 
@@ -54,6 +55,7 @@ _PENDING = """
       AND NOT EXISTS (SELECT 1 FROM delivery WHERE id = d.id)
       AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers WHERE id = d.id)
       AND NOT EXISTS (SELECT 1 FROM listing_availability WHERE id = d.id AND reason IS NOT NULL)
+      AND NOT EXISTS (SELECT 1 FROM listing_credit_proof WHERE id = d.id AND required = 1)
 """
 _EXACT_APPROVAL = """
     WHERE id = ? AND state = 'queued' AND message_hash = ? AND updated_at = ? AND attachment_digest IS ?
@@ -63,6 +65,7 @@ _EXACT_APPROVAL = """
 
 def install_application_reviews(db: sqlite3.Connection) -> None:
     install_listing_availability(db)
+    install_listing_credit_proof(db)
     db.execute("""
         CREATE TABLE IF NOT EXISTS application_reviews (
             id TEXT PRIMARY KEY REFERENCES drafts(id),
@@ -215,6 +218,9 @@ def review_application(
         if not (now - age).timestamp() <= fresh_at <= now.timestamp():
             raise ApplicationReviewError(_EXPIRED if approve else "Der Entwurf ist inzwischen abgelaufen.")
         if approve:
+            install_listing_credit_proof(db)
+            if db.execute("SELECT 1 FROM listing_credit_proof WHERE id = ? AND required = 1", (listing_id,)).fetchone():
+                raise ApplicationReviewError(CREDIT_PROOF_REQUIRED_REASON)
             current = _current_attachment(db)
             if attachment_digest != (current.digest if current else None):
                 raise ApplicationReviewError(_ATTACHMENT_CHANGED)

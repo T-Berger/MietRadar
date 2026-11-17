@@ -68,6 +68,10 @@ class UnconfirmedDelivery(RelayError):
     """Railway recorded the attempted delivery without a WG-Gesucht receipt."""
 
 
+class BrowserNeedsAttention(RelayError):
+    """The browser stopped before claiming the approved application."""
+
+
 class NoRedirects(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -268,17 +272,19 @@ def process_next(relay: Relay, sender: BrowserSender, source: WGSource) -> bool:
         outcome = sender.send(job.ref.url, message, claim, attachment=attachment)
     if claim_error:
         raise RelayError("Die Versandreservierung konnte nicht bestätigt werden.")
-    if claimed and outcome is not DeliveryOutcome.SENT:
+    if claimed and outcome not in {DeliveryOutcome.SENT, DeliveryOutcome.CREDIT_PROOF_REQUIRED}:
         outcome = DeliveryOutcome.UNCONFIRMED
     elif not claimed and outcome in {DeliveryOutcome.SENT, DeliveryOutcome.UNCONFIRMED}:
         outcome = DeliveryOutcome.BLOCKED
     _finish(relay, job, outcome)
     if outcome is DeliveryOutcome.BLOCKED:
-        raise RelayError("WG-Gesucht braucht eine Anmeldung oder Bestätigung im lokalen Browser.")
+        raise BrowserNeedsAttention("WG-Gesucht braucht eine Anmeldung oder Bestätigung im lokalen Browser.")
     if outcome is DeliveryOutcome.UNCONFIRMED:
         raise UnconfirmedDelivery("WG-Gesucht hat den Versand nicht bestätigt. Prüfe das Postfach.")
     if outcome is DeliveryOutcome.SENT:
         LOG.info("WG-Gesucht hat eine Bewerbung bestätigt.")
+    if outcome is DeliveryOutcome.CREDIT_PROOF_REQUIRED:
+        LOG.info("WG-Gesucht verlangt einen separaten Bonitätsnachweis. Der Entwurf bleibt in MietRadar.")
     return True
 
 
@@ -441,7 +447,7 @@ def _poll_jobs(relay: Relay, sender: BrowserSender, *, visible: bool, inbox_enab
                     if not inbox_updates and inbox_sync_ok:
                         LOG.info("WG-Gesucht-Postfach mit Railway abgeglichen.")
             time.sleep(2 if more or inbox_updates else _POLL_SECONDS)
-        except UnconfirmedDelivery as error:
+        except (BrowserNeedsAttention, UnconfirmedDelivery) as error:
             if not visible:
                 raise
             LOG.warning("%s Der bisherige Tab bleibt zur Prüfung offen.", error)

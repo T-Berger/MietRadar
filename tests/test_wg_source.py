@@ -64,6 +64,19 @@ class PublicPageTests(unittest.TestCase):
         listing = self.source.details(ref)
         self.assertEqual(listing.photo_urls, (f"{cdn}/room.sized.JPEG", f"{cdn}/kitchen.large.JPEG"))
 
+    def test_credit_request_is_specific_to_the_listings_documents(self):
+        ref = ListingRef.from_url(f"{BASE_URL}/wg-zimmer-in-Muenchen.123.html")
+        ad = """
+            <h1 class="detailed-view-title">WG-Zimmer in München</h1>
+            <a href="/bonitaetscheck.html?utm_source=site">SCHUFA</a>
+        """
+        self.stub_pages({ref.url: ad})
+        self.assertFalse(self.source.details(ref).credit_proof_requested)
+        self.stub_pages({ref.url: ad + """
+            <a class="required-document-link" href="/bonitaetscheck.html?utm_source=offer_detail_documents">SCHUFA</a>
+        """})
+        self.assertTrue(self.source.details(ref).credit_proof_requested)
+
     def test_photo_metadata_is_scoped_to_the_current_ad(self):
         ref = ListingRef.from_url(f"{BASE_URL}/wohnungen-in-Muenchen.123.html")
         cdn = "https://img.wg-gesucht.de/media/up/2026/45"

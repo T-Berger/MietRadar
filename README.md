@@ -142,7 +142,7 @@ Trage die Variablen aus der lokalen Anleitung in Railway ein, inklusive `MUNICH_
 
 #### Freigegebene WG-Gesucht-Bewerbungen über den Mac versenden
 
-Der Mac übernimmt den Versand über ein eigenes Chrome-Profil. Railway prüft die exakte Dashboard-Freigabe für Text und gegebenenfalls PDF und übernimmt die Rückmeldung zum Versand. Der Mac muss dafür wach sein und die macOS-Sitzung angemeldet bleiben.
+Der Mac übernimmt den Versand über ein eigenes Chrome-Profil. Railway lässt den exakt freigegebenen Text vor dem Versand mit `MUNICH_OUTGOING_JUDGE_PROVIDER=mistral` prüfen und übernimmt die Rückmeldung zum Versand. Wenn WG-Gesucht im Kontaktformular eine separate Bonitätsauskunft verlangt, bleibt die Bewerbung als Entwurf gespeichert. Der Mac muss dafür wach sein und die macOS-Sitzung angemeldet bleiben.
 
 Lege den privaten Verbindungsschlüssel auf dem Mac an und kopiere ihn für die Railway-Variable `MUNICH_WG_RELAY_TOKEN` in die Zwischenablage. Setze in Railway auch `MUNICH_DASHBOARD_ENABLED=true` und `MUNICH_REVIEWED_SEND=true` und deploye den Dienst. Die HTTPS-Adresse des Dashboards ist zugleich die Adresse für die Verbindung vom Mac.
 
