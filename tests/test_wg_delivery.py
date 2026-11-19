@@ -3,7 +3,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, Mock, patch
 
-from selenium.common.exceptions import NoSuchElementException, SessionNotCreatedException, TimeoutException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException, NoSuchElementException, SessionNotCreatedException,
+    StaleElementReferenceException, TimeoutException, WebDriverException,
+)
 from selenium.webdriver.common.by import By
 
 from wg_delivery import BrowserSender, DeliveryOutcome
@@ -73,7 +76,12 @@ class SenderTest(unittest.TestCase):
         self.receipt = None
         self.new_conversation = element()
         self.blocked = False
+        self.submission_error = None
+        self.thread_listing = None
+        self.outgoing_text = None
+        self.outgoing_attachment = None
         self.driver.find_elements.side_effect = self.find_elements
+        self.driver.execute_script.return_value = True
         self.wait = Mock()
         self.wait.until.side_effect = self.evaluate
         self.web_wait = patch("wg_delivery.WebDriverWait", return_value=self.wait)
@@ -96,6 +104,12 @@ class SenderTest(unittest.TestCase):
             return [element()] if self.blocked else []
         if selector == "a[href*='/nachricht-senden/']":
             return [self.link]
+        if selector == "a[href]":
+            return [self.thread_listing] if self.thread_listing else []
+        if selector == "#messages_container .message.my_message .message_content.message_text":
+            return [self.outgoing_text] if self.outgoing_text else []
+        if selector == "#messages_container .message.my_message .download_attachment_conversation a":
+            return [self.outgoing_attachment] if self.outgoing_attachment else []
         if selector == "#message_timestamp":
             return [self.timestamp] if self.confirmed else []
         if selector == "#message_successfully_sent":
@@ -108,6 +122,8 @@ class SenderTest(unittest.TestCase):
             return [self.file_input] if self.file_input else []
         if selector == "#attachments_modal_content #validation-error-placeholder":
             return [self.upload_error] if self.upload_error else []
+        if selector.startswith("#messenger_form #validation-error-placeholder"):
+            return [self.submission_error] if self.submission_error else []
         if selector == "#messenger_form .message_input_wrapper.pre_attached_file":
             return [self.upload_preview] if self.upload_preview else []
         if selector.startswith("button[data-ng-click"):
@@ -258,6 +274,121 @@ class SenderTest(unittest.TestCase):
         self.submit.click.side_effect = lambda: setattr(self, "confirmed", True)
         result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
         self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+        self.submit.click.assert_called_once_with()
+
+    def test_pdf_send_relocates_a_stale_button_after_upload(self):
+        attachment = self.prepare_attachment()
+        initial = self.submit
+        replacement = element("Senden")
+
+        def replace_control():
+            self.submit = replacement
+            raise StaleElementReferenceException()
+
+        def click():
+            self.confirmed = self.reported_attachment = True
+
+        initial.click.side_effect = replace_control
+        replacement.click.side_effect = click
+        self.wait.until.side_effect = lambda predicate: predicate(self.driver) or self.evaluate(predicate)
+        claim = Mock(return_value=True)
+        self.assertIs(self.sender.send(PUBLIC, "Hallo", claim, attachment=attachment), DeliveryOutcome.SENT)
+        claim.assert_called_once_with()
+        self.file_input.send_keys.assert_called_once()
+        initial.click.assert_called_once_with()
+        replacement.click.assert_called_once_with()
+
+    def test_send_waits_until_button_is_unobscured(self):
+        self.driver.execute_script.side_effect = [False, True]
+        self.submit.click.side_effect = lambda: setattr(self, "confirmed", True)
+        self.wait.until.side_effect = lambda predicate: predicate(self.driver) or self.evaluate(predicate)
+        self.assertIs(self.sender.send(PUBLIC, "Hallo", lambda: True), DeliveryOutcome.SENT)
+        self.assertEqual(self.driver.execute_script.call_count, 2)
+        self.submit.click.assert_called_once_with()
+
+    def test_intercepted_click_still_requires_the_approved_text_on_retry(self):
+        def intercept():
+            self.compose("Anderer Text")
+            raise ElementClickInterceptedException()
+
+        self.submit.click.side_effect = intercept
+        self.wait.until.side_effect = lambda predicate: predicate(self.driver) or self.evaluate(predicate)
+        self.assertIs(self.sender.send(PUBLIC, "Hallo", lambda: True), DeliveryOutcome.UNCONFIRMED)
+        self.submit.click.assert_called_once_with()
+
+    def test_ambiguous_click_failure_is_logged_without_retry_or_raw_details(self):
+        self.submit.click.side_effect = WebDriverException("private error detail")
+        self.wait.until.side_effect = lambda predicate: predicate(self.driver) or self.evaluate(predicate)
+        with self.assertLogs("wg_delivery", level="INFO") as logs:
+            result = self.sender.send(PUBLIC, "Hallo", lambda: True)
+        self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+        self.submit.click.assert_called_once_with()
+        self.assertIn("WebDriverException", logs.output[0])
+        self.assertNotIn("private error detail", " ".join(logs.output))
+
+    def matching_thread(self, message="Hallo zusammen", attachment=None, *, listing=PUBLIC):
+        self.driver.current_url = "https://www.wg-gesucht.de/nachricht.html?nachrichten-id=42&list=1"
+        self.confirmed = True
+        self.thread_listing = element(href=listing)
+        self.outgoing_text = element(message)
+        self.outgoing_attachment = element(attachment) if attachment else None
+
+    def test_click_timeout_can_still_confirm_exact_outgoing_text_and_pdf_in_actual_thread(self):
+        attachment = self.prepare_attachment()
+
+        def sent_despite_timeout():
+            self.matching_thread("Hallo\nzusammen", attachment.name)
+            raise TimeoutException()
+
+        self.submit.click.side_effect = sent_despite_timeout
+        result = self.sender.send(PUBLIC, "Hallo zusammen", lambda: True, attachment=attachment)
+        self.assertIs(result, DeliveryOutcome.SENT)
+        self.submit.click.assert_called_once_with()
+
+    def test_different_thread_text_listing_or_attachment_cannot_confirm_pdf_send(self):
+        cases = (
+            ("Anderer Text", "Nachweis.pdf", PUBLIC),
+            ("Hallo zusammen", "Nachweis.pdf", "https://www.wg-gesucht.de/wg-zimmer-in-Muenchen.10123457.html"),
+            ("Hallo zusammen", "Andere.pdf", PUBLIC),
+        )
+        for message, sent_pdf, listing in cases:
+            with self.subTest(message=message, sent_pdf=sent_pdf, listing=listing):
+                self.driver.current_url = PUBLIC
+                self.confirmed = False
+                self.upload_preview = None
+                attachment = self.prepare_attachment()
+                self.submit.click.side_effect = lambda: self.matching_thread(message, sent_pdf, listing=listing)
+                result = self.sender.send(PUBLIC, "Hallo zusammen", lambda: True, attachment=attachment)
+                self.assertIs(result, DeliveryOutcome.UNCONFIRMED)
+
+    def test_contact_redirect_to_matching_existing_thread_does_not_claim_or_send(self):
+        self.link.click.side_effect = self.matching_thread
+        claim = Mock()
+        self.assertIs(self.sender.send(PUBLIC, "Hallo", claim), DeliveryOutcome.ALREADY_CONTACTED)
+        claim.assert_not_called()
+        self.submit.click.assert_not_called()
+
+    def test_explicit_credit_proof_submission_rejection_is_distinct_from_an_uncertain_send(self):
+        attachment = self.prepare_attachment()
+        self.submit.click.side_effect = lambda: setattr(
+            self, "submission_error", element("Ihre Nachricht konnte nicht gesendet werden. Bonitätsauskunft fehlt.")
+        )
+        result = self.sender.send(PUBLIC, "Hallo", lambda: True, attachment=attachment)
+        self.assertIs(result, DeliveryOutcome.CREDIT_PROOF_REQUIRED)
+        self.submit.click.assert_called_once_with()
+
+    def test_credit_proof_notice_alone_does_not_count_as_a_refusal(self):
+        self.submit.click.side_effect = lambda: setattr(
+            self, "submission_error", element("Aktuelle Bonitätsauskunft erforderlich!")
+        )
+        self.assertIs(self.sender.send(PUBLIC, "Hallo", lambda: True), DeliveryOutcome.UNCONFIRMED)
+        self.submit.click.assert_called_once_with()
+
+    def test_unrelated_send_error_mentioning_credit_proof_does_not_assign_credit_reason(self):
+        self.submit.click.side_effect = lambda: setattr(self, "submission_error", element(
+            "Die Nachricht konnte nicht gesendet werden. Bei Fragen zum Bonitätsnachweis hilft der Support."
+        ))
+        self.assertIs(self.sender.send(PUBLIC, "Hallo", lambda: True), DeliveryOutcome.UNCONFIRMED)
         self.submit.click.assert_called_once_with()
 
     def test_confirms_approved_pdf_with_success_receipt_and_hidden_composer(self):

@@ -129,6 +129,8 @@ Der Radar ordnet Antworten in **Besichtigung**, **Rückfrage**, **Absage**, **Vo
 
 MietRadar meldet neue Treffer in den ÖPNV-Kategorien A* und A nach dem nächsten Suchlauf für WG-Gesucht und Kleinanzeigen. Der Verlauf enthält auch Kleinanzeigen-Ortsprüfungen, Versandstatus und bewertete Antworten. Mit `python src/munich_radar.py klein-activity` kannst du die Hinweise bis zu 30 Tage im lokalen Verlauf ansehen.
 
+MietRadar sendet höchstens eine E-Mail zum Angebot oder Bewerbungsstatus pro Anzeigen-ID. Sind mehrere Hinweise gleichzeitig offen, hat der neue Treffer Vorrang. Antworten von Anbietern können eigene E-Mails auslösen.
+
 Für E-Mail-Hinweise setze `MUNICH_NOTIFY_EMAIL_FROM` auf die beim Anbieter bestätigte Absenderadresse und `MUNICH_NOTIFY_EMAIL_TO` auf deine Empfängeradresse. Wähle den Anbieter über `MUNICH_NOTIFY_EMAIL_PROVIDER`:
 
 - `resend` (Standard) verwendet `RESEND_API_KEY` und einen Absender auf einer [bei Resend verifizierten Domain](https://resend.com/docs/dashboard/domains/introduction).
@@ -142,7 +144,7 @@ Trage die Variablen aus der lokalen Anleitung in Railway ein, inklusive `MUNICH_
 
 #### Freigegebene WG-Gesucht-Bewerbungen über den Mac versenden
 
-Der Mac übernimmt den Versand über ein eigenes Chrome-Profil. Railway prüft die exakte Dashboard-Freigabe für Text und gegebenenfalls PDF und übernimmt die Rückmeldung zum Versand. Der Mac muss dafür wach sein und die macOS-Sitzung angemeldet bleiben.
+Der Mac übernimmt den Versand über ein eigenes Chrome-Profil. Railway lässt den exakt freigegebenen Text vor dem Versand mit `MUNICH_OUTGOING_JUDGE_PROVIDER=mistral` prüfen und übernimmt die Rückmeldung zum Versand. Wenn WG-Gesucht im Kontaktformular eine separate Bonitätsauskunft verlangt, bleibt die Bewerbung als Entwurf gespeichert. Der Mac muss dafür wach sein und die macOS-Sitzung angemeldet bleiben.
 
 Lege den privaten Verbindungsschlüssel auf dem Mac an und kopiere ihn für die Railway-Variable `MUNICH_WG_RELAY_TOKEN` in die Zwischenablage. Setze in Railway auch `MUNICH_DASHBOARD_ENABLED=true` und `MUNICH_REVIEWED_SEND=true` und deploye den Dienst. Die HTTPS-Adresse des Dashboards ist zugleich die Adresse für die Verbindung vom Mac.
 

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 _TABLE_COLUMNS = {
     "drafts": {"id", "url", "fresh_at", "basis", "message", "done"},
     "delivery": {"id", "state"},
+    "wg_relay_preparations": {"id", "expires_at", "claimed_at", "outcome"},
     "application_reviews": {"id", "state", "reason"},
     "outgoing_checks": {"id", "kind", "approved", "reason"},
     "klein_review": {"id", "url", "title", "fresh_at", "basis", "reason"},
@@ -38,6 +39,7 @@ _TABLE_COLUMNS = {
     "wg_observations": {"last_seen_at"},
     "munich_secondary_offers": {"id", "url", "title", "fresh_at", "basis", "tier", "station", "minutes"},
     "listing_availability": {"id", "reason"},
+    "listing_credit_proof": {"id", "checked_at", "required"},
     "listing_profiles": {"id", "title", "rent_eur", "rent_kind", "area_sqm", "summary", "fit", "fit_reason"},
     "dashboard_hidden_listings": {"id", "url", "title", "hidden_at"},
 }
@@ -47,6 +49,7 @@ RESULT_LIMIT = 100
 BERLIN = ZoneInfo("Europe/Berlin")
 DateBasis = Literal["published", "first_seen"]
 ProviderFilter = Literal["all", "commercial", "other"]
+CreditProof = Literal["requested", "required"]
 
 
 @dataclass(frozen=True)
@@ -131,6 +134,7 @@ class MapListing:
     area_sqm: float | None
     is_commercial: bool = False
     recipient_role: RecipientRole = "unknown"
+    credit_proof: CreditProof | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +163,14 @@ class SentApplication:
     url: str | None
     title: str | None
     sent_at: float
+
+
+@dataclass(frozen=True)
+class QueuedApplication:
+    application: Match
+    title: str | None
+    updated_at: float
+    relay_claimed: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,6 +213,14 @@ class DashboardData:
     dated_secondary_offers: tuple[SecondaryListing, ...] = ()
     hidden_listings: tuple[HiddenListing, ...] = ()
     sent_applications: tuple[SentApplication, ...] = ()
+    application_queue: tuple[QueuedApplication, ...] = ()
+    credit_proof_required: frozenset[str] = frozenset()
+    credit_proof_requested: frozenset[str] = frozenset()
+
+    @property
+    def credit_proofs(self) -> dict[str, CreditProof]:
+        return {**dict.fromkeys(self.credit_proof_requested, "requested"),
+                **dict.fromkeys(self.credit_proof_required, "required")}
 
 
 def filter_listing_providers(data: DashboardData, provider: ProviderFilter) -> DashboardData:
@@ -225,6 +245,7 @@ def map_listings(data: DashboardData, *, date_filtered: bool = False) -> tuple[M
     """Return eligible A*–C listings, including those still waiting for a verified map point."""
     secondary_rows = (*data.secondary_offers, *data.dated_secondary_offers) if date_filtered else data.secondary_offers
     secondary_by_id = {row.id: row for row in secondary_rows if row.tier in {"b", "c"}}
+    credit_proofs = data.credit_proofs
     candidates = (data.dated_listings if date_filtered else
                   sorted((*data.matches, *data.secondary_offers), key=lambda row: row.fresh_at, reverse=True))
     listings = {}
@@ -248,7 +269,7 @@ def map_listings(data: DashboardData, *, date_filtered: bool = False) -> tuple[M
             row.id, row.url, row.platform, title or "Mietangebot", tier, minutes, station, latitude, longitude,
             profile.rent_eur if profile else None, profile.rent_kind if profile else None,
             profile.area_sqm if profile else None, bool(profile and profile.is_commercial),
-            profile.recipient_role if profile else "unknown",
+            profile.recipient_role if profile else "unknown", credit_proofs.get(row.id),
         )
     return tuple(listings.values())
 
@@ -420,6 +441,83 @@ def _sent_applications(db: sqlite3.Connection, tables: set[str], until: float) -
                  for listing_id, sent_at, url, observed_url, name in rows)
 
 
+def _application_queue(db: sqlite3.Connection, tables: set[str], until: float) -> tuple[QueuedApplication, ...]:
+    review_columns = _columns(db, "application_reviews") if "application_reviews" in tables else set()
+    delivery_columns = _columns(db, "delivery") if "delivery" in tables else set()
+    entries = []
+    if "updated_at" in review_columns:
+        without_attempt = "AND NOT EXISTS (SELECT 1 FROM delivery s WHERE s.id = r.id)" if delivery_columns else ""
+        entries.append(f"""
+            SELECT r.id, r.state, r.updated_at, NULL FROM application_reviews r
+            WHERE r.state IN ('queued', 'failed') {without_attempt}
+        """)
+    if "recorded_at" in delivery_columns:
+        attempt = "s.attempted_at" if "attempted_at" in delivery_columns else "NULL"
+        reviewed_outcome = """OR (s.state IN ('unavailable', 'already_contacted') AND EXISTS (
+            SELECT 1 FROM application_reviews r WHERE r.id = s.id AND r.state IN ('queued', 'failed')
+        ))""" if review_columns else ""
+        entries.append(f"""
+            SELECT s.id, s.state, s.recorded_at, {attempt} FROM delivery s
+            WHERE s.state IN ('unconfirmed', 'credit_proof_required') {reviewed_outcome}
+        """)
+    if not entries:
+        return ()
+
+    draft_join = "LEFT JOIN drafts d ON d.id = q.id" if "drafts" in tables else ""
+    draft_fields = "d.url, d.fresh_at, d.basis, d.message" if draft_join else "NULL, NULL, NULL, NULL"
+    review_join = "LEFT JOIN application_reviews r ON r.id = q.id" if review_columns else ""
+    reason = "r.reason" if review_join else "NULL"
+    review_hash = "r.message_hash" if "message_hash" in review_columns else "NULL"
+    attachment = "r.attachment_digest" if "attachment_digest" in review_columns else "NULL"
+    profile_join = "LEFT JOIN listing_profiles p ON p.id = q.id" if "listing_profiles" in tables else ""
+    title = "NULLIF(TRIM(p.title), '')" if profile_join else "NULL"
+    observation_join = ""
+    if "wg_observations" in tables and {"id", "url"} <= _columns(db, "wg_observations"):
+        observation_join = "LEFT JOIN wg_observations o ON o.id = q.id"
+    observation_url = "o.url" if observation_join else "NULL"
+    check_join = ""
+    if "outgoing_checks" in tables and "message_hash" in _columns(db, "outgoing_checks"):
+        check_join = "LEFT JOIN outgoing_checks c ON c.id = q.id AND c.kind = 'application'"
+    check_fields = "c.message_hash, c.approved, c.reason" if check_join else "NULL, NULL, NULL"
+    relay_claim = "0"
+    if "wg_relay_preparations" in tables:
+        relay_claim = """EXISTS (SELECT 1 FROM wg_relay_preparations relay
+            WHERE relay.id = q.id AND relay.claimed_at = q.attempted_at
+              AND relay.outcome IS NULL AND relay.expires_at > :until)"""
+
+    rows = db.execute(f"""
+        WITH queue(id, state, updated_at, attempted_at) AS ({' UNION ALL '.join(entries)})
+        SELECT q.id, q.state, q.updated_at, {draft_fields}, {reason}, {review_hash}, {attachment},
+               {title}, {observation_url}, {check_fields}, {relay_claim}
+        FROM queue q {draft_join} {review_join} {profile_join} {observation_join} {check_join}
+        WHERE q.updated_at BETWEEN 0 AND :until AND length(q.id) BETWEEN 1 AND 20 AND q.id NOT GLOB '*[^0-9]*'
+        ORDER BY CASE q.state WHEN 'queued' THEN 0 WHEN 'unconfirmed' THEN 1 ELSE 2 END,
+                 q.updated_at DESC, q.id DESC LIMIT :limit
+    """, {"until": until, "limit": RESULT_LIMIT}).fetchall()
+
+    queue = []
+    for (listing_id, state, updated_at, draft_url, fresh_at, basis, message, review_reason, review_hash_value,
+         attachment_digest, listing_title, observed_url, check_hash, check_approved, check_reason, claimed) in rows:
+        url = None
+        for candidate in (draft_url, observed_url):
+            if (safe := _platform_url(candidate)) and (ref := ListingRef.from_url(safe)) and ref.id == listing_id:
+                url = ref.url
+                break
+        digest = sha256(message.encode("utf-8")).hexdigest() if message is not None else None
+        exact_message = digest is not None and (digest == review_hash_value or (
+            state == "unconfirmed" and review_hash_value is None
+        ))
+        exact_check = exact_message and digest == check_hash and check_approved in (0, 1)
+        reason = review_reason if state in {"queued", "failed"} else None
+        queue.append(QueuedApplication(Match(
+            listing_id, "WG-Gesucht", url, fresh_at if fresh_at is not None else updated_at, basis or "",
+            message if exact_message else None, state, reason, attachment_digest=attachment_digest,
+            judge_approved=bool(check_approved) if exact_check else None,
+            judge_reason=check_reason if exact_check else None,
+        ), listing_title, updated_at, state == "unconfirmed" and bool(claimed)))
+    return tuple(queue)
+
+
 def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: float) -> tuple[Match, ...]:
     if "drafts" not in tables:
         return ()
@@ -452,7 +550,7 @@ def _matches(db: sqlite3.Connection, tables: set[str], cutoff: float, until: flo
         FROM drafts d {delivery_join} {check_join} {observation_join} {review_join}
         WHERE d.fresh_at BETWEEN ? AND ?
           AND ((d.done = 0 AND d.message IS NOT NULL) OR {state} IS NOT NULL)
-          AND ({available} OR {state} IN ('sent', 'already_contacted', 'unconfirmed'))
+          AND ({available} OR {state} IN ('sent', 'already_contacted', 'unconfirmed', 'credit_proof_required'))
           AND {_not_hidden(tables, 'd.id')}
           {secondary_filter}
         ORDER BY d.fresh_at DESC, d.id DESC LIMIT ?
@@ -565,6 +663,21 @@ def _wg_scan(db: sqlite3.Connection, tables: set[str]) -> tuple[float, int] | No
         SELECT s.scanned_at, (SELECT COUNT(*) FROM wg_observations WHERE last_seen_at = s.scanned_at)
         FROM wg_inventory_scan s WHERE s.id = 1 AND s.scanned_at IS NOT NULL
     """).fetchone()
+
+
+def _credit_proof_requirements(
+    db: sqlite3.Connection, tables: set[str], listing_ids: set[str], until: float,
+) -> tuple[frozenset[str], frozenset[str]]:
+    wg_ids = sorted(listing_id for listing_id in listing_ids if listing_id.isascii() and listing_id.isdecimal())
+    if "listing_credit_proof" not in tables or not wg_ids:
+        return frozenset(), frozenset()
+    placeholders = ", ".join("?" for _ in wg_ids)
+    rows = db.execute(f"""
+        SELECT id, required FROM listing_credit_proof
+        WHERE id IN ({placeholders}) AND required IN (0, 1) AND checked_at BETWEEN 0 AND ?
+    """, (*wg_ids, until)).fetchall()
+    return (frozenset(listing_id for listing_id, required in rows if required),
+            frozenset(listing_id for listing_id, required in rows if not required))
 
 
 def _profiles(db: sqlite3.Connection, tables: set[str], ids: set[str]) -> dict[str, ListingProfile]:
@@ -729,7 +842,12 @@ def load_dashboard(
             dated_secondary_offers = _secondary_offers(db, tables, cutoff, until, ids=tuple(
                 row.id for row in dated_listings
             )) if dated_listings and "munich_secondary_offers" in tables else ()
+            application_queue = _application_queue(db, tables, until)
+            hidden_listings = _hidden_listings(db, tables)
             visible_ids = {row.id for group in (matches, address_checks, dated_listings, secondary_offers) for row in group}
+            visible_ids.update(item.application.id for item in application_queue)
+            proof_ids = visible_ids | {row.id for row in hidden_listings}
+            credit_proof_required, credit_proof_requested = _credit_proof_requirements(db, tables, proof_ids, until)
             return DashboardData(
                 "ready",
                 matches=matches,
@@ -743,8 +861,11 @@ def load_dashboard(
                 application_reviews_available="application_reviews" in tables,
                 wg_inbox_status=_wg_inbox_status(db, tables),
                 dated_secondary_offers=dated_secondary_offers,
-                hidden_listings=_hidden_listings(db, tables),
+                hidden_listings=hidden_listings,
                 sent_applications=_sent_applications(db, tables, until),
+                application_queue=application_queue,
+                credit_proof_required=credit_proof_required,
+                credit_proof_requested=credit_proof_requested,
             )
     except (OSError, sqlite3.Error):
         return DashboardData("unavailable")

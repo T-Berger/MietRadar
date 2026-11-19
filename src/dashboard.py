@@ -21,8 +21,9 @@ from dotenv import load_dotenv
 from application_revision import ApplicationRevisionError, MAX_REVISION_FOCUS_CHARS, regenerate_application
 from dashboard_auth import logout_button, require_authentication
 from dashboard_data import (
-    BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, DateBasis, DatedListing, HiddenListing, ListingProfile,
-    MapListing, Match, ProviderFilter, Reply, SecondaryListing, SentApplication, confirm_application_delivery,
+    BERLIN, RESULT_LIMIT, WG_REPLY_INBOX, AddressCheck, CreditProof, DateBasis, DatedListing, HiddenListing, ListingProfile,
+    MapListing, Match, ProviderFilter, QueuedApplication, Reply, SecondaryListing, SentApplication,
+    confirm_application_delivery,
     filter_listing_providers, load_dashboard, map_listings, set_listing_hidden, weekend_dates,
 )
 from listing_profiles import valid_listing_coordinates
@@ -33,14 +34,25 @@ from reviewed_applications import (
     cancel_application_review, load_application_attachment, remove_application_attachment,
     review_application, save_application_attachment,
 )
+from wg_credit_proof import CREDIT_PROOF_REQUIRED_REASON
 
 
 ROOT = Path(__file__).resolve().parent.parent
+CREDIT_PROOF_LABELS: dict[CreditProof, str] = {
+    "requested": "Bonitätsauskunft gewünscht",
+    "required": "SCHUFA-Datenkopie reicht nicht",
+}
 STATES = {
     "draft": "Entwurf", "held": "Zurückgehalten", "sent": "Gesendet", "done": "Erledigt",
-    "unconfirmed": "Versand unklar", "already_contacted": "Bereits kontaktiert", "unavailable": "Kontakt nicht verfügbar",
-    "edited": "Entwurf bearbeitet", "queued": "Freigegeben · wartet auf Versand", "failed": "Versand nicht erfolgt",
+    "unconfirmed": "Versand unbestätigt", "already_contacted": "Bereits kontaktiert", "unavailable": "Kontakt nicht verfügbar",
+    "edited": "Entwurf bearbeitet", "queued": "Für Versand freigegeben", "failed": "Versand gestoppt",
+    "credit_proof_required": CREDIT_PROOF_LABELS["required"],
 }
+_QUEUE_TAB = "Versandwarteschlange"
+_TAB_KEY = "mietradar_tab"
+_SHOW_QUEUE = "mietradar_show_queue"
+_QUEUE_COLORS = {"queued": "blue", "failed": "red", "unconfirmed": "orange", "unavailable": "red",
+                 "already_contacted": "gray", "credit_proof_required": "red"}
 _REVIEW_NOTICE = "mietradar_application_review_notice"
 _VISIBILITY_NOTICE = "mietradar_listing_visibility_notice"
 OFFERS_PER_PAGE = 4
@@ -90,6 +102,8 @@ INTRO = """
   .radar-listing__badge { padding: .15rem .55rem; border-radius: .45rem; font-size: .76rem; font-weight: 650;
     background: #e1efed; color: #224a44; }
   .radar-listing__commercial { background: #fbe3a9; color: #523600; }
+  .radar-listing__credit-proof-required { background: #ffe4dc; color: #75291d; }
+  .radar-listing__credit-proof-requested { background: #e9edf1; color: #35495c; }
   .radar-listing__photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(11rem, 45%), 1fr));
     gap: .55rem; }
   .radar-listing__photo { position: relative; display: block; overflow: hidden; border-radius: .7rem;
@@ -226,7 +240,8 @@ def _map_facts(row: MapListing) -> str:
     area = _format_value(row.area_sqm, "m²")
     provider = COMMERCIAL_LABEL if row.is_commercial else None
     recipient = RECIPIENT_LABELS.get(row.recipient_role)
-    return " · ".join(filter(None, (row.platform, provider, recipient, f"{route} {direction}", rent, area)))
+    credit_proof = CREDIT_PROOF_LABELS[row.credit_proof] if row.credit_proof else None
+    return " · ".join(filter(None, (row.platform, provider, recipient, f"{route} {direction}", rent, area, credit_proof)))
 
 
 def _listing_map(rows: tuple[MapListing, ...], db_path: Path) -> None:
@@ -377,6 +392,7 @@ def _listing_connections(profile: ListingProfile | None) -> str:
 def _listing_card(
     profile: ListingProfile | None, *, title: str, platform: str, status: str, date_label: str,
     route: tuple[str, str] | None = None, note: str | None = None, map_key: str | None = None,
+    credit_proof: CreditProof | None = None,
 ) -> None:
     if profile and profile.title:
         title = profile.title
@@ -404,11 +420,15 @@ def _listing_card(
     )
     recipient = RECIPIENT_LABELS.get(profile.recipient_role) if profile else None
     recipient_badge = f'<span class="radar-listing__badge">{recipient}</span>' if recipient else ""
+    credit_proof_badge = (
+        f'<span class="radar-listing__badge radar-listing__credit-proof-{credit_proof}">'
+        f'{CREDIT_PROOF_LABELS[credit_proof]}</span>' if credit_proof else ""
+    )
     photos = _listing_photos(profile.photo_urls) if profile else ""
     st.html(
         '<article class="radar-listing"><header>'
         f'<div class="radar-listing__meta"><span class="radar-listing__source">{escape(platform)}</span>'
-        f'{provider}{recipient_badge}{badge}</div>'
+        f'{provider}{recipient_badge}{badge}{credit_proof_badge}</div>'
         f'<h3>{escape(title)}</h3><p class="radar-listing__foot">{escape(date_label)}</p></header>'
         f'{connections}{photos}<div class="radar-listing__facts">{facts}</div>{"".join(sections)}</article>'
     )
@@ -452,6 +472,7 @@ def _credit_proof(db_path: Path, attachment: ApplicationAttachmentInfo | None) -
 def _application(
     row: Match, profile: ListingProfile | None, db_path: Path, hours: int, *,
     review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
+    credit_proof_required: bool,
 ) -> None:
     if row.state == "unconfirmed" and row.platform == "WG-Gesucht":
         st.warning("Der Versand ließ sich nicht bestätigen. Schau im WG-Gesucht-Postfach nach.")
@@ -470,12 +491,12 @@ def _application(
                 return
             st.session_state[_REVIEW_NOTICE] = "Die Bewerbung steht jetzt unter „Bewerbungen“."
             st.rerun()
-    elif row.review_reason and row.review_reason != row.judge_reason:
+    elif row.review_reason and row.review_reason not in {row.judge_reason, CREDIT_PROOF_REQUIRED_REASON}:
         st.text(row.review_reason)
     if row.message is None:
         return
     editable = (review_available and row.platform == "WG-Gesucht" and row.url is not None
-                and row.state not in {"sent", "unconfirmed"})
+                and row.state not in {"sent", "unconfirmed", "credit_proof_required"})
     can_rewrite = (editable or row.platform == "Kleinanzeigen") and row.state in {"draft", "held", "edited", "failed"}
     mistral_configured = (os.getenv("MUNICH_LLM_PROVIDER", "none").strip().lower() == "mistral"
                           and bool(os.getenv("MISTRAL_API_KEY", "").strip()))
@@ -516,7 +537,7 @@ def _application(
                 notice = "Die Versandfreigabe wurde zurückgezogen. Dein Entwurf bleibt gespeichert."
             else:
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=min(hours, 24))
-                may_approve = editable and reviewed_send and row.fresh_at >= cutoff.timestamp()
+                may_approve = editable and reviewed_send and not credit_proof_required and row.fresh_at >= cutoff.timestamp()
                 attachment_version = attachment.digest if attachment else "no-attachment"
                 form_key = f"application-{row.id}-{version}-{attachment_version}-{revision}"
                 if saved_preview:
@@ -542,11 +563,12 @@ def _application(
                     if may_approve:
                         if attachment:
                             st.text(f"Anhang · {attachment.name}")
-                            approve = st.form_submit_button("Text und PDF freigeben und senden", type="primary")
-                            st.caption("MietRadar verschickt genau diesen Text zusammen mit der angezeigten Datei.")
+                            approve = st.form_submit_button("Text und PDF zum Versand freigeben", type="primary")
+                            st.caption("Text und PDF kommen zusammen in die Versandwarteschlange.")
                         else:
-                            approve = st.form_submit_button("Freigeben und senden", type="primary")
-                            st.caption("MietRadar verschickt genau diesen Text.")
+                            approve = st.form_submit_button("Zum Versand freigeben", type="primary")
+                    elif editable and credit_proof_required:
+                        st.caption("WG-Gesucht verlangt für diese Anzeige eine aktuelle Bonitätsauskunft.")
                     elif editable and reviewed_send:
                         st.caption("Das Zeitfenster für den Versand ist abgelaufen.")
                     elif editable:
@@ -574,8 +596,8 @@ def _application(
                     attachment_digest=attachment.digest if approve and attachment else None,
                 )
                 if result == "queued":
-                    notice = ("Deine Bewerbung mit Anhang wurde zum Versand freigegeben." if attachment
-                              else "Deine Nachricht wurde zum Versand freigegeben.")
+                    notice = "Bewerbung freigegeben und in die Versandwarteschlange aufgenommen."
+                    st.session_state[_SHOW_QUEUE] = True
                 else:
                     notice = "Entwurf gespeichert."
         except ApplicationReviewError as error:
@@ -653,39 +675,47 @@ def _offer_date_label(row: Match | DatedListing | SecondaryListing) -> str:
     return posting
 
 
+def _application_status(row: Match) -> str:
+    if row.judge_approved is False:
+        return "Freigegeben · Text zurückgehalten" if row.state == "queued" else "Text zurückgehalten"
+    if row.state == "queued" and row.review_reason:
+        return "Freigegeben · Versand verzögert"
+    return STATES.get(row.state, "Entwurf")
+
+
 def _render_match(
     row: Match, profile: ListingProfile | None, db_path: Path, hours: int, *, view: str,
     review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
-    show_maps: bool,
+    show_maps: bool, credit_proof: CreditProof | None,
 ) -> None:
     tier, route = _primary_route(profile)
+    if row.state == "credit_proof_required":
+        credit_proof = "required"
     with st.container(border=True):
         date_label = _offer_date_label(row)
         if row.basis == "zuerst gesehen" and row.message and row.state != "queued":
-            if review_available and reviewed_send and row.platform == "WG-Gesucht":
-                date_label += " · Versand nur nach Freigabe"
-            else:
-                date_label += " · nur als Entwurf"
-        status = STATES.get(row.state, "Entwurf")
-        if row.judge_approved is False:
-            status = "Freigegeben · Text zurückgehalten" if row.state == "queued" else "Text zurückgehalten"
-        elif row.state == "queued" and row.review_reason:
-            status = "Freigegeben · Versand verzögert"
+            can_send = review_available and reviewed_send and row.platform == "WG-Gesucht" and credit_proof != "required"
+            date_label += " · Versand nur nach Freigabe" if can_send else " · nur als Entwurf"
+        status = "Versand gestoppt" if row.state == "credit_proof_required" else _application_status(row)
         _listing_card(
             profile, title=_headline(row.url), platform=row.platform,
             status=f"{tier} · {status}", date_label=f"{date_label} · {row.id}", route=route,
             map_key=f"{view}_map_{row.id}" if show_maps and row.state != "unavailable" else None,
+            credit_proof=credit_proof,
         )
         _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
                        row.url, view=view)
-        _application(row, profile, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
-                     attachment=attachment)
+        if row.platform == "WG-Gesucht" and row.state in {"queued", "failed", "unconfirmed", "credit_proof_required"}:
+            st.caption(f"Versanddetails findest du unter „{_QUEUE_TAB}“.")
+        else:
+            _application(row, profile, db_path, hours, review_available=review_available, reviewed_send=reviewed_send,
+                         attachment=attachment, credit_proof_required=credit_proof == "required")
 
 
 def _matches(
     rows: tuple[Match, ...], hours: int, wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile],
     db_path: Path, *, newest_first: bool, review_available: bool, reviewed_send: bool,
-    attachment: ApplicationAttachmentInfo | None, show_maps: bool,
+    attachment: ApplicationAttachmentInfo | None, show_maps: bool, credit_proofs: dict[str, CreditProof],
 ) -> None:
     st.subheader("Neue Mietangebote", anchor=False)
     _scan_status(wg_scan)
@@ -700,7 +730,8 @@ def _matches(
         return
     for row in _daily_offer_page(filtered, "current", newest_first):
         _render_match(row, profiles.get(row.id), db_path, hours, view="current", review_available=review_available,
-                      reviewed_send=reviewed_send, attachment=attachment, show_maps=show_maps)
+                      reviewed_send=reviewed_send, attachment=attachment, show_maps=show_maps,
+                      credit_proof=credit_proofs.get(row.id))
 
 
 def _scan_status(wg_scan: tuple[float, int] | None) -> None:
@@ -737,6 +768,7 @@ def _dated_offers(
     wg_scan: tuple[float, int] | None, profiles: dict[str, ListingProfile], db_path: Path,
     *, newest_first: bool, current_matches: dict[str, Match], hours: int, review_available: bool,
     reviewed_send: bool, attachment: ApplicationAttachmentInfo | None, show_maps: bool,
+    credit_proofs: dict[str, CreditProof],
 ) -> None:
     sightings = basis == "first_seen"
     st.subheader("Zuerst erfasste Mietangebote" if sightings else "Veröffentlichte Mietangebote", anchor=False)
@@ -769,7 +801,8 @@ def _dated_offers(
         profile = profiles.get(row.id)
         if match := current_matches.get(row.id):
             _render_match(match, profile, db_path, hours, view="dated", review_available=review_available,
-                          reviewed_send=reviewed_send, attachment=attachment, show_maps=show_maps)
+                          reviewed_send=reviewed_send, attachment=attachment, show_maps=show_maps,
+                          credit_proof=credit_proofs.get(row.id))
             continue
         with st.container(border=True):
             status = "Filter erfüllt" if row.matched else "Erfasst"
@@ -779,7 +812,8 @@ def _dated_offers(
                 status = f"{tier} · {status}"
             _listing_card(profile, title=_headline(row.url), platform=row.platform,
                           status=status, date_label=_offer_date_label(row), route=route,
-                          map_key=f"dated_map_{row.id}" if show_maps else None)
+                          map_key=f"dated_map_{row.id}" if show_maps else None,
+                          credit_proof=credit_proofs.get(row.id))
             _offer_actions(db_path, row.id, profile.title if profile and profile.title else _headline(row.url),
                            row.url, view="dated")
 
@@ -801,7 +835,7 @@ def _addresses(rows: tuple[AddressCheck, ...], profiles: dict[str, ListingProfil
 
 def _secondary_offers(
     rows: tuple[SecondaryListing, ...], profiles: dict[str, ListingProfile], db_path: Path, *,
-    newest_first: bool, basis: DateBasis | None,
+    newest_first: bool, basis: DateBasis | None, credit_proofs: dict[str, CreditProof],
 ) -> None:
     st.caption("Bis zu 45 Min. mit dem ÖPNV ab Ostbahnhof für B oder ab Hauptbahnhof für C. Passt beides, gilt B.")
     category = st.selectbox("ÖPNV-Kategorie", ("B und C", "B", "C"), key="secondary_offer_category",
@@ -817,11 +851,11 @@ def _secondary_offers(
             title = (profile.title if profile else None) or row.title or _headline(row.url)
             _listing_card(profile, title=title, platform=row.platform, status=f"Kategorie {row.tier.upper()}",
                           date_label=_offer_date_label(row), route=(f"Ab {station}", f"{row.minutes} Min."),
-                          map_key=f"secondary_map_{row.id}")
+                          map_key=f"secondary_map_{row.id}", credit_proof=credit_proofs.get(row.id))
             _offer_actions(db_path, row.id, title, row.url, view="secondary")
 
 
-def _hidden_offers(rows: tuple[HiddenListing, ...], db_path: Path) -> None:
+def _hidden_offers(rows: tuple[HiddenListing, ...], db_path: Path, credit_proofs: dict[str, CreditProof]) -> None:
     st.subheader("Ausgeblendete Angebote", anchor=False)
     if not rows:
         st.info("Du hast noch keine Angebote ausgeblendet.")
@@ -829,14 +863,64 @@ def _hidden_offers(rows: tuple[HiddenListing, ...], db_path: Path) -> None:
     for row in rows:
         with st.container(border=True):
             st.text(row.title)
+            if credit_proof := credit_proofs.get(row.id):
+                st.badge(CREDIT_PROOF_LABELS[credit_proof], color="red" if credit_proof == "required" else "gray")
             st.caption(f"{row.platform} · Ausgeblendet am {_date(row.hidden_at)}")
             _offer_actions(db_path, row.id, row.title, row.url, view="hidden", hidden=True)
 
 
-def _sent_applications(rows: tuple[SentApplication, ...]) -> None:
+def _application_queue(
+    rows: tuple[QueuedApplication, ...], profiles: dict[str, ListingProfile], db_path: Path, hours: int, *,
+    review_available: bool, reviewed_send: bool, attachment: ApplicationAttachmentInfo | None,
+    wg_on_mac: bool, wg_inbox_status: tuple[float, bool] | None, credit_proofs: dict[str, CreditProof],
+) -> None:
+    if wg_on_mac:
+        if wg_inbox_status is None:
+            st.caption("Vom Mac liegt noch kein Postfachabgleich vor.")
+        else:
+            checked_at, available = wg_inbox_status
+            st.caption(f"Letzter Postfachabgleich vom Mac · {_date(checked_at)}")
+            if not available:
+                st.warning("Das WG-Gesucht-Postfach auf dem Mac ist gerade nicht erreichbar.")
+    if not rows:
+        st.info("Keine Bewerbungen in der Versandwarteschlange.")
+        return
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=min(hours, 24))).timestamp()
+    for item in rows:
+        row = item.application
+        credit_proof = credit_proofs.get(row.id)
+        with st.container(border=True):
+            st.text(item.title or _headline(row.url))
+            if item.relay_claimed:
+                st.badge("Vom Mac übernommen", color="blue")
+                date_label = "Versand begonnen"
+            else:
+                status = _application_status(row) if row.state == "queued" else STATES[row.state]
+                color = _QUEUE_COLORS[row.state]
+                if row.state == "queued" and row.fresh_at < cutoff:
+                    status, color = "Versandfenster abgelaufen", "orange"
+                st.badge(status, color=color)
+                date_label = "Freigabe" if row.state == "queued" else "Stand"
+            if credit_proof and row.state != "credit_proof_required":
+                st.badge(CREDIT_PROOF_LABELS[credit_proof], color="red" if credit_proof == "required" else "gray")
+            st.caption(f"{row.platform} · {date_label} {_date(item.updated_at)}")
+            _location_link(row.url)
+            if item.relay_claimed:
+                if row.message:
+                    with st.expander("Freigegebenen Text anzeigen"):
+                        st.code(row.message, language=None, wrap_lines=True)
+                continue
+            _application(row, profiles.get(row.id), db_path, hours, review_available=review_available,
+                         reviewed_send=reviewed_send, attachment=attachment,
+                         credit_proof_required=credit_proof == "required")
+
+
+def _sent_applications(rows: tuple[SentApplication, ...], *, has_queue: bool) -> None:
     st.subheader("Gesendete Bewerbungen", anchor=False)
     if not rows:
         st.info("MietRadar hat noch keinen bestätigten Versand erfasst.")
+        if has_queue:
+            st.caption(f"Freigaben und ihre Versanddetails findest du unter „{_QUEUE_TAB}“.")
         return
     for row in rows:
         with st.container(border=True):
@@ -952,12 +1036,15 @@ def main() -> None:
         st.warning("Die MietRadar-Daten konnten gerade nicht gelesen werden. Aktualisiere die Seite in Kürze.")
         return
     data = filter_listing_providers(data, provider)
+    credit_proofs = data.credit_proofs
     current_rows = tuple(row for row in data.matches if platform == "Alle" or row.platform == platform)
     dated_rows = tuple(row for row in data.dated_listings if platform == "Alle" or row.platform == platform)
     secondary_rows = data.secondary_offers if date_basis is None else data.dated_secondary_offers
     secondary_rows = tuple(row for row in secondary_rows if platform == "Alle" or row.platform == platform)
     if notice := st.session_state.pop(_REVIEW_NOTICE, None):
         st.success(notice)
+    if st.session_state.pop(_SHOW_QUEUE, False):
+        st.session_state[_TAB_KEY] = _QUEUE_TAB
     if visibility_notice := st.session_state.pop(_VISIBILITY_NOTICE, None):
         success, message = visibility_notice
         if success:
@@ -973,50 +1060,61 @@ def main() -> None:
         matches.metric("Neue Angebote", len(current_rows), border=True)
     drafts.metric("Bewerbungsentwürfe", sum(bool(row.message) for row in current_rows), border=True)
     pending.metric("Adressen zur Prüfung", len(data.address_checks), border=True)
-    offers, applications, map_tab, secondary, address, replies, activity, hidden = st.tabs(
-        ["Angebote", "Bewerbungen", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf", "Ausgeblendet"],
-        key="mietradar_tab", on_change="rerun",
+    offers, queue, applications, map_tab, secondary, address, replies, activity, hidden = st.tabs(
+        ["Angebote", _QUEUE_TAB, "Bewerbungen", "Karte", "B & C", "Adresse prüfen", "Antwortentwürfe", "Verlauf",
+         "Ausgeblendet"], key=_TAB_KEY, on_change="rerun",
     )
-    with offers:
-        attachment = None
-        reviewed_send = os.getenv("MUNICH_REVIEWED_SEND", "").strip().lower() == "true"
-        if reviewed_send and data.application_reviews_available:
-            try:
-                attachment = load_application_attachment(db_path)
-            except ApplicationReviewError as error:
-                st.warning(str(error))
-                reviewed_send = False
-            else:
+    attachment = None
+    reviewed_send = os.getenv("MUNICH_REVIEWED_SEND", "").strip().lower() == "true"
+    if reviewed_send and data.application_reviews_available:
+        try:
+            attachment = load_application_attachment(db_path)
+        except ApplicationReviewError as error:
+            st.warning(str(error))
+            reviewed_send = False
+        else:
+            with offers:
                 _credit_proof(db_path, attachment)
+    with offers:
         if date_basis:
             _dated_offers(dated_rows, date_window, date_basis, data.wg_scan, data.listing_profiles, db_path,
                           newest_first=newest_first, current_matches={row.id: row for row in current_rows}, hours=hours,
                           review_available=data.application_reviews_available, reviewed_send=reviewed_send,
-                          attachment=attachment, show_maps=bool(offers.open))
+                          attachment=attachment, show_maps=bool(offers.open),
+                          credit_proofs=credit_proofs)
         else:
             _matches(current_rows, hours, data.wg_scan, data.listing_profiles, db_path, newest_first=newest_first,
                      review_available=data.application_reviews_available,
-                     reviewed_send=reviewed_send, attachment=attachment, show_maps=bool(offers.open))
+                     reviewed_send=reviewed_send, attachment=attachment, show_maps=bool(offers.open),
+                     credit_proofs=credit_proofs)
+    wg_on_mac = bool(os.getenv("MUNICH_WG_RELAY_TOKEN", "").strip())
+    if queue.open:
+        with queue:
+            _application_queue(data.application_queue, data.listing_profiles, db_path, hours,
+                               review_available=data.application_reviews_available, reviewed_send=reviewed_send,
+                               attachment=attachment, wg_on_mac=wg_on_mac, wg_inbox_status=data.wg_inbox_status,
+                               credit_proofs=credit_proofs)
     if applications.open:
         with applications:
-            _sent_applications(data.sent_applications)
+            _sent_applications(data.sent_applications, has_queue=bool(data.application_queue))
     if map_tab.open:
         with map_tab:
             map_rows = map_listings(data, date_filtered=date_basis is not None)
             _listing_map(tuple(row for row in map_rows if platform == "Alle" or row.platform == platform), db_path)
     if secondary.open:
         with secondary:
-            _secondary_offers(secondary_rows, data.listing_profiles, db_path, newest_first=newest_first, basis=date_basis)
+            _secondary_offers(secondary_rows, data.listing_profiles, db_path, newest_first=newest_first, basis=date_basis,
+                              credit_proofs=credit_proofs)
     with address:
         _addresses(data.address_checks, data.listing_profiles, db_path)
     with replies:
         _replies(data.replies, wg_enabled=os.getenv("MUNICH_WG_REPLY_DRAFTS", "").strip().lower() == "true",
-                 wg_status=data.wg_inbox_status, wg_on_mac=bool(os.getenv("MUNICH_WG_RELAY_TOKEN", "").strip()))
+                 wg_status=data.wg_inbox_status, wg_on_mac=wg_on_mac)
     with activity:
         _activity(data.activity)
     if hidden.open:
         with hidden:
-            _hidden_offers(data.hidden_listings, db_path)
+            _hidden_offers(data.hidden_listings, db_path, credit_proofs)
 
 
 if __name__ == "__main__":

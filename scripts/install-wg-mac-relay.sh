@@ -81,7 +81,8 @@ trap 'rm -rf -- "$stage_dir"' EXIT
 mkdir "$stage_dir/worker"
 modules=(
     kleinanzeigen_judge listing_photos llm_personalizer munich_delivery munich_tiers outgoing_judge
-    rental_availability reviewed_applications wg_delivery wg_first_message wg_mac_worker wg_reply_inbox wg_source
+    rental_availability reviewed_applications wg_credit_proof wg_delivery wg_first_message wg_mac_worker wg_reply_inbox
+    wg_source
 )
 for module in "${modules[@]}"; do
     cp "$repo_dir/src/$module.py" "$stage_dir/worker/"

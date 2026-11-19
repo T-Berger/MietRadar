@@ -156,6 +156,7 @@ class Listing:
     is_commercial: bool = False
     recipient_role: RecipientRole = "unknown"
     contact_name: str | None = None
+    credit_proof_requested: bool = False
 
 
 def _search_url(url):
@@ -680,4 +681,7 @@ class WGSource:
             is_commercial=commercial,
             recipient_role=listing_recipient_role(description, commercial=commercial, contact_roles=contact_roles),
             contact_name=contact_name,
+            credit_proof_requested=soup.select_one(
+                "a.required-document-link[href^='/bonitaetscheck.html?'][href*='offer_detail_documents']"
+            ) is not None,
         )

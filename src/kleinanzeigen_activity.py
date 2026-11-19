@@ -8,6 +8,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum, auto
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -54,6 +55,13 @@ def install_activity(db: sqlite3.Connection) -> None:
             emailed_at REAL
         )
     """)
+    with db:
+        db.execute("CREATE TABLE IF NOT EXISTS listing_email_notifications (listing_id TEXT PRIMARY KEY)")
+        db.execute("""
+            INSERT OR IGNORE INTO listing_email_notifications (listing_id)
+            SELECT listing_id FROM klein_activity
+            WHERE listing_id IS NOT NULL AND kind <> 'reply' AND emailed_at IS NOT NULL
+        """)
 
 
 @dataclass(frozen=True)
@@ -142,6 +150,12 @@ def record_replies(
     return count
 
 
+class EmailOutcome(Enum):
+    ACCEPTED = auto()
+    REJECTED = auto()
+    UNCERTAIN = auto()
+
+
 @dataclass(frozen=True)
 class EmailNotifier:
     api_key: str
@@ -150,20 +164,45 @@ class EmailNotifier:
     provider: str = "resend"
 
     def flush(self, db: sqlite3.Connection, now: datetime) -> tuple[int, bool]:
-        # Older items stay in the local log. Brevo's duplicate protection is shorter than Resend's 24h.
-        pending = db.execute("""SELECT id, subject, summary, url FROM klein_activity
-            WHERE emailed_at IS NULL AND occurred_at BETWEEN ? AND ? ORDER BY occurred_at DESC LIMIT 15
+        pending = db.execute("""
+            WITH pending AS (
+                SELECT id, kind, subject, summary, url, occurred_at,
+                       CASE WHEN kind <> 'reply' THEN listing_id END AS notification_listing_id
+                FROM klein_activity WHERE emailed_at IS NULL AND occurred_at BETWEEN ? AND ?
+            ), ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY notification_listing_id, CASE WHEN notification_listing_id IS NULL THEN id END
+                    ORDER BY CASE kind WHEN 'match' THEN 0 WHEN 'delivery' THEN 1 ELSE 2 END, occurred_at DESC, id
+                ) AS priority
+                FROM pending WHERE NOT EXISTS (
+                    SELECT 1 FROM listing_email_notifications WHERE listing_id = notification_listing_id
+                )
+            )
+            SELECT id, subject, summary, url, notification_listing_id FROM ranked
+            WHERE priority = 1 ORDER BY occurred_at DESC, id LIMIT 15
         """, ((now - timedelta(hours=23)).timestamp(), now.timestamp())).fetchall()
         sent = 0
-        for event_id, subject, summary, url in pending:
-            if not self._send(event_id, subject, summary, url):
+        for event_id, subject, summary, url, listing_id in pending:
+            if listing_id is not None:
+                with db:
+                    claimed = db.execute("INSERT OR IGNORE INTO listing_email_notifications VALUES (?)",
+                                         (listing_id,)).rowcount
+                if not claimed:
+                    continue
+            outcome = self._send(event_id, subject, summary, url)
+            if outcome is not EmailOutcome.ACCEPTED:
+                if listing_id is not None and outcome is EmailOutcome.REJECTED:
+                    with db:
+                        db.execute("DELETE FROM listing_email_notifications WHERE listing_id = ?", (listing_id,))
+                elif listing_id is not None:
+                    LOG.warning("Versandstatus einer Anzeigenbenachrichtigung unklar. Sie wird nicht erneut versendet.")
                 return sent, False
             with db:
                 db.execute("UPDATE klein_activity SET emailed_at = ? WHERE id = ?", (now.timestamp(), event_id))
             sent += 1
         return sent, True
 
-    def _send(self, event_id: str, subject: str, summary: str, url: str) -> bool:
+    def _send(self, event_id: str, subject: str, summary: str, url: str) -> EmailOutcome:
         subject = f"MietRadar · {subject}"
         body = f"{summary}\n\n{url}".strip()
         headers = {"Content-Type": "application/json", "User-Agent": "MietRadar/1.0"}
@@ -186,7 +225,7 @@ class EmailNotifier:
         request = Request(endpoint, method="POST", data=json.dumps(payload).encode("utf-8"), headers=headers)
         try:
             with urlopen(request, timeout=10) as response:
-                return bool(json.load(response).get(response_id))
+                return EmailOutcome.ACCEPTED if json.load(response).get(response_id) else EmailOutcome.UNCERTAIN
         except HTTPError as error:
             with error:
                 try:
@@ -200,9 +239,11 @@ class EmailNotifier:
             message = message.lower() if isinstance(message, str) else ""
             if (self.provider == "brevo" and error.code == 400 and code == "duplicate_parameter"
                     and "idempotency" in message):
-                return True
+                return EmailOutcome.ACCEPTED
             LOG.warning("%s hat die E-Mail abgelehnt (HTTP %d). %s.", self.provider.title(), error.code,
                         _rejection_hint(self.provider, error.code, code, message))
-            return False
+            if 400 <= error.code < 500 and error.code not in {408, 409, 425}:
+                return EmailOutcome.REJECTED
+            return EmailOutcome.UNCERTAIN
         except (URLError, OSError, HTTPException, ValueError, AttributeError):
-            return False
+            return EmailOutcome.UNCERTAIN

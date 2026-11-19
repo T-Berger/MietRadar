@@ -13,7 +13,8 @@ from selenium.common.exceptions import TimeoutException
 
 from munich_delivery import DeliveryOutcome
 from wg_mac_worker import (
-    Relay, RelayError, RelayTemporaryError, UnconfirmedDelivery, _check_browser, _inbox_updates, _poll_jobs,
+    BrowserNeedsAttention, Relay, RelayError, RelayTemporaryError, UnconfirmedDelivery,
+    _check_browser, _inbox_updates, _poll_jobs,
     _read_inbox_in_temporary_tab, _write_attachment, process_next, read_token,
 )
 from wg_reply_inbox import WGInboxEntry, WGInboxError
@@ -86,6 +87,32 @@ class MacWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(RelayError, "PDF-Anhang"):
             process_next(self.relay, self.browser, self.source)
         self.browser.send.assert_not_called()
+
+    def test_required_credit_proof_is_reported_without_a_claim(self):
+        self.relay.post.side_effect = [self.next_job, self.prepared, {"recorded": True}]
+        self.browser.send.return_value = DeliveryOutcome.CREDIT_PROOF_REQUIRED
+        self.assertTrue(process_next(self.relay, self.browser, self.source))
+        self.assertEqual([entry.args[0] for entry in self.relay.post.call_args_list], ["next", "prepare", "finish"])
+        self.assertEqual(self.relay.post.call_args.args[1], {**JOB, "outcome": "credit_proof_required"})
+
+    def test_explicit_credit_refusal_can_be_reported_after_claim(self):
+        self.relay.post.side_effect = [self.next_job, self.prepared, {"claimed": True}, {"recorded": True}]
+
+        def send(_url, _message, claim, **_kwargs):
+            self.assertTrue(claim())
+            return DeliveryOutcome.CREDIT_PROOF_REQUIRED
+
+        self.browser.send.side_effect = send
+        self.assertTrue(process_next(self.relay, self.browser, self.source))
+        self.assertEqual(self.relay.post.call_args.args[1], {**JOB, "outcome": "credit_proof_required"})
+
+    def test_visible_worker_recovers_from_a_browser_block_before_claim(self):
+        with patch("wg_mac_worker.process_next", side_effect=[BrowserNeedsAttention("Anmeldung"), KeyboardInterrupt]), \
+                patch("wg_mac_worker._check_browser") as check:
+            with self.assertRaises(KeyboardInterrupt):
+                _poll_jobs(self.relay, self.browser, visible=True)
+        self.browser._browser.return_value.switch_to.new_window.assert_called_once_with("tab")
+        check.assert_called_once_with(self.browser, manual=True, keep_waiting=True)
 
     def test_repeated_uploads_use_distinct_generic_names_for_the_approved_pdf(self):
         attachment = {

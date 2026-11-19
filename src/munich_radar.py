@@ -42,6 +42,7 @@ from reviewed_applications import (
     reject_unavailable_approval, set_application_wait_reason,
 )
 from wg_alerts import AlertsError, AlertsInbox
+from wg_credit_proof import record_credit_proof_request
 from wg_first_message import applicant_answers, viewing_availability, viewing_slot_labels
 from wg_observations import FIRST_SEEN_BASIS, install_observations, record_details, record_inventory
 from wg_preferences import rejection_reason
@@ -358,8 +359,10 @@ class Scanner:
             set_application_wait_reason(db, item, None)
             result = self.reviewed_delivery.deliver(
                 db, item.id, item.url, item.message, item.fresh_at, self.max_age, context=listing.description,
-                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
-                                                recipient_role=self._recipient_role(db, listing)), attachment=attachment,
+                first_message=FirstMessageReview(
+                    listing.title, self.applicant_intro, (), self.applicant_answers,
+                    user_reviewed=True, recipient_role=self._recipient_role(db, listing),
+                ), attachment=attachment,
             )
             if result:
                 counts[result] += 1
@@ -568,6 +571,7 @@ class Scanner:
                     refresh_draft = True
                     skip_draft = False
             record_listing_profile(db, listing)
+            record_credit_proof_request(db, listing.id, now, requested=listing.credit_proof_requested)
             if reason := self._check_availability(db, listing, now):
                 counts[reason] += 1
                 retry_after[listing.id] = now + self.max_age

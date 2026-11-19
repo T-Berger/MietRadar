@@ -13,7 +13,8 @@ from urllib.request import Request, urlopen
 
 from munich_radar import Scanner, _database
 from outgoing_judge import OutgoingJudgment
-from reviewed_applications import cancel_application_review, review_application, save_application_attachment
+from reviewed_applications import ApplicationReviewError, cancel_application_review, review_application, save_application_attachment
+from wg_credit_proof import CREDIT_PROOF_REQUIRED_REASON, record_credit_proof_request
 from test_munich_radar import NOW, offer
 from wg_delivery_relay import PREPARATION_AGE, ReviewedDeliveryRelay, _RelayServer
 
@@ -35,6 +36,8 @@ class ReviewedDeliveryRelayTest(unittest.TestCase):
         self.scanner = Mock(spec=Scanner)
         self.scanner.max_age = timedelta(hours=24)
         self.scanner.outgoing_provider = "mistral"
+        self.scanner.applicant_intro = "Ich bin Sam."
+        self.scanner.applicant_answers = {"einzug": "Ich kann ab Dezember einziehen."}
         self.scanner.validate_reviewed_listing.return_value = True
         self.relay = self.new_relay()
 
@@ -158,6 +161,8 @@ class ReviewedDeliveryRelayTest(unittest.TestCase):
         self.assertEqual(judge.call_args.args, (MESSAGE,))
         self.assertEqual(judge.call_args.kwargs["provider"], "mistral")
         self.assertTrue(judge.call_args.kwargs["user_reviewed"])
+        self.assertEqual(judge.call_args.kwargs["applicant_intro"], self.scanner.applicant_intro)
+        self.assertEqual(judge.call_args.kwargs["applicant_answers"], self.scanner.applicant_answers)
         self.scanner.validate_reviewed_listing.assert_called_once()
         rival = self.new_relay()
         start = Barrier(2)
@@ -185,6 +190,57 @@ class ReviewedDeliveryRelayTest(unittest.TestCase):
         self.assertEqual(self.relay.dispatch("/v1/claim", job), {"claimed": False})
         self.assertEqual(self.relay.dispatch("/v1/prepare", {**job, "listing": self.public_listing()}), {"ready": False})
         self.assertIsNone(self.db.execute("SELECT state FROM delivery").fetchone())
+
+    def test_mac_dispatch_requires_current_mistral_approval(self):
+        self.draft()
+        job = self.job()
+        self.scanner.outgoing_provider = "none"
+        self.assertEqual(self.relay.dispatch("/v1/prepare", {**job, "listing": self.public_listing()}), {"ready": False})
+        self.assertIsNone(self.db.execute("SELECT id FROM outgoing_checks").fetchone())
+        self.now += timedelta(minutes=3)
+        self.scanner.outgoing_provider = "mistral"
+        self.assertEqual(self.job(), job)
+        self.assertTrue(self.prepare(job)[0]["ready"])
+        with self.db:
+            self.db.execute("UPDATE outgoing_checks SET approved = 0 WHERE id = ?", (job["id"],))
+        self.assertEqual(self.relay.dispatch("/v1/claim", job), {"claimed": False})
+        self.assertIsNone(self.db.execute("SELECT state FROM delivery").fetchone())
+
+    def test_required_credit_proof_stops_send_and_keeps_the_draft(self):
+        document = self.draft(attachment=True)
+        job = self.job()
+        self.assertTrue(self.prepare(job)[0]["ready"])
+        finish = {**job, "outcome": "credit_proof_required"}
+        self.assertEqual(self.relay.dispatch("/v1/finish", finish), {"recorded": True})
+        self.assertEqual(self.relay.dispatch("/v1/finish", finish), {"recorded": True})
+        self.assertIsNone(self.job())
+        self.assertEqual(self.relay.dispatch("/v1/claim", job), {"claimed": False})
+        self.assertIsNone(self.db.execute("SELECT state FROM delivery").fetchone())
+        self.assertEqual(self.db.execute("SELECT id, required FROM listing_credit_proof").fetchone(), (job["id"], 1))
+        self.assertEqual(self.db.execute("SELECT state, reason FROM application_reviews").fetchone(),
+                         ("failed", CREDIT_PROOF_REQUIRED_REASON))
+        self.assertEqual(self.db.execute("SELECT done, message FROM drafts").fetchone(), (0, MESSAGE))
+        with self.assertRaisesRegex(ApplicationReviewError, "Bonitätsauskunft"):
+            review_application(self.path, job["id"], MESSAGE, MESSAGE, approve=True, now=self.now,
+                               max_age=self.scanner.max_age, attachment_digest=document.digest)
+
+    def test_public_credit_request_is_permitted_but_explicit_refusal_after_claim_is_recorded(self):
+        with self.db:
+            record_credit_proof_request(self.db, self.listing.id, self.now, requested=True)
+        self.draft(attachment=True)
+        job = self.job()
+        self.assertTrue(self.prepare(job)[0]["ready"])
+        self.assertEqual(self.relay.dispatch("/v1/claim", job), {"claimed": True})
+        finish = {**job, "outcome": "credit_proof_required"}
+        self.assertEqual(self.relay.dispatch("/v1/finish", finish), {"recorded": True})
+        self.assertEqual(self.relay.dispatch("/v1/finish", finish), {"recorded": True})
+        with self.db:
+            record_credit_proof_request(self.db, self.listing.id, self.now + timedelta(minutes=1), requested=False)
+        self.assertEqual(self.db.execute("SELECT state, attempted_at FROM delivery").fetchone(),
+                         ("credit_proof_required", self.now.timestamp()))
+        self.assertEqual(self.db.execute("SELECT required FROM listing_credit_proof").fetchone(), (1,))
+        self.assertEqual(self.db.execute("SELECT done, message FROM drafts").fetchone(), (0, MESSAGE))
+        self.assertIsNone(self.job())
 
     def test_withdrawal_and_expiry_prevent_claiming_an_old_preparation(self):
         self.draft()

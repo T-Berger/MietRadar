@@ -15,7 +15,10 @@ from typing import Protocol
 from munich_tiers import install_secondary_offers
 from outgoing_judge import OutgoingJudgment, judge_outgoing
 from rental_availability import AVAILABILITY_POLICY_VERSION
-from reviewed_applications import ApplicationAttachment, install_application_reviews, review_is_pending
+from reviewed_applications import (
+    ApplicationAttachment, install_application_reviews, reject_unavailable_approval, review_is_pending,
+)
+from wg_credit_proof import CREDIT_PROOF_REQUIRED_REASON, record_credit_proof_requirement
 from wg_first_message import viewing_slot_labels
 from wg_source import RecipientRole
 
@@ -25,6 +28,7 @@ class DeliveryOutcome(Enum):
     ALREADY_CONTACTED = auto()
     UNCONFIRMED = auto()
     UNAVAILABLE = auto()
+    CREDIT_PROOF_REQUIRED = auto()
     BLOCKED = auto()
     SKIPPED = auto()
 
@@ -170,6 +174,7 @@ class DeliveryQueue:
                      AND NOT EXISTS (SELECT 1 FROM application_reviews r WHERE r.id = d.id)
                      AND NOT EXISTS (SELECT 1 FROM munich_secondary_offers o WHERE o.id = d.id)
                      AND NOT EXISTS (SELECT 1 FROM listing_availability a WHERE a.id = d.id AND a.reason IS NOT NULL)
+                     AND NOT EXISTS (SELECT 1 FROM listing_credit_proof p WHERE p.id = d.id AND p.required = 1)
                      AND (d.id NOT LIKE 'ka-%' OR EXISTS (
                          SELECT 1 FROM listing_availability a WHERE a.id = d.id AND a.policy_version = ?
                      ))""",
@@ -227,6 +232,15 @@ class DeliveryQueue:
         if outcome == DeliveryOutcome.BLOCKED:
             self.paused = True
             return "Versand pausiert: Anmeldung, Prüfung oder Kontaktformular blockiert"
+        if outcome == DeliveryOutcome.CREDIT_PROOF_REQUIRED:
+            with db:
+                record_credit_proof_requirement(db, listing_id, self.clock())
+                if reserved:
+                    db.execute("UPDATE delivery SET state = 'credit_proof_required', recorded_at = ? WHERE id = ?",
+                               (stamp, listing_id))
+                else:
+                    reject_unavailable_approval(db, listing_id, CREDIT_PROOF_REQUIRED_REASON, self.clock())
+            return CREDIT_PROOF_REQUIRED_REASON
         if reserved:
             if outcome != DeliveryOutcome.SENT:
                 # A click may have occurred. Keep the claim and halt this session

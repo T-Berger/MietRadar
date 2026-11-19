@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -14,7 +15,10 @@ from tempfile import TemporaryDirectory, TemporaryFile
 from urllib.parse import parse_qs, urlsplit
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, SessionNotCreatedException, TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException, NoSuchElementException, SessionNotCreatedException,
+    StaleElementReferenceException, TimeoutException, WebDriverException,
+)
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -25,14 +29,28 @@ from wg_source import ListingRef
 
 _HOSTS = {"www.wg-gesucht.de", "wg-gesucht.de"}
 _CONTACT_PREFIXES = ("/nachricht-senden/", "/en/nachricht-senden/")
+_THREAD_PATHS = {"/nachricht.html", "/nachrichten.html", "/en/nachrichten.html"}
 _CONTACT_LABELS = {"nachricht senden", "send message"}
 _SEND_LABELS = _CONTACT_LABELS | {"senden", "send"}
 _PDF_INPUT = "#messenger_form input#file_input[type='file']"
 _PENDING_ATTACHMENTS = "#messenger_form .message_input_wrapper.pre_attached_file"
-_FORM_ERROR = "#messenger_form #validation-error-placeholder, #attachments_modal_content #validation-error-placeholder"
+_SUBMISSION_ERROR = "#messenger_form #validation-error-placeholder"
 _UPLOAD_ERROR = "#attachments_modal_content #validation-error-placeholder"
+_FORM_ERROR = f"{_SUBMISSION_ERROR}, {_UPLOAD_ERROR}"
+_OUTGOING_MESSAGES = "#messages_container .message.my_message"
+_OUTGOING_TEXT = f"{_OUTGOING_MESSAGES} .message_content.message_text"
+_OUTGOING_ATTACHMENT = f"{_OUTGOING_MESSAGES} .download_attachment_conversation a"
 _NEW_CONVERSATION = "#start_new_conversation"
 _SENT_NOTICE = "#message_successfully_sent"
+_CREDIT_DOCUMENT = r"(?:bonitätsauskunft|bonitätsnachweis|bonitätspass|schufa-auskunft)"
+_CREDIT_PROOF_REFUSED = re.compile(
+    rf"\b{_CREDIT_DOCUMENT}\b(?:\s+\w+){{0,3}}\s+"
+    r"(?:fehlt|erforderlich|ungültig|nicht (?:gültig|ausreichend|akzeptiert))\b"
+    rf"|\b(?:ohne|fehlende[nr]?|ungültige[nr]?)\s+(?:(?:eine[nr]?|aktuelle[nr]?|gültige[nr]?)\s+){{0,3}}"
+    rf"{_CREDIT_DOCUMENT}\b",
+    re.I,
+)
+_SEND_REFUSED = re.compile(r"\bnachricht (?:konnte|wurde|kann) nicht (?:gesendet|versendet|verschickt)\b", re.I)
 _VERIFICATION = (
     "#login_two_factor_authentication_form, #registration_verification_phone_number_form, "
     "#registration_verification_code_form, #sicherheit_bestaetigung, "
@@ -183,7 +201,7 @@ class BrowserSender:
         if _visible(driver, "#pre_session_email, #login_form #login_password") is not None:
             return "login"
         if _contact_id(driver.current_url) != listing.id:
-            return None
+            return DeliveryOutcome.ALREADY_CONTACTED if self._thread_for_listing(driver, listing) else None
         if _visible(driver, "#message_timestamp") is not None or self._new_conversation_sent(driver):
             return DeliveryOutcome.ALREADY_CONTACTED
         return "ready" if _visible(driver, "textarea#message_input") is not None else None
@@ -244,6 +262,37 @@ class BrowserSender:
         return next((button for button in scope.find_elements(By.CSS_SELECTOR, selectors)
                      if button.is_displayed() and button.is_enabled() and _label(button) in _SEND_LABELS), None)
 
+    def _click_send(self, driver, listing: ListingRef, text: str, attachment_name: str | None) -> bool:
+        try:
+            if self._composer_state(driver, listing) != "ready" or _visible(driver, _FORM_ERROR) is not None:
+                return False
+            area = _visible(driver, "textarea#message_input")
+            if area is None or area.get_property("value") != text:
+                return False
+            if attachment_name and not self._attachment_ready(driver, attachment_name):
+                return False
+            button = self._submit_button(driver, area)
+            if button is None or not driver.execute_script("""
+                const button = arguments[0];
+                button.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+                const rect = button.getClientRects()[0];
+                if (!rect) return false;
+                const left = Math.max(0, rect.left);
+                const right = Math.min(window.innerWidth, rect.right);
+                const top = Math.max(0, rect.top);
+                const bottom = Math.min(window.innerHeight, rect.bottom);
+                if (left >= right || top >= bottom) return false;
+                const target = document.elementFromPoint(Math.floor((left + right) / 2),
+                                                         Math.floor((top + bottom) / 2));
+                return button.contains(target);
+            """, button):
+                return False
+            button.click()
+        except (ElementClickInterceptedException, StaleElementReferenceException):
+            # WebDriver did not dispatch the click. Recheck the exact message on the next poll.
+            return False
+        return True
+
     @staticmethod
     def _attachment_input(driver):
         inputs = driver.find_elements(By.CSS_SELECTOR, _PDF_INPUT)
@@ -290,33 +339,50 @@ class BrowserSender:
         return None
 
     @staticmethod
+    def _credit_proof_refused(driver, listing: ListingRef) -> bool:
+        if _contact_id(driver.current_url) != listing.id:
+            return False
+        for error in driver.find_elements(By.CSS_SELECTOR, _SUBMISSION_ERROR):
+            if error.is_displayed():
+                text = " ".join(error.text.split())
+                if _CREDIT_PROOF_REFUSED.search(text) and _SEND_REFUSED.search(text):
+                    return True
+        return False
+
+    @staticmethod
     def _new_conversation_sent(driver) -> bool:
         return _visible(driver, _SENT_NOTICE) is not None and _visible(driver, _NEW_CONVERSATION) is None
+
+    @staticmethod
+    def _thread_for_listing(driver, listing: ListingRef) -> bool:
+        parts = urlsplit(driver.current_url)
+        ids = parse_qs(parts.query, keep_blank_values=True).get("nachrichten-id", [])
+        if (parts.path not in _THREAD_PATHS or len(ids) != 1 or not re.fullmatch(r"[0-9]{1,20}", ids[0])
+                or _visible(driver, "#message_timestamp") is None):
+            return False
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+        return any((ref := ListingRef.from_url(link.get_attribute("href") or "")) and ref.id == listing.id
+                   for link in links if link.is_displayed())
 
     def _confirmed(self, driver, listing: ListingRef, message: str, attachment_name: str | None = None) -> bool:
         if self._blocked(driver):
             return False
-        if _contact_id(driver.current_url) == listing.id and self._new_conversation_sent(driver):
-            return True
-        if _visible(driver, "#message_timestamp") is None:
-            return False
-        if attachment_name and not self._sent_attachment_label(driver, attachment_name):
-            return False
         if _contact_id(driver.current_url) == listing.id:
-            return True
-        parts = urlsplit(driver.current_url)
-        if parts.path not in {"/nachrichten.html", "/en/nachrichten.html"}:
+            return self._new_conversation_sent(driver) or (
+                _visible(driver, "#message_timestamp") is not None
+                and (attachment_name is None or self._sent_attachment_label(driver, attachment_name))
+            )
+        if not self._thread_for_listing(driver, listing):
             return False
-        if not parse_qs(parts.query).get("nachrichten-id"):
+        approved = " ".join(message.split())
+        if not any(" ".join(item.text.split()) == approved for item in driver.find_elements(
+            By.CSS_SELECTOR, _OUTGOING_TEXT
+        ) if item.is_displayed()):
             return False
-        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-        if not any((ref := ListingRef.from_url(link.get_attribute("href") or "")) and ref.id == listing.id
-                   for link in links if link.is_displayed()):
-            return False
-        literal = _xpath_text(" ".join(message.split()))
-        return any(item.is_displayed() for item in driver.find_elements(
-            By.XPATH, f"//*[not(self::textarea) and normalize-space(.) = {literal}]"
-        ))
+        return attachment_name is None or any(
+            attachment_name in {link.text.strip(), link.get_attribute("title")}
+            for link in driver.find_elements(By.CSS_SELECTOR, _OUTGOING_ATTACHMENT) if link.is_displayed()
+        )
 
     def send(
         self, url: str, text: str, before_submit: Callable[[], bool], *, attachment: Path | None = None,
@@ -381,19 +447,30 @@ class BrowserSender:
                         return DeliveryOutcome.UNCONFIRMED
                     if self._composer_state(browser, listing) != "ready" or _visible(browser, _FORM_ERROR) is not None:
                         return DeliveryOutcome.UNCONFIRMED
-                    if self._attachment_ready(browser, attachment.name):
-                        return self._submit_button(browser, area)
-                    return None
+                    return self._attachment_ready(browser, attachment.name)
 
-                submit = WebDriverWait(driver, 45).until(ready_after_upload)
-                if submit == DeliveryOutcome.UNCONFIRMED or area.get_property("value") != text:
+                if WebDriverWait(driver, 45).until(ready_after_upload) is DeliveryOutcome.UNCONFIRMED:
                     return unconfirmed()
             phase = "Auf Senden klicken"
-            submit.click()
-            phase = "Klick auf Senden abgeschlossen; auf Bestätigung warten"
             attachment_name = attachment.name if attachment is not None else None
-            wait.until(lambda browser: self._blocked(browser) or self._confirmed(browser, listing, text, attachment_name))
-            return (DeliveryOutcome.SENT if self._confirmed(driver, listing, text, attachment_name)
-                    else unconfirmed())
+            click_completed = False
+            try:
+                wait.until(lambda browser: self._click_send(browser, listing, text, attachment_name))
+            except WebDriverException as error:
+                # An uncertain click may already have sent the message. Only look for its receipt.
+                LOG.info("WG-Gesucht: Sendeklick nicht bestätigt (%s).", type(error).__name__)
+            else:
+                click_completed = True
+                phase = "Klick auf Senden abgeschlossen; auf Bestätigung warten"
+
+            def submission_outcome(browser):
+                if self._confirmed(browser, listing, text, attachment_name):
+                    return DeliveryOutcome.SENT
+                if click_completed and self._credit_proof_refused(browser, listing):
+                    return DeliveryOutcome.CREDIT_PROOF_REQUIRED
+                return DeliveryOutcome.UNCONFIRMED if self._blocked(browser) else None
+
+            result = wait.until(submission_outcome)
+            return unconfirmed() if result is DeliveryOutcome.UNCONFIRMED else result
         except (TimeoutException, WebDriverException, OSError):
             return unconfirmed() if claimed else DeliveryOutcome.BLOCKED

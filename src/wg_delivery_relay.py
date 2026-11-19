@@ -23,8 +23,9 @@ from munich_delivery import (
 from munich_radar import ROOT, Scanner, _database, _number, _scanner, _switch
 from reviewed_applications import (
     ReviewedApplication, fail_application_review, get_application_attachment, pending_application_reviews,
-    review_is_pending, set_application_wait_reason,
+    reject_unavailable_approval, review_is_pending, set_application_wait_reason,
 )
+from wg_credit_proof import CREDIT_PROOF_REQUIRED_REASON, record_credit_proof_requirement
 from wg_reply_drafts import sync_wg_reply_drafts
 from wg_reply_inbox import WGInboxEntry, _thread_url
 from wg_source import Listing, listing_recipient_role
@@ -157,7 +158,7 @@ class ReviewedDeliveryRelay:
 
     def _revision(self, item: ReviewedApplication) -> str:
         value = json.dumps([
-            item.id, item.url, item.message_hash, item.updated_at.hex(), item.attachment_digest,
+            "mistral-required-v1", item.id, item.url, item.message_hash, item.updated_at.hex(), item.attachment_digest,
         ], ensure_ascii=True, separators=(",", ":"))
         return hmac.digest(self.secret, value.encode("ascii"), "sha256").hex()
 
@@ -183,6 +184,13 @@ class ReviewedDeliveryRelay:
             SELECT expires_at, claimed_at, outcome FROM wg_relay_preparations WHERE id = ? AND revision = ?
         """, (listing_id, revision)).fetchone()
 
+    @staticmethod
+    def _judge_approved(db: sqlite3.Connection, item: ReviewedApplication) -> bool:
+        return db.execute("""
+            SELECT 1 FROM outgoing_checks WHERE id = ? AND kind = 'application'
+              AND message_hash = ? AND approved = 1 AND checked_at >= ?
+        """, (item.id, item.message_hash, item.updated_at)).fetchone() is not None
+
     def _next(self, db: sqlite3.Connection, body: object) -> dict:
         _read_fields(body, set())
         now = self.clock()
@@ -199,9 +207,14 @@ class ReviewedDeliveryRelay:
         item = self._item(db, listing_id, revision, now)
         if not item or listing_id in self.retry_after or not within_send_limit(db, now, self.daily_limit):
             return {"ready": False}
+        if self.scanner.outgoing_provider != "mistral":
+            self.retry_after[item.id] = now + RETRY_DELAY
+            set_application_wait_reason(db, item, "Der Versand wartet auf den Mistral-Judge.")
+            return {"ready": False}
         listing = _read_public_listing(body["listing"], item)
         prior = self._preparation(db, listing_id, revision)
-        reuse = prior and prior[0] > now.timestamp() and prior[1] is None and prior[2] is None
+        reuse = (prior and prior[0] > now.timestamp() and prior[1] is None and prior[2] is None
+                 and self._judge_approved(db, item))
         if not reuse:
             if not self.scanner.validate_reviewed_listing(db, item, listing, now, self.retry_after):
                 return {"ready": False}
@@ -212,8 +225,10 @@ class ReviewedDeliveryRelay:
             judgment = review_outgoing(
                 db, item.id, item.message, kind="application", context=listing.description,
                 provider=self.scanner.outgoing_provider, now=self.clock(),
-                first_message=FirstMessageReview(listing.title, "", (), {}, user_reviewed=True,
-                                                recipient_role=role),
+                first_message=FirstMessageReview(
+                    listing.title, self.scanner.applicant_intro, (), self.scanner.applicant_answers,
+                    user_reviewed=True, recipient_role=role,
+                ),
             )
             if not judgment.approved:
                 fail_application_review(db, item, judgment.reason, self.clock())
@@ -221,7 +236,8 @@ class ReviewedDeliveryRelay:
         with db:
             db.execute("BEGIN IMMEDIATE")
             now = self.clock()
-            if not self._still_pending(db, item, now) or not within_send_limit(db, now, self.daily_limit):
+            if (not self._still_pending(db, item, now) or not self._judge_approved(db, item)
+                    or not within_send_limit(db, now, self.daily_limit)):
                 return {"ready": False}
             if reuse and prior[0] <= now.timestamp():
                 return {"ready": False}
@@ -247,7 +263,7 @@ class ReviewedDeliveryRelay:
     def _claim(self, db: sqlite3.Connection, body: object) -> dict:
         listing_id, revision = _read_job(body)
         item = self._item(db, listing_id, revision, self.clock())
-        if item is None:
+        if item is None or self.scanner.outgoing_provider != "mistral":
             return {"claimed": False}
         with db:
             db.execute("BEGIN IMMEDIATE")
@@ -255,7 +271,8 @@ class ReviewedDeliveryRelay:
             prep = self._preparation(db, listing_id, revision)
             if (
                 prep is None or prep[1] is not None or prep[2] is not None or prep[0] <= now.timestamp()
-                or not self._still_pending(db, item, now) or not within_send_limit(db, now, self.daily_limit)
+                or not self._still_pending(db, item, now) or not self._judge_approved(db, item)
+                or not within_send_limit(db, now, self.daily_limit)
             ):
                 return {"claimed": False}
             stamp = now.timestamp()
@@ -290,7 +307,8 @@ class ReviewedDeliveryRelay:
                            (item.id, revision))
             return {"recorded": True}
         if outcome != DeliveryOutcome.UNAVAILABLE and (
-            outcome != DeliveryOutcome.ALREADY_CONTACTED or prep is None or prep[0] <= now.timestamp()
+            outcome not in {DeliveryOutcome.ALREADY_CONTACTED, DeliveryOutcome.CREDIT_PROOF_REQUIRED}
+            or prep is None or prep[0] <= now.timestamp()
         ):
             return {"recorded": False}
         return {"recorded": self._finish_without_claim(db, item, revision, outcome, now)}
@@ -299,18 +317,25 @@ class ReviewedDeliveryRelay:
         self, db: sqlite3.Connection, listing_id: str, revision: str, claimed_at: float,
         outcome: DeliveryOutcome, now: datetime,
     ) -> bool:
-        if outcome not in {DeliveryOutcome.SENT, DeliveryOutcome.UNCONFIRMED, DeliveryOutcome.SKIPPED, DeliveryOutcome.BLOCKED}:
+        if outcome not in {
+            DeliveryOutcome.SENT, DeliveryOutcome.UNCONFIRMED, DeliveryOutcome.SKIPPED, DeliveryOutcome.BLOCKED,
+            DeliveryOutcome.CREDIT_PROOF_REQUIRED,
+        }:
             return False
+        state = (outcome.name.lower() if outcome in {DeliveryOutcome.SENT, DeliveryOutcome.CREDIT_PROOF_REQUIRED}
+                 else "unconfirmed")
         with db:
             db.execute("BEGIN IMMEDIATE")
             changed = db.execute("""
                 UPDATE delivery SET state = ?, recorded_at = ?
                 WHERE id = ? AND state = 'unconfirmed' AND attempted_at = ?
-            """, ("sent" if outcome == DeliveryOutcome.SENT else "unconfirmed", now.timestamp(), listing_id, claimed_at))
+            """, (state, now.timestamp(), listing_id, claimed_at))
             if not changed.rowcount:
                 return False
             if outcome == DeliveryOutcome.SENT:
                 db.execute("UPDATE drafts SET done = 1, message = NULL WHERE id = ?", (listing_id,))
+            elif outcome == DeliveryOutcome.CREDIT_PROOF_REQUIRED:
+                record_credit_proof_requirement(db, listing_id, now)
             db.execute("UPDATE wg_relay_preparations SET outcome = ? WHERE id = ? AND revision = ?",
                        (outcome.name, listing_id, revision))
         return True
@@ -324,9 +349,13 @@ class ReviewedDeliveryRelay:
             if not self._still_pending(db, item, now):
                 return False
             stamp = now.timestamp()
-            db.execute("INSERT INTO delivery VALUES (?, ?, ?, NULL)", (item.id, outcome.name.lower(), stamp))
-            if outcome == DeliveryOutcome.ALREADY_CONTACTED:
-                db.execute("UPDATE drafts SET done = 1, message = NULL WHERE id = ?", (item.id,))
+            if outcome == DeliveryOutcome.CREDIT_PROOF_REQUIRED:
+                record_credit_proof_requirement(db, item.id, now)
+                reject_unavailable_approval(db, item.id, CREDIT_PROOF_REQUIRED_REASON, now)
+            else:
+                db.execute("INSERT INTO delivery VALUES (?, ?, ?, NULL)", (item.id, outcome.name.lower(), stamp))
+                if outcome == DeliveryOutcome.ALREADY_CONTACTED:
+                    db.execute("UPDATE drafts SET done = 1, message = NULL WHERE id = ?", (item.id,))
             db.execute("""
                 INSERT INTO wg_relay_preparations (id, revision, expires_at, claimed_at, outcome)
                 VALUES (?, ?, ?, NULL, ?) ON CONFLICT(id) DO UPDATE SET
